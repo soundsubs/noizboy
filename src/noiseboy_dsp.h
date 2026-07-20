@@ -11,11 +11,16 @@
  * not just convenient.
  *
  * Each voice is 1-3 randomly-chosen layers, decided once per module
- * instantiation (fixed for that load, not re-randomized per note).
- * Each layer is independently either:
+ * instantiation (fixed for that load, not re-randomized per note --
+ * though see noiseboy_randomize_recipe() for re-rolling on demand
+ * without a full reload). Each layer is independently either:
  *   - filtered noise: a noise generator (random colour) through a
- *     resonant filter (randomly Moog Ladder or Korg35 LP/HP) tuned to
- *     the played note's frequency, or
+ *     resonant lowpass filter (randomly Moog Ladder or Korg35 LP --
+ *     the highpass option was tried and dropped, see FilterKind's
+ *     comment) tuned to the played note's frequency, PLUS a sample-
+ *     and-hold pitch stage layered in before the filter (see
+ *     PitchedHold) for a stronger, more clearly pitched result than
+ *     filter resonance alone, or
  *   - Karplus-Strong: a noise-excited, damped delay line whose length
  *     itself sets the pitch (the classic plucked-string algorithm),
  *     picked randomly per the explicit request to add it as a second
@@ -28,62 +33,11 @@
  * ---------------------------------------------------------------------*/
 
 #include <stddef.h>
+#include "distroy_dsp.h" /* SimpleNoise, NoiseGen, NoiseColour, MoogLadder, Korg35LP, Korg35HP now come from here -- consolidated to one shared source when DBCELL processing was added, rather than keeping NOISEBOY's own verbatim-copied duplicates alongside a second copy pulled in for DBCELL. Same structs/functions as before, just declared once instead of twice. */
 
 #define NOISEBOY_MAX_VOICES 8
 #define NOISEBOY_MAX_LAYERS 3
 #define NOISEBOY_KS_MAX_SAMPLES 2400 /* enough delay-line length for the lowest supported note (~A0, 27.5Hz) at up to 48kHz-ish sample rates, with headroom */
-
-/* ---- Reused verbatim from distroy_dsp.c (see that file's own tests --
- * these are proven, already-tested building blocks, not reimplemented
- * from scratch here) ---- */
-
-typedef struct {
-    unsigned int state;
-} SimpleNoise;
-
-void noise_init(SimpleNoise *n, unsigned int seed);
-double noise_next(SimpleNoise *n); /* returns -1.0..1.0 */
-
-typedef enum { NOISE_WHITE = 0, NOISE_PINK, NOISE_RED } NoiseColour;
-
-typedef struct {
-    SimpleNoise white;
-    double pink_b0, pink_b1, pink_b2;
-    double brown_state;
-} NoiseGen;
-
-void noisegen_init(NoiseGen *n, unsigned int seed);
-double noisegen_process(NoiseGen *n, NoiseColour colour);
-
-typedef struct {
-    double stage[4];
-    double delay[4];
-    double p, k, resonance, drive;
-    double sample_rate;
-} MoogLadder;
-
-void moog_ladder_init(MoogLadder *f, double sample_rate);
-void moog_ladder_set(MoogLadder *f, double cutoff_hz, double resonance01, double drive01);
-double moog_ladder_process(MoogLadder *f, double x);
-
-typedef struct {
-    double stage[2];
-    double delay[2];
-    double p, k, resonance, drive;
-    double sample_rate;
-} Korg35LP;
-
-void korg35lp_init(Korg35LP *f, double sample_rate);
-void korg35lp_set(Korg35LP *f, double cutoff_hz, double resonance01, double drive01);
-double korg35lp_process(Korg35LP *f, double x);
-
-typedef struct {
-    Korg35LP core;
-} Korg35HP;
-
-void korg35hp_init(Korg35HP *f, double sample_rate);
-void korg35hp_set(Korg35HP *f, double cutoff_hz, double resonance01, double drive01);
-double korg35hp_process(Korg35HP *f, double x);
 
 /* ---- New for NOISEBOY ---- */
 
@@ -110,7 +64,33 @@ void karplus_init(KarplusString *k);
 void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, NoiseGen *noiseGen, NoiseColour colour, double dampingAmount);
 double karplus_process(KarplusString *k);
 
+/* Sample-and-hold "pitched noise" stage -- an additional, distinct
+ * pitch mechanism layered in on top of resonant filter tracking, per
+ * direct feedback that filter tracking alone wasn't reading as clearly
+ * pitched. Holds each fresh noise sample for a duration derived from
+ * the played note's frequency (like a bitcrushed/sample-rate-reduced
+ * source, but the reduction rate itself tracks the note), giving a
+ * buzzy, more obviously pitched character that reinforces the
+ * filter's resonant peak rather than replacing it. */
+typedef struct {
+    double heldValue;
+    double phase;
+} PitchedHold;
+
+void pitchedhold_init(PitchedHold *h);
+double pitchedhold_process(PitchedHold *h, double newSample, double freqHz, double sampleRate, double holdMultiplier);
+
 typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG } LayerType;
+/* FILTER_KORG_HP is intentionally no longer selected by the
+ * randomizer (see randomizeCell-equivalent logic in the .c file) --
+ * per direct feedback/diagnosis, a highpass filter tuned to the played
+ * pitch removes energy AT that pitch rather than emphasizing it
+ * (Korg35HP is derived as input-minus-its-own-resonant-lowpass-core,
+ * so at high resonance it creates a NOTCH at the tracked frequency,
+ * not a peak), working against "sounds pitched" rather than for it.
+ * The enum value and its code path are left in place rather than
+ * deleted, matching this project family's convention of keeping
+ * superseded options around for a possible future revert. */
 typedef enum { FILTER_MOOG = 0, FILTER_KORG_LP, FILTER_KORG_HP } FilterKind;
 
 typedef struct {
@@ -123,6 +103,7 @@ typedef struct {
     MoogLadder moog;
     Korg35LP korgLp;
     Korg35HP korgHp;
+    PitchedHold pitchedHold;
 
     /* Karplus-Strong layer state. */
     KarplusString karplus;
@@ -148,7 +129,7 @@ typedef struct {
     /* Simple gate envelope -- fast attack while held, fast release on
      * note-off, rather than a full ADSR: "only turns on with keypress"
      * calls for a gate, not a sustained pad. Attack/Release TIME are
-     * still knob-controllable (see NoiseboyVoiceParams) so it isn't a
+     * still knob-controllable (see NoiseboyParams) so it isn't a
      * hard instant on/off -- just smoothed enough to avoid clicks. */
     double envLevel;
     int gateOpen;
@@ -178,7 +159,9 @@ typedef struct {
 
 /* Knob-controlled parameters, shared across all voices (not per-voice
  * state) -- set via set_param in the Schwung plugin wrapper, mapped to
- * knobs 1-8. */
+ * knobs 1-8 (plus two additional chain_params beyond the 8 physical
+ * knobs -- drive and randomize-trigger -- still reachable via the
+ * module's parameter menu). */
 typedef struct {
     double filterCutoffOffset01;  /* knob 1: brightens/darkens the pitch-tracked filter cutoff, -1..1 mapped from 0..1 */
     double filterResonance01;     /* knob 2 */
@@ -188,6 +171,7 @@ typedef struct {
     double releaseMs;             /* knob 6: 5-2000 ms */
     double detuneSpread01;        /* knob 7: scales each layer's per-layer detuneCents, 0 = unison, 1 = full spread */
     double masterLevel01;         /* knob 8 */
+    double drive01;               /* chain_param 9: single shared drive/saturation stage on the final mix -- see noiseboy_process */
 } NoiseboyParams;
 
 typedef struct {
@@ -200,9 +184,23 @@ typedef struct {
      * LayerRecipe's comment. */
     LayerRecipe recipe[NOISEBOY_MAX_LAYERS];
     int numRecipeLayers;
+
+    /* Tracks the previous value of the "randomize" trigger param so
+     * set_param can detect a rising edge (0 -> nonzero) and re-roll
+     * the recipe exactly once per press, rather than re-randomizing
+     * continuously while a bound knob is mid-turn. */
+    int lastRandomizeTriggerRaw;
 } NoiseboyEngine;
 
 void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int seed);
+/* Re-rolls the recipe (layer count/types/colours/filters/detune) using
+ * the engine's own ongoing RNG state, WITHOUT reinitializing sample
+ * rate, params, or any currently-sounding voices -- per explicit
+ * request for a way to get a new randomized set without reloading the
+ * whole module. Takes effect for notes played AFTER this call; voices
+ * already sounding keep whatever recipe they started with (retroactively
+ * changing an in-flight voice's DSP state would click/glitch). */
+void noiseboy_randomize_recipe(NoiseboyEngine *e);
 void noiseboy_note_on(NoiseboyEngine *e, int midiNote, double velocity01);
 void noiseboy_note_off(NoiseboyEngine *e, int midiNote);
 void noiseboy_all_notes_off(NoiseboyEngine *e);

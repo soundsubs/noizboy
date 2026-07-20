@@ -13,141 +13,6 @@ static double clampd(double x, double lo, double hi) {
     return x;
 }
 
-/* ---------------------------------------------------------------------
- * Reused verbatim from distroy_dsp.c -- see that project's own test
- * suite for verification of these specific algorithms; not re-derived
- * or re-tested here, just carried over for sonic consistency with
- * DISTROY (the stated use case chains NOISEBOY into DISTROY).
- * ------------------------------------------------------------------- */
-
-void noise_init(SimpleNoise *n, unsigned int seed) {
-    n->state = seed != 0 ? seed : 1;
-}
-
-double noise_next(SimpleNoise *n) {
-    unsigned int s = n->state;
-    s ^= s << 13;
-    s ^= s >> 17;
-    s ^= s << 5;
-    n->state = s;
-    return ((double)s / (double)UINT32_MAX) * 2.0 - 1.0;
-}
-
-void noisegen_init(NoiseGen *n, unsigned int seed) {
-    noise_init(&n->white, seed);
-    n->pink_b0 = 0.0;
-    n->pink_b1 = 0.0;
-    n->pink_b2 = 0.0;
-    n->brown_state = 0.0;
-}
-
-double noisegen_process(NoiseGen *n, NoiseColour colour) {
-    double white = noise_next(&n->white);
-    switch (colour) {
-        case NOISE_PINK: {
-            n->pink_b0 = 0.99765 * n->pink_b0 + white * 0.0990460;
-            n->pink_b1 = 0.96300 * n->pink_b1 + white * 0.2965164;
-            n->pink_b2 = 0.57000 * n->pink_b2 + white * 1.0526913;
-            double pink = n->pink_b0 + n->pink_b1 + n->pink_b2 + white * 0.1848;
-            return pink * 0.11;
-        }
-        case NOISE_RED: {
-            n->brown_state = n->brown_state * 0.98 + white * 0.02;
-            return n->brown_state * 3.5;
-        }
-        case NOISE_WHITE:
-        default:
-            return white;
-    }
-}
-
-void moog_ladder_init(MoogLadder *f, double sample_rate) {
-    memset(f, 0, sizeof(*f));
-    f->sample_rate = sample_rate;
-    f->drive = 1.0;
-    moog_ladder_set(f, 1000.0, 0.0, 0.0);
-}
-
-void moog_ladder_set(MoogLadder *f, double cutoff_hz, double resonance01, double drive01) {
-    double fc = clampd(cutoff_hz / (f->sample_rate * 0.5), 0.0001, 0.99);
-    f->p = fc * (1.8 - 0.8 * fc);
-    f->k = 2.0 * sin(fc * M_PI * 0.5) - 1.0;
-    double t1 = (1.0 - f->p) * 1.386249;
-    double t2 = 12.0 + t1 * t1;
-    f->resonance = resonance01 * 3.5 * (t2 + 6.0 * t1) / (t2 - 6.0 * t1);
-    f->drive = 1.0 + drive01 * 11.0;
-}
-
-double moog_ladder_process(MoogLadder *f, double x) {
-    x *= f->drive;
-    x = tanh(x);
-
-    double input = x - f->resonance * f->stage[3];
-    f->stage[0] = input * f->p + f->delay[0] * f->p - f->k * f->stage[0];
-    f->stage[1] = f->stage[0] * f->p + f->delay[1] * f->p - f->k * f->stage[1];
-    f->stage[2] = f->stage[1] * f->p + f->delay[2] * f->p - f->k * f->stage[2];
-    f->stage[3] = f->stage[2] * f->p + f->delay[3] * f->p - f->k * f->stage[3];
-    f->stage[3] -= (f->stage[3] * f->stage[3] * f->stage[3]) / 6.0;
-
-    for (int i = 0; i < 4; i++) {
-        f->stage[i] = clampd(f->stage[i], -8.0, 8.0);
-    }
-
-    f->delay[0] = input;
-    f->delay[1] = f->stage[0];
-    f->delay[2] = f->stage[1];
-    f->delay[3] = f->stage[2];
-
-    return f->stage[3];
-}
-
-void korg35lp_init(Korg35LP *f, double sample_rate) {
-    memset(f, 0, sizeof(*f));
-    f->sample_rate = sample_rate;
-    f->drive = 1.0;
-    korg35lp_set(f, 1000.0, 0.0, 0.0);
-}
-
-void korg35lp_set(Korg35LP *f, double cutoff_hz, double resonance01, double drive01) {
-    double fc = clampd(cutoff_hz / (f->sample_rate * 0.5), 0.0001, 0.99);
-    f->p = fc * (1.8 - 0.8 * fc);
-    f->k = 2.0 * sin(fc * M_PI * 0.5) - 1.0;
-    double t1 = (1.0 - f->p) * 1.386249;
-    double t2 = 12.0 + t1 * t1;
-    f->resonance = resonance01 * 2.6 * (t2 + 6.0 * t1) / (t2 - 6.0 * t1);
-    f->drive = 1.0 + drive01 * 9.0;
-}
-
-double korg35lp_process(Korg35LP *f, double x) {
-    x *= f->drive;
-    x = tanh(x);
-
-    double input = x - f->resonance * f->stage[1];
-    f->stage[0] = input * f->p + f->delay[0] * f->p - f->k * f->stage[0];
-    f->stage[1] = f->stage[0] * f->p + f->delay[1] * f->p - f->k * f->stage[1];
-    f->stage[1] -= (f->stage[1] * f->stage[1] * f->stage[1]) / 6.0;
-
-    f->stage[0] = clampd(f->stage[0], -8.0, 8.0);
-    f->stage[1] = clampd(f->stage[1], -8.0, 8.0);
-
-    f->delay[0] = input;
-    f->delay[1] = f->stage[0];
-
-    return f->stage[1];
-}
-
-void korg35hp_init(Korg35HP *f, double sample_rate) {
-    korg35lp_init(&f->core, sample_rate);
-}
-
-void korg35hp_set(Korg35HP *f, double cutoff_hz, double resonance01, double drive01) {
-    korg35lp_set(&f->core, cutoff_hz, resonance01, drive01);
-}
-
-double korg35hp_process(Korg35HP *f, double x) {
-    double lp = korg35lp_process(&f->core, x);
-    return x - lp;
-}
 
 /* ---------------------------------------------------------------------
  * New for NOISEBOY: Karplus-Strong plucked-string synthesis.
@@ -193,6 +58,34 @@ double karplus_process(KarplusString *k) {
 }
 
 /* ---------------------------------------------------------------------
+ * New for NOISEBOY: sample-and-hold pitched noise stage.
+ * ------------------------------------------------------------------- */
+
+void pitchedhold_init(PitchedHold *h) {
+    h->heldValue = 0.0;
+    h->phase = 0.0;
+}
+
+double pitchedhold_process(PitchedHold *h, double newSample, double freqHz, double sampleRate, double holdMultiplier) {
+    /* Advances a phase accumulator at freqHz*holdMultiplier cycles per
+     * second; each time it wraps, latches newSample as the held value
+     * -- a sample-and-hold whose rate itself tracks the played pitch,
+     * giving the noise a buzzy/quantized character with a much
+     * stronger, more obvious relationship to the note than filter
+     * resonance alone provides. holdMultiplier > 1 holds at a multiple
+     * of the fundamental (still musically related, just a higher
+     * "grain rate") rather than always exactly at it, for some
+     * per-layer variety. */
+    double rate = freqHz * (holdMultiplier > 0.01 ? holdMultiplier : 1.0);
+    h->phase += rate / sampleRate;
+    if (h->phase >= 1.0) {
+        h->phase -= floor(h->phase);
+        h->heldValue = newSample;
+    }
+    return h->heldValue;
+}
+
+/* ---------------------------------------------------------------------
  * Engine: voice management, randomized recipe, MIDI, per-sample mix.
  * ------------------------------------------------------------------- */
 
@@ -217,6 +110,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     memset(e, 0, sizeof(*e));
     e->sampleRate = sampleRate;
     e->rngState = seed != 0 ? seed : 1;
+    e->lastRandomizeTriggerRaw = 0;
 
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         e->voices[v].active = 0;
@@ -224,19 +118,34 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
 
     /* Reasonable defaults -- overwritten by set_param once the host
      * reads knob positions, but these keep the instrument playable
-     * (and not silent/broken) even before any knob has been touched. */
+     * (and not silent/broken) even before any knob has been touched.
+     * filterResonance01 default raised significantly (was 0.3) --
+     * per direct feedback/diagnosis that the noise "isn't quite
+     * pitched": a resonant filter needs to sit much closer to
+     * self-oscillation than 0.3 to produce an audible peak at its
+     * cutoff from noise input, which is the whole mechanism "pitched
+     * noise via resonant filter" depends on. */
     e->params.filterCutoffOffset01 = 0.5;  /* neutral: filter tracks exactly at the played pitch */
-    e->params.filterResonance01 = 0.3;
+    e->params.filterResonance01 = 0.82;
     e->params.amRateHz = 4.0;
     e->params.amDepth01 = 0.0;             /* off by default -- AM is a deliberate extra character, not a default-on wobble */
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
     e->params.masterLevel01 = 0.8;
+    e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
-    /* The randomized recipe -- decided ONCE here, per explicit spec
-     * ("every time you instantiate, its a randomized noise block").
-     * 1-3 layers. */
+    noiseboy_randomize_recipe(e);
+}
+
+void noiseboy_randomize_recipe(NoiseboyEngine *e) {
+    /* 1-3 layers, per explicit spec ("every time you instantiate, its
+     * a randomized noise block"). Also callable on demand (not just at
+     * instantiation) per explicit request for a way to get a new
+     * randomized set without reloading the whole module -- uses the
+     * engine's own ongoing RNG state, so repeated calls keep producing
+     * fresh, non-repeating recipes rather than resetting to the same
+     * sequence. */
     e->numRecipeLayers = 1 + (int)(rand01(&e->rngState) * 3.0);
     if (e->numRecipeLayers > NOISEBOY_MAX_LAYERS) e->numRecipeLayers = NOISEBOY_MAX_LAYERS;
 
@@ -250,8 +159,11 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
 
-        double filterRoll = rand01(&e->rngState);
-        r->filterKind = (filterRoll < 0.34) ? FILTER_MOOG : (filterRoll < 0.67) ? FILTER_KORG_LP : FILTER_KORG_HP;
+        /* FILTER_KORG_HP deliberately excluded from selection -- see
+         * FilterKind's header comment for why a highpass tuned to the
+         * played pitch actively works against sounding pitched.
+         * Moog/Korg35LP only, 50/50. */
+        r->filterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
 
         /* Detune spread across layers -- first layer stays at 0 cents
          * (an anchor pitch), the rest spread out symmetrically so
@@ -296,6 +208,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             moog_ladder_init(&layer->moog, e->sampleRate);
             korg35lp_init(&layer->korgLp, e->sampleRate);
             korg35hp_init(&layer->korgHp, e->sampleRate);
+            pitchedhold_init(&layer->pitchedHold);
         } else {
             karplus_init(&layer->karplus);
             NoiseGen seedGen;
@@ -349,7 +262,16 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
 
+    /* Sample-and-hold pitch stage, applied BEFORE the filter -- per
+     * direct feedback that filter tracking alone wasn't reading as
+     * clearly pitched. Hold multiplier varies per layer (via
+     * resonanceBias01, reused here rather than adding yet another
+     * recipe field) between 1x and 3x the fundamental, so multiple
+     * layers don't all buzz at exactly the same grain rate. */
     double detuneMul = pow(2.0, (layer->detuneCents * e->params.detuneSpread01) / 1200.0);
+    double holdMultiplier = 1.0 + layer->resonanceBias01 * 2.0;
+    raw = pitchedhold_process(&layer->pitchedHold, raw, v->freqHz * detuneMul, e->sampleRate, holdMultiplier);
+
     /* filterCutoffOffset01: 0.5 = neutral (filter sits exactly at the
      * played pitch, i.e. always tracks it); away from 0.5 brightens or
      * darkens the filter RELATIVE TO the tracked pitch, but never
@@ -414,6 +336,18 @@ double noiseboy_process(NoiseboyEngine *e) {
 
         mix += voiceSum * v->envLevel * amGain;
     }
+
+    /* Single shared drive/saturation stage on the final mix, per
+     * explicit request for something to give the noise more volume
+     * and colour -- deliberately one block applied once here, not
+     * per-voice or per-layer. Simple pre-gain into tanh (same
+     * saturation approach used throughout this project family's
+     * filters) -- NOT normalized back down afterward, since the
+     * saturation's natural loudness/density increase at higher drive
+     * IS the "more volume" part of the request, not a side effect to
+     * cancel out. */
+    double driveGain = 1.0 + e->params.drive01 * 6.0;
+    mix = tanh(mix * driveGain);
 
     return mix * e->params.masterLevel01;
 }

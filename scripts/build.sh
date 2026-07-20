@@ -39,7 +39,7 @@ docker run --rm --platform linux/arm64 \
     sh -c '
         apt-get update -qq && apt-get install -y -qq gcc make > /dev/null
         gcc -g -O3 -shared -fPIC \
-            src/noiseboy_dsp.c src/noiseboy_plugin.c \
+            src/distroy_dsp.c src/dbcell_dsp.c src/noiseboy_dsp.c src/noiseboy_plugin.c \
             -o build/dsp.so \
             -Isrc -I/schwung/src \
             -lm

@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.1.0",
+    "version": "0.3.0",
     "abbrev": "NOIZB",
-    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Randomizes 1-3 layers on load; run into DISTROY for extra character.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument, with db-cell's randomized 8-slot DISTROYBOY chain always running on the output. Randomizes both layers on load or via the Randomize param.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "api_version": 2,
@@ -26,7 +26,7 @@
                 "type": "int",
                 "min": 0,
                 "max": 127,
-                "default": 38
+                "default": 104
             },
             {
                 "key": "am_rate",
@@ -75,6 +75,22 @@
                 "min": 0,
                 "max": 127,
                 "default": 102
+            },
+            {
+                "key": "drive",
+                "name": "Drive",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 32
+            },
+            {
+                "key": "randomize",
+                "name": "Randomize",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 0
             }
         ]
     }
