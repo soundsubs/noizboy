@@ -295,20 +295,16 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
 
-        /* FILTER_KORG_HP deliberately excluded from selection -- see
-         * FilterKind's header comment for why a highpass tuned to the
-         * played pitch actively works against sounding pitched.
-         * Moog/Korg35LP only, 50/50. */
-        r->filterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
-
         /* Detune spread across layers -- first layer stays at 0 cents
          * (an anchor pitch), the rest spread out symmetrically so
          * stacking layers doesn't just shift the whole chord sharp or
          * flat. +-15 cents max range, modest enough to read as
-         * "richness" rather than an obvious chorus effect. */
+         * "richness" rather than an obvious chorus effect. Only
+         * meaningful for Karplus-type layers now (their own pitch);
+         * filtered-noise layers no longer have a per-layer filter to
+         * detune. */
         r->detuneCents = (i == 0) ? 0.0 : (rand01(&e->rngState) * 2.0 - 1.0) * 15.0;
 
-        r->resonanceBias01 = rand01(&e->rngState);
         r->dampingAmount01 = rand01(&e->rngState);
     }
 }
@@ -354,25 +350,32 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     vibrato_init(&v->vibrato);
     moog_ladder_init(&v->outputFilter, e->sampleRate);
 
+    /* Voice-level pitch-tracking filter -- randomized fresh per note
+     * (Moog/Korg35LP, 50/50; Korg35HP deliberately excluded, same
+     * reasoning as before: a highpass tuned to the played pitch works
+     * against sounding pitched, not for it), matching
+     * bitDepth/rateReducerMultiplier's own per-note variety pattern
+     * now that filter choice is no longer part of the fixed recipe. */
+    v->pitchFilterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
+    moog_ladder_init(&v->pitchFilterMoog, e->sampleRate);
+    korg35lp_init(&v->pitchFilterKorgLp, e->sampleRate);
+
     v->numLayers = e->numRecipeLayers;
     for (int i = 0; i < v->numLayers; i++) {
         Layer *layer = &v->layers[i];
         const LayerRecipe *r = &e->recipe[i];
         layer->type = r->type;
         layer->colour = r->colour;
-        layer->filterKind = r->filterKind;
         layer->detuneCents = r->detuneCents;
-        layer->resonanceBias01 = r->resonanceBias01;
 
         double detuneMul = pow(2.0, (layer->detuneCents * e->params.detuneSpread01) / 1200.0);
         double layerFreq = v->freqHz * detuneMul;
 
         if (layer->type == LAYER_FILTERED_NOISE) {
+            /* Raw source generation only now -- no per-layer filter,
+             * no per-layer PitchedHold. See Layer's own header comment
+             * for the full restructuring rationale. */
             noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
-            moog_ladder_init(&layer->moog, e->sampleRate);
-            korg35lp_init(&layer->korgLp, e->sampleRate);
-            korg35hp_init(&layer->korgHp, e->sampleRate);
-            pitchedhold_init(&layer->pitchedHold);
         } else {
             karplus_init(&layer->karplus);
             /* noiseGen initialized here too (previously only used for
@@ -439,6 +442,15 @@ int noiseboy_any_voice_active(const NoiseboyEngine *e) {
 }
 
 static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
+    /* Raw source generation only -- per explicit restructuring
+     * request, the signal chain is now: sources (this function) ->
+     * bitcrush/rate-reduce -> voice-level pitch-tracking filter ->
+     * amplitude envelope -> output filter, all in noiseboy_process.
+     * No filter and no PitchedHold pitch stage here anymore -- both
+     * moved out. (e) is unused now that there's no per-layer knob
+     * lookup happening in this function; kept in the signature to
+     * avoid touching every call site. */
+    (void)e;
     if (layer->type == LAYER_KARPLUS_STRONG) {
         /* Small ongoing noise injection while the note is held (0
          * once released, letting the string decay/ring out naturally
@@ -453,63 +465,7 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
         return karplus_process(&layer->karplus, sustainFeed, sustainAmount);
     }
 
-    double raw = noisegen_process(&layer->noiseGen, layer->colour);
-
-    /* Sample-and-hold pitch stage, applied BEFORE the filter -- per
-     * direct feedback that filter tracking alone wasn't reading as
-     * clearly pitched. Hold multiplier varies per layer (via
-     * resonanceBias01, reused here rather than adding yet another
-     * recipe field) between 1x and 3x the fundamental, so multiple
-     * layers don't all buzz at exactly the same grain rate. */
-    double detuneMul = pow(2.0, (layer->detuneCents * e->params.detuneSpread01) / 1200.0);
-    double holdMultiplier = 1.0 + layer->resonanceBias01 * 2.0;
-    raw = pitchedhold_process(&layer->pitchedHold, raw, v->freqHz * detuneMul, e->sampleRate, holdMultiplier);
-
-    /* filterCutoffOffset01: 0.5 = neutral (filter sits exactly at the
-     * played pitch, i.e. always tracks it); away from 0.5 brightens or
-     * darkens the filter RELATIVE TO the tracked pitch, but never
-     * stops tracking it -- the offset is a multiplier applied to the
-     * pitch-derived base cutoff, not a replacement for it. */
-    double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
-    /* Velocity is deliberately NOT applied here anymore -- it was
-     * originally added as a multiplier on this same cutoff, but this
-     * cutoff IS the pitch mechanism for filtered-noise layers (the
-     * filter's resonant peak defines the perceived pitch). Modulating
-     * it by velocity meant harder-played notes were also detuning
-     * sharp relative to softer ones on the same key -- a real, direct
-     * correction: velocity now drives a separate OUTPUT FILT stage
-     * instead (see noiseboy_process), applied post-mix where it can
-     * brighten the overall timbre without touching pitch accuracy at
-     * all. envelopeMul below has the same underlying mechanism and
-     * could theoretically have the same issue (pitch drifting up
-     * during attack, down during release) -- left in place since it
-     * wasn't flagged as a problem, but worth listening for if it
-     * starts to sound off the same way velocity did. */
-    /* Filter cutoff also follows the amplitude envelope itself (rises
-     * during attack, falls during release), capped to a max 20%
-     * brightening at the envelope's own peak -- per explicit request.
-     * envLevel is normalized by velocity01 first since envLevel's own
-     * range is 0..velocity01, not 0..1 -- without normalizing, a
-     * quietly-played (low velocity) note would only ever reach a
-     * fraction of the 20% cap, when the intent is that EVERY note's
-     * own envelope shape drives this the same relative amount. */
-    double envNorm = (v->velocity01 > 0.001) ? clampd(v->envLevel / v->velocity01, 0.0, 1.0) : 0.0;
-    double envelopeMul = 1.0 + envNorm * 0.20;
-    double cutoffHz = clampd(v->freqHz * detuneMul * cutoffMul * envelopeMul, 20.0, e->sampleRate * 0.45);
-    double resonance = clampd(e->params.filterResonance01 + (layer->resonanceBias01 - 0.5) * 0.2, 0.0, 0.95);
-
-    switch (layer->filterKind) {
-        case FILTER_MOOG:
-            moog_ladder_set(&layer->moog, cutoffHz, resonance, 0.2);
-            return moog_ladder_process(&layer->moog, raw);
-        case FILTER_KORG_LP:
-            korg35lp_set(&layer->korgLp, cutoffHz, resonance, 0.2);
-            return korg35lp_process(&layer->korgLp, raw);
-        case FILTER_KORG_HP:
-        default:
-            korg35hp_set(&layer->korgHp, cutoffHz, resonance, 0.2);
-            return korg35hp_process(&layer->korgHp, raw);
-    }
+    return noisegen_process(&layer->noiseGen, layer->colour);
 }
 
 double noiseboy_process(NoiseboyEngine *e) {
@@ -566,35 +522,63 @@ double noiseboy_process(NoiseboyEngine *e) {
             voiceSum = vibrato_process(&v->vibrato, voiceSum, v->amPhase, vibratoDepthSamples);
         }
 
-        /* Per-voice bitcrusher + pitch-following sample-rate reducer,
-         * applied to the mixed voice signal (after layers, before AM)
-         * -- per explicit request. Rate reducer's rate is derived from
-         * the played note (freqHz * this voice's randomized
-         * multiplier), floored at 100Hz and ceiled at Nyquist so it
+        /* STEP 1 (sources) is done above; STEP 2 (bitcrush/rate-reduce)
+         * is here, per explicit 5-step signal chain spec: sources ->
+         * bitcrush/rate-reduce -> pitch-tracking filter -> amplitude
+         * envelope -> output filter. Rate reducer's rate is derived
+         * purely from the played note (freqHz * this voice's
+         * randomized multiplier) -- deliberately has NO dependency on
+         * envLevel or anything else amplitude-related, per direct
+         * correction that a rate/pitch-adjacent stage following the
+         * amplitude envelope was audibly making pitch decay over a
+         * long release. Floored at 100Hz and ceiled at Nyquist so it
          * always sits somewhere between "100Hz crunch" and "full
          * resolution" as requested, while still tracking pitch.
          *
          * ORDER MATTERS HERE, discovered via a real bug: rate-reduce
          * (sample-and-hold) MUST run before bitcrush, not after. At
-         * low bit depths (bitDepth can randomize as low as 1-2),
-         * bitcrush quantizes most small-amplitude samples straight to
-         * 0 -- a Karplus-Strong voice's naturally quiet signal level
-         * meant well over 80% of samples were landing exactly on 0
-         * after crushing. Sampling THAT with a sparse hold (updating
-         * only every ~46 samples at typical rates) had a real, non-
-         * negligible chance of every single hold-update landing on one
-         * of those zeroed samples, silencing the entire voice for the
-         * whole note. Caught this via a debug seed sweep (seed=1
-         * reproduced it consistently) rather than reasoning it out in
-         * advance -- worth remembering that new per-voice per-note
-         * randomization (bitDepth, rateReducerMultiplier) needs the
-         * same seed-sweep verification as everything else, not just
-         * the small sample of seeds a manual test happens to try. */
+         * low bit depths, bitcrush quantizes most small-amplitude
+         * samples straight to 0 -- a Karplus-Strong voice's naturally
+         * quiet signal level meant well over 80% of samples were
+         * landing exactly on 0 after crushing. Sampling THAT with a
+         * sparse hold (updating only every ~46 samples at typical
+         * rates) had a real, non-negligible chance of every single
+         * hold-update landing on one of those zeroed samples,
+         * silencing the entire voice for the whole note. Caught this
+         * via a debug seed sweep (seed=1 reproduced it consistently)
+         * rather than reasoning it out in advance -- worth remembering
+         * that new per-voice per-note randomization needs the same
+         * seed-sweep verification as everything else, not just the
+         * small sample of seeds a manual test happens to try. */
         {
             const double reducerRate = clampd(v->freqHz * v->rateReducerMultiplier, 100.0, e->sampleRate * 0.5);
             voiceSum = pitchedhold_process(&v->rateReducer, voiceSum, reducerRate, e->sampleRate, 1.0);
         }
         voiceSum = bitcrush_process(voiceSum, v->bitDepth);
+
+        /* STEP 3: voice-level pitch-tracking filter -- per explicit
+         * restructuring request, this REPLACES the old per-layer
+         * filters entirely. High resonance, tracks v->freqHz directly
+         * (knob 1 offset, knob 2 resonance). Deliberately NO envelope
+         * or velocity modulation on this cutoff -- both were tried on
+         * the old per-layer version and both caused real, reported
+         * pitch-accuracy bugs (velocity detuning notes sharp when
+         * played harder; envelope making pitch audibly decay over a
+         * long release, since the cutoff followed envLevel). This
+         * filter's cutoff is now purely a function of the played note
+         * and the two relevant knobs -- nothing else. */
+        {
+            const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
+            const double pitchCutoff = clampd(v->freqHz * cutoffMul, 20.0, e->sampleRate * 0.45);
+            const double pitchResonance = e->params.filterResonance01;
+            if (v->pitchFilterKind == FILTER_MOOG) {
+                moog_ladder_set(&v->pitchFilterMoog, pitchCutoff, pitchResonance, 0.2);
+                voiceSum = moog_ladder_process(&v->pitchFilterMoog, voiceSum);
+            } else {
+                korg35lp_set(&v->pitchFilterKorgLp, pitchCutoff, pitchResonance, 0.2);
+                voiceSum = korg35lp_process(&v->pitchFilterKorgLp, voiceSum);
+            }
+        }
 
         /* Per-voice amplitude modulation -- a simple sine tremolo,
          * depth/rate from knobs 3/4. amDepth01=0 leaves the voice
@@ -613,23 +597,23 @@ double noiseboy_process(NoiseboyEngine *e) {
         const double foldAmount = e->params.amDepth01 * amCyclePosition;
         voiceSum = wavefold_process(voiceSum, foldAmount);
 
-        /* OUTPUT FILT -- a second lowpass applied after the whole
-         * synth signal (everything above: layers, vibrato, bitcrush,
-         * rate-reduce, AM, wavefold) but before the amplitude
-         * envelope. Velocity-driven brightness lives here instead of
-         * on the per-layer pitch-tracking filters (see voice_start's
-         * own comment on why that was wrong). 800Hz (soft) to 16kHz
+        /* STEP 4: amplitude envelope. */
+        voiceSum = voiceSum * v->envLevel * amGain;
+
+        /* STEP 5: OUTPUT FILT -- the final stage, applied AFTER the
+         * envelope now (was before it through v0.7.0; per this
+         * explicit 5-step spec it moves to last). Velocity-driven
+         * brightness lives here, not on the pitch-tracking filter (see
+         * that filter's own comment on why). 800Hz (soft) to 16kHz
          * (bright) across the velocity range is the base, further
          * multiplied by knob 8 (same offset-around-neutral pattern as
-         * knob 1's filterCutoffOffset01) -- knob 8 was deliberately
-         * moved here from Level per explicit request, making it "the
-         * final knob to control audible sound" since this filter is
-         * the last stage before the envelope/output. Resonance is
-         * fixed at 0.0 (NOT knob-controlled, not even the small fixed
-         * 0.15 this had before) per direct correction -- even that
-         * modest resonance was apparently still creating a perceivable
-         * pitch-like artifact, which a filter with zero pitch-defining
-         * role shouldn't be doing at all. */
+         * knob 1) -- knob 8 was deliberately moved here from Level per
+         * explicit request, making it "the final knob to control
+         * audible sound" since this filter is now the literal last
+         * stage before output. Resonance fixed at 0.0 -- even a modest
+         * fixed resonance here was still creating a perceivable
+         * pitch-like artifact, and this filter has no pitch-defining
+         * role at all. */
         {
             const double outputCutoffMul = pow(2.0, (e->params.outputFilterFreq01 - 0.5) * 4.0);
             const double outputCutoff = clampd((800.0 + v->velocity01 * 15200.0) * outputCutoffMul, 20.0, e->sampleRate * 0.45);
@@ -637,7 +621,7 @@ double noiseboy_process(NoiseboyEngine *e) {
             voiceSum = moog_ladder_process(&v->outputFilter, voiceSum);
         }
 
-        mix += voiceSum * v->envLevel * amGain;
+        mix += voiceSum;
     }
 
     /* Single shared drive/saturation stage on the final mix, per

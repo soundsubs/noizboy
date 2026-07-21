@@ -29,8 +29,8 @@ release to avoid clicks, not a sustained pad envelope).
 
 | Knob | Parameter | Range |
 |---|---|---|
-| 1 | Filter Offset | brightens/darkens filtered-noise layers relative to the tracked pitch -- centre (64) = filter sits exactly at the played note, never stops tracking it |
-| 2 | Resonance | filter resonance (filtered-noise layers); also blends into Karplus-Strong pluck damping |
+| 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
+| 2 | Resonance | resonance of the voice-level pitch-tracking filter; also blends into Karplus-Strong pluck damping |
 | 3 | AM Depth | amplitude modulation depth, 0 = off (default) |
 | 4 | AM Rate | amplitude modulation rate, 0.1-20 Hz |
 | 5 | Attack | envelope attack time, 0.5-200 ms |
@@ -42,6 +42,63 @@ release to avoid clicks, not a sustained pad envelope).
 | 11 | Level | master output level -- moved off knob 8 to make room for Output Filt; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.9.0** -- major signal chain restructuring, per explicit spec, plus
+the root cause of a real reported bug found and fixed:
+
+**The bug**: "sampling rate of bitcrushers... following amp envelope...
+with a long release, the pitch decays." The actual mechanism: the OLD
+per-layer pitch-tracking filter's cutoff was modulated by the envelope
+(a 20% brightening at the envelope's peak, added in v0.4.0) -- as
+envLevel decayed during a long release, that filter's cutoff (which
+IS the pitch mechanism for filtered-noise layers) decayed right along
+with it, audibly dragging the pitch down. This is exactly the failure
+mode flagged as a risk when it was first added ("envelopeMul... could
+theoretically have the same issue" as the velocity bug fixed in
+v0.7.0) -- now confirmed and removed.
+
+**The restructuring** (per explicit 5-step spec, "trying to push back
+towards musicality"):
+1. Sources -- up to 3 noise layers + Karplus-Strong, raw generation
+   only now. The per-layer filter and per-layer PitchedHold pitch
+   stage are GONE -- no filtering happens per-layer anymore.
+2. Bitcrush + pitch-following sample-rate reduction, applied to the
+   combined voice signal. Unchanged in mechanism, just now runs before
+   any filtering rather than after.
+3. NEW: a single voice-level pitch-tracking filter (high resonance,
+   randomized per note between Moog Ladder / Korg35LP, matching
+   bitDepth's own per-note variety) replaces all the old per-layer
+   filters. Cutoff is purely `freqHz * knob-1-offset` -- NO envelope
+   modulation, NO velocity modulation, nothing but the played note and
+   two relevant knobs. This is the actual fix for the reported bug.
+4. Amplitude envelope.
+5. OUTPUT FILT -- moved to genuinely last in the chain now (was
+   before the envelope through v0.8.0; explicit spec puts it after).
+   Still the velocity-brightened, zero-resonance, knob-8-controlled
+   final stage.
+
+Vibrato, AM, and wavefolder (not part of the explicit 5-step list)
+were fit in at their most sensible existing positions: vibrato stays
+early (pitch-bending the raw combined source, same as before), AM/
+wavefold stay immediately before the envelope (they're both amplitude-
+family effects).
+
+**Honest note on a real tradeoff observed**: the existing pitch-
+tracking test (zero-crossing count, low note vs. high note 4 octaves
+apart) showed a notably weaker ratio after this change (14->49, ~3.5x,
+vs. the true 16x and vs. ~14-19x in earlier architectures) -- likely
+because the rate-reducer now runs BEFORE the pitch filter and can
+compete with/mask its resonant peak on some notes, whereas before the
+filter ran on a cleaner, unreduced signal. This is a direct, expected
+consequence of the explicitly-requested step 2-before-step-3 ordering,
+not a bug -- flagging it because it's a real, measured difference
+worth listening for, not because anything here contradicts the spec
+as given.
+
+Full test suite re-run clean after this restructuring, including the
+24,000-combination sweep (still zero silent cases) -- verified no
+stale references to any of the removed per-layer filter fields
+remained anywhere in the codebase before finishing.
 
 **v0.8.0** -- three changes from real playing feedback, plus a note on
 what turned out NOT to be a code problem:

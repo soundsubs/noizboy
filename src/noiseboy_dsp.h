@@ -158,25 +158,26 @@ typedef enum { FILTER_MOOG = 0, FILTER_KORG_LP, FILTER_KORG_HP } FilterKind;
 typedef struct {
     LayerType type;
 
-    /* Filtered-noise layer state. */
+    /* Filtered-noise layer state -- raw source generation only now.
+     * The per-layer filter (Moog/Korg35LP/Korg35HP switch,
+     * resonance-per-layer, the pre-filter PitchedHold stage) has been
+     * REMOVED per explicit restructuring request: source generation
+     * (noise/Karplus) -> bitcrush/rate-reduce -> a single VOICE-LEVEL
+     * pitch-tracking filter -> envelope -> output filter, not a filter
+     * per layer before mixing. See Voice's own pitchFilter* fields for
+     * where that single filter now lives. */
     NoiseGen noiseGen;
     NoiseColour colour;
-    FilterKind filterKind;
-    MoogLadder moog;
-    Korg35LP korgLp;
-    Korg35HP korgHp;
-    PitchedHold pitchedHold;
 
     /* Karplus-Strong layer state. */
     KarplusString karplus;
 
-    /* Per-layer randomized character, decided once at instantiation:
-     * a small detune (in cents) for chorused richness when multiple
-     * layers stack, and (filtered-noise only) a damping-equivalent
-     * resonance bias so not every layer sounds identical even at the
-     * same knob settings. */
+    /* Small per-layer detune (in cents), still used for Karplus-type
+     * layers' own pitch (each Karplus layer's delay length is tuned
+     * slightly differently for chorused richness when multiple layers
+     * stack) -- no longer relevant to filtered-noise layers now that
+     * they have no per-layer filter of their own to detune. */
     double detuneCents;
-    double resonanceBias01;
 } Layer;
 
 typedef struct {
@@ -221,15 +222,35 @@ typedef struct {
      * VibratoDelay's own comment. */
     VibratoDelay vibrato;
 
-    /* OUTPUT FILT -- a second lowpass, separate from the per-layer
-     * pitch-tracking filters, applied once to the whole mixed voice
-     * signal (after everything else, before the amplitude envelope).
-     * This is where velocity-driven brightness lives now -- per
-     * direct correction, modulating the per-layer filters by velocity
-     * was detuning notes sharp/flat depending on how hard they were
-     * played, since those filters' cutoff IS the pitch mechanism for
-     * filtered-noise layers. This filter has no pitch role at all, so
-     * it can respond to velocity freely. */
+    /* Voice-level pitch-tracking filter -- per explicit restructuring
+     * request, this replaces the old per-layer filters entirely.
+     * Signal chain is now: sources (noise+Karplus, up to 3 layers) ->
+     * bitcrush/rate-reduce -> THIS FILTER -> AM/wavefold -> amplitude
+     * envelope -> output filter. High resonance, tracks v->freqHz
+     * directly via knob 1 (offset) and knob 2 (resonance).
+     * Deliberately carries NO envelope or velocity modulation on its
+     * cutoff -- envelope-modulated cutoff on a pitch-tracking filter
+     * was a real, reported bug (pitch audibly decaying over a long
+     * release, since the old per-layer filter's cutoff followed
+     * envLevel). Filter type (Moog/Korg35LP) randomized fresh per
+     * note, matching bitDepth/rateReducerMultiplier's own per-note
+     * variety pattern -- Korg35HP still deliberately excluded from
+     * the choice, same reasoning as before (a highpass tuned to the
+     * played pitch works against sounding pitched, not for it). */
+    FilterKind pitchFilterKind;
+    MoogLadder pitchFilterMoog;
+    Korg35LP pitchFilterKorgLp;
+
+    /* OUTPUT FILT -- the final stage, per explicit 5-step signal
+     * chain spec: sources -> bitcrush/rate-reduce -> pitch-tracking
+     * filter -> amplitude envelope -> THIS. Separate from the pitch-
+     * tracking filter above; this is where velocity-driven brightness
+     * lives -- per earlier correction, modulating the pitch-tracking
+     * filter by velocity was detuning notes sharp/flat depending on
+     * how hard they were played, since that filter's cutoff IS the
+     * pitch mechanism. This filter has no pitch role at all (fixed
+     * zero resonance), so it can respond to velocity freely without
+     * creating any perceivable pitch artifact. */
     MoogLadder outputFilter;
 } Voice;
 
@@ -237,15 +258,17 @@ typedef struct {
  * per explicit spec ("every time you instantiate, its a randomized
  * noise block"). Every voice is initialized from this same shared
  * recipe on note-on (same layer count/types/colours), giving each note
- * fresh independent DSP state (filter/noise-generator/Karplus-string
+ * fresh independent DSP state (noise-generator/Karplus-string
  * instances) but a consistent "instrument identity" across the whole
- * session, rather than re-randomizing per note. */
+ * session, rather than re-randomizing per note. Filter choice is NOT
+ * part of the recipe anymore -- the filter moved to voice level and is
+ * randomized fresh per note instead (see Voice's own pitchFilterKind),
+ * matching bitDepth/rateReducerMultiplier's per-note variety pattern
+ * rather than being fixed for the whole session. */
 typedef struct {
     LayerType type;
     NoiseColour colour;      /* filtered-noise layers only */
-    FilterKind filterKind;   /* filtered-noise layers only */
     double detuneCents;
-    double resonanceBias01;
     double dampingAmount01;  /* Karplus-Strong layers only */
 } LayerRecipe;
 
