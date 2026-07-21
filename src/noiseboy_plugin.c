@@ -12,6 +12,15 @@
  *     its own sound; it does not process an incoming stream the way
  *     an audio_fx module would)
  *
+ * Signal chain in render_block: NOISEBOY voice engine -> DBCELL
+ * (always-on db-cell port, dbcell_dsp.c/h) -> noise gate. The gate's
+ * placement AFTER db-cell specifically (not before it) is per direct
+ * correction: db-cell's forced-always-present Noiz slot generates
+ * sound regardless of NOISEBOY's own input, so gating only NOISEBOY's
+ * raw output wouldn't catch db-cell's own residual noise -- the gate
+ * has to be the LAST stage, keyed off actual NOISEBOY voice activity,
+ * to guarantee true silence when nothing is being played.
+ *
  * NOTE ON VERIFICATION: the v2 API's exact struct layout (host_api_v1_t
  * fields, plugin_api_v2_t member order) is taken directly from
  * docs/MODULES.md's own code example, not guessed -- but this file
@@ -24,13 +33,64 @@
 
 #include "host/plugin_api_v1.h" /* v2 API is defined in this same file, per docs/MODULES.md */
 #include "noiseboy_dsp.h"
+#include "dbcell_dsp.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
+
+/* Noise gate applied AFTER db-cell, per explicit correction: db-cell's
+ * forced-always-present Noiz slot generates sound regardless of
+ * NOISEBOY's own input, so without this an "instrument" would still
+ * be audibly hissing even with zero voices playing. Keyed off actual
+ * NOISEBOY voice activity (noiseboy_any_voice_active), not off signal
+ * level -- a level-based gate could still let db-cell's own noise
+ * through during a genuinely quiet-but-still-playing moment, or fail
+ * to fully silence a loud db-cell moment right as the last voice
+ * releases. Fast attack (opens quickly when a note starts) and a
+ * slower, smoothed release (avoids an abrupt click when the last
+ * voice stops) -- one shared envelope drives both channels, since
+ * "any voice active" is a single global condition, not a per-channel
+ * one. */
+typedef struct {
+    double envelope;
+} NoiseboyOutputGate;
+
+static void noiseboy_output_gate_init(NoiseboyOutputGate *g) {
+    g->envelope = 0.0;
+}
+
+static double noiseboy_output_gate_process(NoiseboyOutputGate *g, double x, int voicesActive, double sampleRate) {
+    const double target = voicesActive ? 1.0 : 0.0;
+    const double timeMs = voicesActive ? 3.0 : 150.0;
+    const double coeff = exp(-1.0 / (0.001 * timeMs * sampleRate));
+    g->envelope = target + (g->envelope - target) * coeff;
+    return x * g->envelope;
+}
 
 typedef struct {
     NoiseboyEngine engine;
+    /* DBCELL always runs on NOISEBOY's output, per explicit request
+     * ("add db-cell on the output, always... this will test whether I
+     * like my own work"). See dbcell_dsp.h for the full port
+     * rationale. Separate RNG seed from the main engine's, drawn from
+     * the same /dev/urandom source below, so the two layers'
+     * randomizations are independent rather than correlated. */
+    DbCellEngine dbcell;
+    /* Placed AFTER dbcell in the signal chain -- see NoiseboyOutputGate's own
+     * comment above for why. */
+    NoiseboyOutputGate outputGate;
 } noiseboy_instance_t;
+
+static unsigned int read_random_seed(unsigned int fallback) {
+    unsigned int seed = 0;
+    FILE *urandom = fopen("/dev/urandom", "rb");
+    if (urandom) {
+        if (fread(&seed, sizeof(seed), 1, urandom) != 1) seed = 0;
+        fclose(urandom);
+    }
+    return seed != 0 ? seed : fallback;
+}
 
 static void* create_instance(const char *module_dir, const char *json_defaults) {
     (void)module_dir;
@@ -44,18 +104,7 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
      * time you instantiate, its a randomized noise block"). Falls back
      * to a fixed seed only if neither entropy source is available,
      * rather than leaving the seed uninitialized. */
-    unsigned int seed = 0;
-    FILE *urandom = fopen("/dev/urandom", "rb");
-    if (urandom) {
-        if (fread(&seed, sizeof(seed), 1, urandom) != 1) seed = 0;
-        fclose(urandom);
-    }
-    if (seed == 0) {
-        /* Fallback: a real Schwung host provides a monotonic-ish value
-         * via other means; if this ever needs to be swapped for a
-         * host-provided clock/counter, this is the one place to do it. */
-        seed = 0x5EED0001u;
-    }
+    unsigned int seed = read_random_seed(0x5EED0001u);
 
     /* Sample rate: Schwung's audio pipeline runs at a fixed rate
      * per-device; 48000 matches EMAX_FX's (this project family's)
@@ -63,6 +112,8 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
      * rate through host_api_v1_t, prefer that over this constant --
      * see the NOTE at the top of this file. */
     noiseboy_engine_init(&inst->engine, 48000.0, seed);
+    dbcell_engine_init(&inst->dbcell, 48000.0, read_random_seed(0xDBCE11u));
+    noiseboy_output_gate_init(&inst->outputGate);
 
     return inst;
 }
@@ -123,13 +174,62 @@ static void set_param(void *instance, const char *key, const char *val) {
         p->detuneSpread01 = raw01;
     } else if (strcmp(key, "master_level") == 0) {
         p->masterLevel01 = raw01;
+    } else if (strcmp(key, "drive") == 0) {
+        p->drive01 = raw01;
+    } else if (strcmp(key, "randomize") == 0) {
+        /* Rising-edge trigger, per explicit request for a way to get a
+         * new randomized set without reinstantiating the module --
+         * re-rolls the recipe once when this value crosses from 0 to
+         * nonzero, rather than continuously re-randomizing while a
+         * bound knob/menu control is mid-movement. Only affects notes
+         * played AFTER this call -- see noiseboy_randomize_recipe's
+         * own comment for why in-flight voices aren't touched. Also
+         * re-rolls DBCELL's recipe (a fresh independent seed, not
+         * correlated with NOISEBOY's) so one Randomize gesture
+         * refreshes both layers of the sound together. */
+        int raw = atoi(val);
+        if (raw != 0 && inst->engine.lastRandomizeTriggerRaw == 0) {
+            noiseboy_randomize_recipe(&inst->engine);
+            dbcell_randomize(&inst->dbcell, read_random_seed(0xDBCE22u));
+        }
+        inst->engine.lastRandomizeTriggerRaw = raw;
     }
 }
+
+/* Navigable parameter hierarchy for the Shadow UI -- separate
+ * mechanism from chain_params (which docs/MODULES.md describes as
+ * mapping specifically to the 8 physical knobs, "knobs 1-8 in the
+ * Shadow UI for quick access" -- there's no knob 9 or 10 for it to
+ * map "drive"/"randomize" onto). This is what actually makes those
+ * two reachable at all: a "root" level listing all 10 params, with
+ * only the first 8 bound to knobs via the "knobs" array, matching the
+ * "levels" dictionary format documented in docs/MODULES.md's "Shadow
+ * UI Parameter Hierarchy" section. Same verification caveat as the
+ * rest of this file applies -- built from that documentation's own
+ * example, not confirmed against a real working module. */
+static const char *NOISEBOY_UI_HIERARCHY_JSON =
+    "{\"levels\":{\"root\":{\"name\":\"NOISEBOY\",\"params\":["
+    "{\"key\":\"filter_cutoff\",\"name\":\"Filter Offset\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"am_depth\",\"name\":\"AM Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"am_rate\",\"name\":\"AM Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"detune_spread\",\"name\":\"Detune\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127}"
+    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"am_depth\",\"am_rate\",\"attack\",\"release\",\"detune_spread\",\"master_level\"]}}}";
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
     if (!inst || !key || !buf) return -1;
     NoiseboyParams *p = &inst->engine.params;
+
+    if (strcmp(key, "ui_hierarchy") == 0) {
+        int written = snprintf(buf, (size_t)buf_len, "%s", NOISEBOY_UI_HIERARCHY_JSON);
+        return written;
+    }
 
     double val01 = -1.0;
     if (strcmp(key, "filter_cutoff") == 0) val01 = p->filterCutoffOffset01;
@@ -140,6 +240,13 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     else if (strcmp(key, "release") == 0) val01 = (p->releaseMs - 5.0) / 1995.0;
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;
     else if (strcmp(key, "master_level") == 0) val01 = p->masterLevel01;
+    else if (strcmp(key, "drive") == 0) val01 = p->drive01;
+    else if (strcmp(key, "randomize") == 0) {
+        /* Always reads back as 0 -- it's a momentary trigger, not a
+         * value with a meaningful resting state to report. */
+        int written = snprintf(buf, (size_t)buf_len, "0");
+        return written;
+    }
 
     if (val01 < 0.0) return -1; /* unknown key */
 
@@ -153,11 +260,33 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
 
     for (int i = 0; i < frames; i++) {
         double y = noiseboy_process(&inst->engine);
-        if (y > 1.0) y = 1.0;
-        if (y < -1.0) y = -1.0;
-        int16_t sample = (int16_t)(y * 32767.0);
-        out_lr[i * 2 + 0] = sample; /* L */
-        out_lr[i * 2 + 1] = sample; /* R -- mono source, duplicated (see noiseboy_process's own header comment) */
+
+        /* DBCELL always runs on the output, per explicit request --
+         * NOISEBOY's mono synthesis duplicated to both channels as
+         * db-cell's "dry" input; db-cell's own independent per-channel
+         * chain state naturally diverges the two over time even though
+         * they start identical each sample, so the combined result has
+         * some real stereo width NOISEBOY's own mono voice engine
+         * doesn't produce on its own. */
+        double l = y, r = y;
+        dbcell_process(&inst->dbcell, &l, &r);
+
+        /* Noise gate AFTER dbcell, per explicit correction -- db-cell's
+         * forced-always-present Noiz slot would otherwise keep making
+         * sound even with zero NOISEBOY voices playing. Keyed off
+         * actual voice activity, not signal level -- see
+         * NoiseboyOutputGate's own comment for why. */
+        const int voicesActive = noiseboy_any_voice_active(&inst->engine);
+        l = noiseboy_output_gate_process(&inst->outputGate, l, voicesActive, inst->engine.sampleRate);
+        r = noiseboy_output_gate_process(&inst->outputGate, r, voicesActive, inst->engine.sampleRate);
+
+        if (l > 1.0) l = 1.0;
+        if (l < -1.0) l = -1.0;
+        if (r > 1.0) r = 1.0;
+        if (r < -1.0) r = -1.0;
+
+        out_lr[i * 2 + 0] = (int16_t)(l * 32767.0);
+        out_lr[i * 2 + 1] = (int16_t)(r * 32767.0);
     }
 }
 
