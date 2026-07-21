@@ -54,13 +54,13 @@
  * one. */
 typedef struct {
     double envelope;
-} NoiseGate;
+} NoiseboyOutputGate;
 
-static void noisegate_init(NoiseGate *g) {
+static void noiseboy_output_gate_init(NoiseboyOutputGate *g) {
     g->envelope = 0.0;
 }
 
-static double noisegate_process(NoiseGate *g, double x, int voicesActive, double sampleRate) {
+static double noiseboy_output_gate_process(NoiseboyOutputGate *g, double x, int voicesActive, double sampleRate) {
     const double target = voicesActive ? 1.0 : 0.0;
     const double timeMs = voicesActive ? 3.0 : 150.0;
     const double coeff = exp(-1.0 / (0.001 * timeMs * sampleRate));
@@ -77,9 +77,9 @@ typedef struct {
      * the same /dev/urandom source below, so the two layers'
      * randomizations are independent rather than correlated. */
     DbCellEngine dbcell;
-    /* Placed AFTER dbcell in the signal chain -- see NoiseGate's own
+    /* Placed AFTER dbcell in the signal chain -- see NoiseboyOutputGate's own
      * comment above for why. */
-    NoiseGate noiseGate;
+    NoiseboyOutputGate outputGate;
 } noiseboy_instance_t;
 
 static unsigned int read_random_seed(unsigned int fallback) {
@@ -113,7 +113,7 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
      * see the NOTE at the top of this file. */
     noiseboy_engine_init(&inst->engine, 48000.0, seed);
     dbcell_engine_init(&inst->dbcell, 48000.0, read_random_seed(0xDBCE11u));
-    noisegate_init(&inst->noiseGate);
+    noiseboy_output_gate_init(&inst->outputGate);
 
     return inst;
 }
@@ -274,11 +274,11 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         /* Noise gate AFTER dbcell, per explicit correction -- db-cell's
          * forced-always-present Noiz slot would otherwise keep making
          * sound even with zero NOISEBOY voices playing. Keyed off
-         * actual voice activity, not signal level -- see NoiseGate's
-         * own comment for why. */
+         * actual voice activity, not signal level -- see
+         * NoiseboyOutputGate's own comment for why. */
         const int voicesActive = noiseboy_any_voice_active(&inst->engine);
-        l = noisegate_process(&inst->noiseGate, l, voicesActive, inst->engine.sampleRate);
-        r = noisegate_process(&inst->noiseGate, r, voicesActive, inst->engine.sampleRate);
+        l = noiseboy_output_gate_process(&inst->outputGate, l, voicesActive, inst->engine.sampleRate);
+        r = noiseboy_output_gate_process(&inst->outputGate, r, voicesActive, inst->engine.sampleRate);
 
         if (l > 1.0) l = 1.0;
         if (l < -1.0) l = -1.0;

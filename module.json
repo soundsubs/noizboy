@@ -1,7 +1,7 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.6.0",
+    "version": "0.6.1",
     "abbrev": "NOIZB",
     "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Gentle vibrato, envelope-following cutoff, velocity brightness. db-cell always runs on the output, gated silent between notes. Single-press Randomize via jog click.",
     "author": "soundsubs",

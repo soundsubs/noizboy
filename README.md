@@ -42,6 +42,18 @@ release to avoid clicks, not a sustained pad envelope).
 
 ## Status
 
+**v0.6.1** -- real build fix: `distroy_dsp.h` (the shared DSP core)
+already has its own `NoiseGate` struct and `noisegate_init`/
+`noisegate_process` functions (part of DISTROY's own pedal chain,
+apparently), which I didn't know about when adding a same-named gate
+in `noiseboy_plugin.c` for the post-dbcell silencing fix -- caused a
+genuine compile error (conflicting types) on the real build. Renamed
+mine to `NoiseboyOutputGate`/`noiseboy_output_gate_init`/
+`noiseboy_output_gate_process` to disambiguate. Also proactively
+diffed every struct and function name across `noiseboy_dsp.h`,
+`noiseboy_plugin.c`, and `distroy_dsp.h` to check for any OTHER hidden
+collisions before they could surface the same way -- none found.
+
 **v0.6.0** -- this round covers a real bug catch plus three feature
 requests, and a full rewrite of the Randomize menu using verified
 (not guessed) Schwung UI source:
