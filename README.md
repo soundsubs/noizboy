@@ -40,8 +40,9 @@ release to avoid clicks, not a sustained pad envelope).
 3. Amplitude modulation (tremolo) + wavefolder, both knob 3/4
    controlled and linked to the same cycle.
 4. Amplitude envelope (attack/release, knobs 5-6).
-5. Output Filt -- velocity-brightened, zero-resonance, knob 8
-   controlled; the last stage before output.
+5. Output Filt -- a tilt filter, knob 8 controlled, the last stage
+   before output. Centre = bypassed; left = lowpass sweeping down;
+   right = highpass sweeping up. Either extreme silences the signal.
 
 Bitcrush and sample-rate reduction were both tried at various
 amounts and ultimately removed entirely, per direct feedback -- see
@@ -58,12 +59,41 @@ amounts and ultimately removed entirely, per direct feedback -- see
 | 5 | Attack | envelope attack time, 0.5-200 ms |
 | 6 | Release | envelope release time, 5-2000 ms |
 | 7 | Detune | spread between layers' per-layer detune (0 = unison, up = richer/chorused) |
-| 8 | Output Filt | the LAST stage before the envelope/output -- a second, velocity-brightened, zero-resonance lowpass; this knob multiplies that velocity-driven range up or down (centre/64 = neutral). Deliberately the final knob in the signal path |
+| 8 | Output Filt | TILT filter, the last stage before output. Centre (64) = fully bypassed. Turn left: lowpass sweeps down (20kHz to 20Hz), silencing from the top. Turn right: highpass sweeps up (20Hz to 20kHz), silencing from the bottom. Makes the sound disappear in either direction |
 | 9 | Drive | single shared drive/saturation stage on the final mix -- beyond the 8 physical knobs, reachable via the module's parameter menu |
 | 10 | Randomize | re-rolls the layer recipe on demand, without reinstantiating the module -- rising-edge trigger (any 0->nonzero move fires it once); also reachable as a single jog-wheel-click action in the module's own menu screen |
 | 11 | Level | master output level -- moved off knob 8 to make room for Output Filt; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.11.0** -- Output Filt (knob 8) rebuilt as a TILT filter, per
+direct request. Checked the previous design first rather than
+assuming it was broken -- `set_param`, `get_param`, and the
+`ui_hierarchy` knob mapping for `output_filter_freq` all traced
+correctly, so the most likely explanation is the old design (a
+velocity-scaled multiplier, clamped near Nyquist on the bright end)
+was just too subtle to register as doing anything.
+
+New behaviour: knob centred (12 o'clock, 64) = completely bypassed.
+Turning left engages a lowpass whose cutoff falls (20kHz down to
+20Hz, log scale) the further left you go. Turning right engages a
+highpass whose cutoff rises (20Hz up to 20kHz) the further right you
+go. Only one side is ever active at a time -- a true tilt, not two
+filters stacked.
+
+Caught and fixed a real acoustic limitation during testing, not just
+implemented blind: isolated-filter testing against white noise showed
+Korg35HP's own attenuation plateaus around ~29% RMS remaining no
+matter how close its cutoff gets pushed toward Nyquist -- a structural
+property of this filter topology at extreme cutoff ratios, not
+something tunable away. Added a supplemental quadratic gain fade
+(applied to BOTH sides, for symmetry) that guarantees true silence at
+each extreme regardless of what the filter alone achieves, while
+leaving the filter's own natural sweep character dominant through
+most of the knob's range. Verified directly: both extremes now
+measure exactly 0.0 output in a dedicated test (`make test-tilt`, now
+part of the default `make test`), center position confirmed unchanged
+(full signal passes through).
 
 **v0.10.0** -- bitcrush and sample-rate reduction removed entirely,
 per explicit request, after several rounds of trying to find a

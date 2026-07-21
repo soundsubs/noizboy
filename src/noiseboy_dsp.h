@@ -236,17 +236,20 @@ typedef struct {
     MoogLadder pitchFilterMoog;
     Korg35LP pitchFilterKorgLp;
 
-    /* OUTPUT FILT -- the final stage, per explicit 5-step signal
-     * chain spec: sources -> bitcrush/rate-reduce -> pitch-tracking
-     * filter -> amplitude envelope -> THIS. Separate from the pitch-
-     * tracking filter above; this is where velocity-driven brightness
-     * lives -- per earlier correction, modulating the pitch-tracking
-     * filter by velocity was detuning notes sharp/flat depending on
-     * how hard they were played, since that filter's cutoff IS the
-     * pitch mechanism. This filter has no pitch role at all (fixed
-     * zero resonance), so it can respond to velocity freely without
-     * creating any perceivable pitch artifact. */
-    MoogLadder outputFilter;
+    /* OUTPUT FILT -- the final stage, per explicit spec. Rebuilt as a
+     * TILT filter, per direct request: knob centred (12 o'clock) =
+     * no filtering at all. Turning left engages a lowpass whose
+     * cutoff falls as you keep turning left, eventually silencing the
+     * signal from the top down. Turning right engages a highpass
+     * whose cutoff rises as you keep turning right, eventually
+     * silencing the signal from the bottom up -- "make it disappear
+     * either direction". Only one side is ever active at a time (never
+     * both at once) -- a true tilt, not two independent filters
+     * stacked. No velocity or envelope influence, no resonance --
+     * purely knob-controlled sweep in either direction, deliberately
+     * simple and predictable. */
+    MoogLadder outputLowpass;
+    Korg35HP outputHighpass;
 } Voice;
 
 /* Layer RECIPE, decided once at module instantiation (not per-note) --

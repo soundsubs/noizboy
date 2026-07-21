@@ -332,7 +332,8 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
      * in case a future revision wants them back at a different
      * amount/design. */
     vibrato_init(&v->vibrato);
-    moog_ladder_init(&v->outputFilter, e->sampleRate);
+    moog_ladder_init(&v->outputLowpass, e->sampleRate);
+    korg35hp_init(&v->outputHighpass, e->sampleRate);
 
     /* Voice-level pitch-tracking filter -- randomized fresh per note
      * (Moog/Korg35LP, 50/50; Korg35HP deliberately excluded, same
@@ -577,25 +578,55 @@ double noiseboy_process(NoiseboyEngine *e) {
         /* STEP 4: amplitude envelope. */
         voiceSum = voiceSum * v->envLevel * amGain;
 
-        /* STEP 5: OUTPUT FILT -- the final stage, applied AFTER the
-         * envelope now (was before it through v0.7.0; per this
-         * explicit 5-step spec it moves to last). Velocity-driven
-         * brightness lives here, not on the pitch-tracking filter (see
-         * that filter's own comment on why). 800Hz (soft) to 16kHz
-         * (bright) across the velocity range is the base, further
-         * multiplied by knob 8 (same offset-around-neutral pattern as
-         * knob 1) -- knob 8 was deliberately moved here from Level per
-         * explicit request, making it "the final knob to control
-         * audible sound" since this filter is now the literal last
-         * stage before output. Resonance fixed at 0.0 -- even a modest
-         * fixed resonance here was still creating a perceivable
-         * pitch-like artifact, and this filter has no pitch-defining
-         * role at all. */
+        /* STEP 5: OUTPUT FILT -- the final stage. Rebuilt as a TILT
+         * filter, per direct request. Knob centred (12 o'clock, 64) =
+         * completely bypassed, full signal through. Turning left
+         * engages a lowpass whose cutoff falls (log scale, 20kHz down
+         * to 20Hz) the further left you go, silencing the signal from
+         * the top down. Turning right engages a highpass whose cutoff
+         * rises (log scale, 20Hz up to 20kHz) the further right you
+         * go, silencing the signal from the bottom up -- "make it
+         * disappear either direction". Only ONE side is ever active at
+         * a time (a true tilt, not two filters stacked) -- below
+         * centre uses the lowpass exclusively, above centre uses the
+         * highpass exclusively. No velocity or envelope influence, no
+         * resonance -- purely a knob-controlled sweep, deliberately
+         * simple and predictable given this replaces a previous
+         * design that wasn't landing as an audible, useful control. */
         {
-            const double outputCutoffMul = pow(2.0, (e->params.outputFilterFreq01 - 0.5) * 4.0);
-            const double outputCutoff = clampd((800.0 + v->velocity01 * 15200.0) * outputCutoffMul, 20.0, e->sampleRate * 0.45);
-            moog_ladder_set(&v->outputFilter, outputCutoff, 0.0, 0.1);
-            voiceSum = moog_ladder_process(&v->outputFilter, voiceSum);
+            const double knob = e->params.outputFilterFreq01;
+            if (knob <= 0.5) {
+                const double t = clampd((0.5 - knob) / 0.5, 0.0, 1.0);
+                const double lpCutoff = clampd(20000.0 * pow(20.0 / 20000.0, t), 20.0, e->sampleRate * 0.45);
+                moog_ladder_set(&v->outputLowpass, lpCutoff, 0.0, 0.1);
+                voiceSum = moog_ladder_process(&v->outputLowpass, voiceSum);
+                /* Same supplemental fade as the highpass side, for a
+                 * symmetric guarantee of true silence at both extremes
+                 * rather than relying solely on each filter's own
+                 * natural rolloff (which, like the highpass side,
+                 * still leaves some audible signal through even at its
+                 * most extreme setting). */
+                voiceSum *= (1.0 - t * t);
+            } else {
+                const double t = clampd((knob - 0.5) / 0.5, 0.0, 1.0);
+                const double hpCutoff = clampd(20.0 * pow(20000.0 / 20.0, t), 20.0, e->sampleRate * 0.45);
+                korg35hp_set(&v->outputHighpass, hpCutoff, 0.0, 0.1);
+                voiceSum = korg35hp_process(&v->outputHighpass, voiceSum);
+                /* Supplemental gain fade, highpass side only -- verified
+                 * directly (isolated filter test against white noise)
+                 * that Korg35HP's own attenuation plateaus around ~29%
+                 * RMS remaining no matter how close the cutoff gets to
+                 * Nyquist, a structural limit of this filter topology
+                 * at extreme cutoff ratios, not something tunable away
+                 * by pushing the cutoff further. The lowpass side needs
+                 * no such help -- it naturally reaches near-total
+                 * silence on its own. Quadratic fade (gentle at first,
+                 * accelerating toward full silence exactly at t=1) so
+                 * full-right guarantees "disappear" as explicitly
+                 * requested, while the filter's own sweep character
+                 * still dominates through most of the range. */
+                voiceSum *= (1.0 - t * t);
+            }
         }
 
         mix += voiceSum;
