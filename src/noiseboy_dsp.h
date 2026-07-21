@@ -80,6 +80,19 @@ typedef struct {
 void pitchedhold_init(PitchedHold *h);
 double pitchedhold_process(PitchedHold *h, double newSample, double freqHz, double sampleRate, double holdMultiplier);
 
+/* Simple bit-depth quantizer, per explicit request for a per-voice
+ * bitcrusher (random 1-15 bits, applied to the voice's mixed layer
+ * output). Stateless -- just a quantization formula, no persistent
+ * state needed between calls. */
+double bitcrush_process(double x, int bits);
+
+/* Simple reflective wavefolder, per explicit request to add one to
+ * the AM stage that "comes in and out with the AM" -- amount 0 = no
+ * folding (passthrough), higher amounts fold the signal back on
+ * itself repeatedly when it exceeds +-1, producing rich, FM-like
+ * harmonics rather than hard clipping. */
+double wavefold_process(double x, double amount);
+
 typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG } LayerType;
 /* FILTER_KORG_HP is intentionally no longer selected by the
  * randomizer (see randomizeCell-equivalent logic in the .c file) --
@@ -139,6 +152,21 @@ typedef struct {
      * more like an ensemble of slightly-differently-wobbling noise
      * sources than one synchronized tremolo. */
     double amPhase;
+
+    /* Per-voice bitcrusher and pitch-following sample-rate reducer,
+     * per explicit request -- randomized fresh on every note-on (not
+     * part of the fixed recipe), so different notes played on the
+     * same recipe get some additional per-note variety. bitDepth is
+     * literal (1-15 bits, quantization applied directly). The rate
+     * reducer reuses the same PitchedHold mechanism the per-layer
+     * pitch stage uses (a sample-and-hold whose rate tracks the
+     * played note), applied here at the VOICE level (after layers are
+     * mixed) rather than per-layer -- "the ear will detect this as
+     * pitch" is the same principle as PitchedHold's own rationale,
+     * just as a second, voice-wide instance of it. */
+    int bitDepth;
+    PitchedHold rateReducer;
+    double rateReducerMultiplier; /* how far above the 100Hz floor this voice's reduction rate can reach, randomized per note */
 } Voice;
 
 /* Layer RECIPE, decided once at module instantiation (not per-note) --
@@ -174,6 +202,22 @@ typedef struct {
     double drive01;               /* chain_param 9: single shared drive/saturation stage on the final mix -- see noiseboy_process */
 } NoiseboyParams;
 
+/* Global, always-on tape-style saturation stage on the final mixed
+ * output -- per explicit request ("output should have a tape
+ * saturation on always that compresses, drives, and saturates the
+ * final sound... on the global output, so all voices get this").
+ * Simple envelope-follower compressor feeding a driven tanh
+ * saturation stage -- not a literal tape-machine model (no wow/
+ * flutter, no head-bump EQ), just the "compresses, drives, saturates"
+ * character requested, kept cheap given NOISEBOY's CPU-light mandate
+ * (same philosophy as db-cell's own drive stage). */
+typedef struct {
+    double envelope;
+} TapeSaturation;
+
+void tapesat_init(TapeSaturation *t);
+double tapesat_process(TapeSaturation *t, double x, double sampleRate);
+
 typedef struct {
     double sampleRate;
     unsigned int rngState;
@@ -190,6 +234,11 @@ typedef struct {
      * the recipe exactly once per press, rather than re-randomizing
      * continuously while a bound knob is mid-turn. */
     int lastRandomizeTriggerRaw;
+
+    /* Global output stage -- always on, not knob-controlled, applied
+     * once to the final mix after all voices are summed (and after
+     * DBCELL processing, in the plugin wrapper). */
+    TapeSaturation tapeSat;
 } NoiseboyEngine;
 
 void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int seed);
@@ -204,6 +253,13 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e);
 void noiseboy_note_on(NoiseboyEngine *e, int midiNote, double velocity01);
 void noiseboy_note_off(NoiseboyEngine *e, int midiNote);
 void noiseboy_all_notes_off(NoiseboyEngine *e);
+/* Whether any voice is currently active (sounding or in release) --
+ * per explicit request, used to key a noise gate placed AFTER db-cell
+ * in the plugin wrapper's output chain, since db-cell's own forced-
+ * always-present Noiz slot generates sound regardless of NOISEBOY's
+ * own input and would otherwise leak through even with zero voices
+ * playing. */
+int noiseboy_any_voice_active(const NoiseboyEngine *e);
 /* Processes and returns ONE mono sample -- there's no meaningful
  * stereo width to a noise+filter/Karplus-Strong source without adding
  * complexity that wasn't asked for, so the caller duplicates this to

@@ -16,6 +16,7 @@ rm -rf dist/noiseboy
 mkdir -p dist/noiseboy
 cp module.json dist/noiseboy/
 cp build/dsp.so dist/noiseboy/
+cp src/ui.js dist/noiseboy/
 
 tar -czf noiseboy-module.tar.gz -C dist noiseboy
 

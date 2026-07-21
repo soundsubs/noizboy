@@ -85,6 +85,66 @@ double pitchedhold_process(PitchedHold *h, double newSample, double freqHz, doub
     return h->heldValue;
 }
 
+double bitcrush_process(double x, int bits) {
+    /* Standard bit-depth quantizer, covering the full [-1,1] signal
+     * range with 2^bits discrete levels. bits=1 crushes to essentially
+     * {-1,0,1}; bits=15 is close to imperceptible (step ~0.00006). */
+    if (bits < 1) bits = 1;
+    if (bits > 16) bits = 16;
+    double levels = pow(2.0, (double)bits);
+    double step = 2.0 / levels;
+    return floor(x / step + 0.5) * step;
+}
+
+double wavefold_process(double x, double amount) {
+    /* Reflective wavefolder: pre-gain scales with amount, then any
+     * excursion past +-1 bounces back into range (a triangle-wave-
+     * style fold) rather than clipping -- the classic wavefolding
+     * technique for rich, FM-like harmonics. Iteration count capped at
+     * 8 as a safety net against runaway loops on extreme inputs; in
+     * practice folds rarely need more than 1-2 reflections at the
+     * amounts this is actually driven with. */
+    if (amount <= 0.0001) return x;
+    double driven = x * (1.0 + amount * 4.0);
+    for (int i = 0; i < 8; i++) {
+        if (driven > 1.0) driven = 2.0 - driven;
+        else if (driven < -1.0) driven = -2.0 - driven;
+        else break;
+    }
+    return driven;
+}
+
+void tapesat_init(TapeSaturation *t) {
+    t->envelope = 0.0;
+}
+
+double tapesat_process(TapeSaturation *t, double x, double sampleRate) {
+    /* Simple envelope-follower compressor (5ms attack, 80ms release,
+     * threshold 0.3, ratio 3:1) feeding a fixed 2x drive into tanh
+     * saturation -- "compresses, drives, and saturates", per explicit
+     * request, kept deliberately simple/cheap rather than modeling
+     * tape wow/flutter or head-bump EQ, matching the CPU-light mandate
+     * this whole project follows. */
+    double absX = fabs(x);
+    const double attackCoeff = exp(-1.0 / (0.001 * 5.0 * sampleRate));
+    const double releaseCoeff = exp(-1.0 / (0.001 * 80.0 * sampleRate));
+    const double coeff = absX > t->envelope ? attackCoeff : releaseCoeff;
+    t->envelope = absX + (t->envelope - absX) * coeff;
+
+    const double threshold = 0.3;
+    const double ratio = 3.0;
+    double gainReduction = 1.0;
+    if (t->envelope > threshold) {
+        const double excess = t->envelope - threshold;
+        const double compressedExcess = excess / ratio;
+        gainReduction = (threshold + compressedExcess) / t->envelope;
+    }
+
+    const double compressed = x * gainReduction;
+    const double driven = compressed * 2.0;
+    return tanh(driven);
+}
+
 /* ---------------------------------------------------------------------
  * Engine: voice management, randomized recipe, MIDI, per-sample mix.
  * ------------------------------------------------------------------- */
@@ -135,6 +195,8 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     e->params.masterLevel01 = 0.8;
     e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
+    tapesat_init(&e->tapeSat);
+
     noiseboy_randomize_recipe(e);
 }
 
@@ -154,7 +216,15 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
         /* Per explicit clarification: filtered-noise layers always
          * track pitch via their filter; Karplus-Strong is the second,
          * separately-pitched method, chosen randomly per layer. */
-        r->type = (rand01(&e->rngState) < 0.5) ? LAYER_FILTERED_NOISE : LAYER_KARPLUS_STRONG;
+        /* 25% per-layer chance, not 50% -- per direct feedback that
+         * Karplus-Strong felt like it was on "most patches". Worked
+         * out why: with 1-3 layers per recipe, a 50/50 per-layer coin
+         * flip means the probability of AT LEAST ONE Karplus layer
+         * appearing compounds across layers (50% at 1 layer, 75% at 2,
+         * 87.5% at 3 -- averaging ~71% overall, which matches the
+         * complaint). 25% per-layer brings that average down to ~42%,
+         * a genuinely "sometimes" rate rather than "usually". */
+        r->type = (rand01(&e->rngState) < 0.25) ? LAYER_KARPLUS_STRONG : LAYER_FILTERED_NOISE;
 
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
@@ -189,6 +259,19 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->envLevel = 0.0;
     v->gateOpen = 1;
     v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't AM in lockstep */
+
+    /* Per-voice bitcrusher (1-15 bits) and pitch-following sample-rate
+     * reducer, randomized fresh each note-on per explicit request.
+     * rateReducerMultiplier is randomized per note so different notes
+     * on the same recipe get some variety in how aggressively reduced
+     * they sound, not just where the reduction rate sits -- the
+     * reduction rate itself (freqHz * multiplier, floored at 100Hz,
+     * ceiled at Nyquist in noiseboy_process) is what actually "follows
+     * played note numbers". */
+    v->bitDepth = 1 + (int)(rand01(&e->rngState) * 15.0);
+    if (v->bitDepth > 15) v->bitDepth = 15;
+    v->rateReducerMultiplier = 0.5 + rand01(&e->rngState) * 7.5;
+    pitchedhold_init(&v->rateReducer);
 
     v->numLayers = e->numRecipeLayers;
     for (int i = 0; i < v->numLayers; i++) {
@@ -253,6 +336,13 @@ void noiseboy_all_notes_off(NoiseboyEngine *e) {
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         e->voices[v].gateOpen = 0;
     }
+}
+
+int noiseboy_any_voice_active(const NoiseboyEngine *e) {
+    for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
+        if (e->voices[v].active) return 1;
+    }
+    return 0;
 }
 
 static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
@@ -325,6 +415,19 @@ double noiseboy_process(NoiseboyEngine *e) {
         }
         if (v->numLayers > 0) voiceSum /= (double)v->numLayers;
 
+        /* Per-voice bitcrusher + pitch-following sample-rate reducer,
+         * applied to the mixed voice signal (after layers, before AM)
+         * -- per explicit request. Rate reducer's rate is derived from
+         * the played note (freqHz * this voice's randomized
+         * multiplier), floored at 100Hz and ceiled at Nyquist so it
+         * always sits somewhere between "100Hz crunch" and "full
+         * resolution" as requested, while still tracking pitch. */
+        voiceSum = bitcrush_process(voiceSum, v->bitDepth);
+        {
+            const double reducerRate = clampd(v->freqHz * v->rateReducerMultiplier, 100.0, e->sampleRate * 0.5);
+            voiceSum = pitchedhold_process(&v->rateReducer, voiceSum, reducerRate, e->sampleRate, 1.0);
+        }
+
         /* Per-voice amplitude modulation -- a simple sine tremolo,
          * depth/rate from knobs 3/4. amDepth01=0 leaves the voice
          * completely untouched (multiplying by 1.0 always), matching
@@ -332,7 +435,17 @@ double noiseboy_process(NoiseboyEngine *e) {
          * wobble. */
         v->amPhase += e->params.amRateHz * dt;
         if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
-        double amGain = 1.0 - e->params.amDepth01 * 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase));
+        const double amCyclePosition = 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase)); // 0 at the AM peak, 1 at the AM dip
+        const double amGain = 1.0 - e->params.amDepth01 * amCyclePosition;
+
+        /* Wavefolder linked to the SAME AM cycle, per explicit request
+         * that it "comes in and out with the AM" -- fold amount peaks
+         * exactly when amGain is at its quietest, so the dip in volume
+         * is accompanied by a dip into more distorted/folded texture
+         * rather than the two being unrelated. Zero when AM depth is
+         * zero, matching "controlled by the knobs" like AM itself. */
+        const double foldAmount = e->params.amDepth01 * amCyclePosition;
+        voiceSum = wavefold_process(voiceSum, foldAmount);
 
         mix += voiceSum * v->envLevel * amGain;
     }
@@ -348,6 +461,15 @@ double noiseboy_process(NoiseboyEngine *e) {
      * cancel out. */
     double driveGain = 1.0 + e->params.drive01 * 6.0;
     mix = tanh(mix * driveGain);
+
+    /* Global, always-on tape saturation stage -- per explicit request,
+     * distinct from the knob-controlled Drive above (which can be
+     * turned down to 0; this can't). Placed after Drive specifically
+     * because it has its own built-in compressor, which tames whatever
+     * loudness Drive added before the final tanh warms/rounds it off
+     * -- a sensible "drive then tame" order rather than two unrelated
+     * saturation stages fighting each other. */
+    mix = tapesat_process(&e->tapeSat, mix, e->sampleRate);
 
     return mix * e->params.masterLevel01;
 }

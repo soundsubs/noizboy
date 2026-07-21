@@ -1,11 +1,12 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.3.0",
+    "version": "0.4.1",
     "abbrev": "NOIZB",
-    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument, with db-cell's randomized 8-slot DISTROYBOY chain always running on the output. Randomizes both layers on load or via the Randomize param.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument with per-voice bitcrush/rate-reduce, AM-linked wavefolding, always-on tape saturation, and db-cell's chain always running on the output. Single-press Randomize in the menu.",
     "author": "soundsubs",
     "dsp": "dsp.so",
+    "ui": "ui.js",
     "api_version": 2,
     "capabilities": {
         "audio_out": true,

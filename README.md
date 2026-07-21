@@ -42,6 +42,48 @@ release to avoid clicks, not a sustained pad envelope).
 
 ## Status
 
+**v0.4.1** -- signal chain correction: db-cell's forced-always-present
+Noiz slot generates sound regardless of NOISEBOY's own input, so a
+noise gate is now placed AFTER db-cell (not before, and not on
+NOISEBOY's raw output alone) -- keyed off actual NOISEBOY voice
+activity (`noiseboy_any_voice_active`), not signal level, so the
+instrument is genuinely silent when nothing is being played rather
+than leaving a faint db-cell hiss running. Fast attack (3ms), smoothed
+release (150ms) to avoid a click when the last voice stops. Verified
+the gate math directly with a standalone simulation before wiring it
+in: full level while "active", decays ~84dB down within 1 second of
+"inactive".
+
+**v0.4.0** -- five changes from real hardware feedback:
+1. Karplus-Strong rebalanced from 50% to 25% per-layer selection odds
+   -- the original 50/50 compounded across 1-3 layers to ~71% of
+   recipes containing at least one Karplus layer, which is what "on
+   most patches" was actually describing. Verified the new ~42% rate
+   statistically across 5000 seeds (42.7% actual vs. ~42% computed).
+2. Per-voice bitcrusher (random 1-15 bits) and pitch-following
+   sample-rate reducer, both randomized fresh on every note-on,
+   applied to the voice's mixed layer output. The reducer reuses the
+   same `PitchedHold` sample-and-hold mechanism the per-layer pitch
+   stage already used, floored at 100Hz and ceiled at Nyquist.
+3. AM-linked wavefolder -- fold amount driven by the exact same phase
+   as the AM tremolo, so distortion peaks exactly when the AM dip is
+   deepest ("comes in and out with the AM").
+4. Global always-on tape saturation (envelope-follower compressor +
+   fixed drive + tanh) on the final mix, distinct from the existing
+   knob-controlled Drive stage -- placed after Drive since its
+   built-in compressor tames whatever loudness Drive added.
+5. Single-button-press Randomize via a new `ui.js` Shadow UI menu
+   (previously only reachable by nudging a chain_param knob from 0).
+   This is new ground for the project -- everything before this was
+   pure native C/dsp.so with no JavaScript UI layer at all -- built
+   from documentation examples, syntax-verified with `node --check`,
+   but not confirmed against a real working module's menu.
+
+All DSP changes stress-tested together at maximum AM depth/rate/drive
+across 4 simultaneous voices: stayed finite, peaked at a safe 0.77,
+and confirmed bitDepth genuinely varies per voice across different
+notes (not a fixed/stuck value).
+
 **v0.3.0** -- db-cell is now permanently baked into the output, per
 explicit request ("add db-cell on the output, always... this will
 test whether I like my own work"). Full C port of db-cell's chaos

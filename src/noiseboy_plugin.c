@@ -12,6 +12,15 @@
  *     its own sound; it does not process an incoming stream the way
  *     an audio_fx module would)
  *
+ * Signal chain in render_block: NOISEBOY voice engine -> DBCELL
+ * (always-on db-cell port, dbcell_dsp.c/h) -> noise gate. The gate's
+ * placement AFTER db-cell specifically (not before it) is per direct
+ * correction: db-cell's forced-always-present Noiz slot generates
+ * sound regardless of NOISEBOY's own input, so gating only NOISEBOY's
+ * raw output wouldn't catch db-cell's own residual noise -- the gate
+ * has to be the LAST stage, keyed off actual NOISEBOY voice activity,
+ * to guarantee true silence when nothing is being played.
+ *
  * NOTE ON VERIFICATION: the v2 API's exact struct layout (host_api_v1_t
  * fields, plugin_api_v2_t member order) is taken directly from
  * docs/MODULES.md's own code example, not guessed -- but this file
@@ -28,6 +37,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
+
+/* Noise gate applied AFTER db-cell, per explicit correction: db-cell's
+ * forced-always-present Noiz slot generates sound regardless of
+ * NOISEBOY's own input, so without this an "instrument" would still
+ * be audibly hissing even with zero voices playing. Keyed off actual
+ * NOISEBOY voice activity (noiseboy_any_voice_active), not off signal
+ * level -- a level-based gate could still let db-cell's own noise
+ * through during a genuinely quiet-but-still-playing moment, or fail
+ * to fully silence a loud db-cell moment right as the last voice
+ * releases. Fast attack (opens quickly when a note starts) and a
+ * slower, smoothed release (avoids an abrupt click when the last
+ * voice stops) -- one shared envelope drives both channels, since
+ * "any voice active" is a single global condition, not a per-channel
+ * one. */
+typedef struct {
+    double envelope;
+} NoiseGate;
+
+static void noisegate_init(NoiseGate *g) {
+    g->envelope = 0.0;
+}
+
+static double noisegate_process(NoiseGate *g, double x, int voicesActive, double sampleRate) {
+    const double target = voicesActive ? 1.0 : 0.0;
+    const double timeMs = voicesActive ? 3.0 : 150.0;
+    const double coeff = exp(-1.0 / (0.001 * timeMs * sampleRate));
+    g->envelope = target + (g->envelope - target) * coeff;
+    return x * g->envelope;
+}
 
 typedef struct {
     NoiseboyEngine engine;
@@ -38,6 +77,9 @@ typedef struct {
      * the same /dev/urandom source below, so the two layers'
      * randomizations are independent rather than correlated. */
     DbCellEngine dbcell;
+    /* Placed AFTER dbcell in the signal chain -- see NoiseGate's own
+     * comment above for why. */
+    NoiseGate noiseGate;
 } noiseboy_instance_t;
 
 static unsigned int read_random_seed(unsigned int fallback) {
@@ -71,6 +113,7 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
      * see the NOTE at the top of this file. */
     noiseboy_engine_init(&inst->engine, 48000.0, seed);
     dbcell_engine_init(&inst->dbcell, 48000.0, read_random_seed(0xDBCE11u));
+    noisegate_init(&inst->noiseGate);
 
     return inst;
 }
@@ -227,6 +270,15 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
          * doesn't produce on its own. */
         double l = y, r = y;
         dbcell_process(&inst->dbcell, &l, &r);
+
+        /* Noise gate AFTER dbcell, per explicit correction -- db-cell's
+         * forced-always-present Noiz slot would otherwise keep making
+         * sound even with zero NOISEBOY voices playing. Keyed off
+         * actual voice activity, not signal level -- see NoiseGate's
+         * own comment for why. */
+        const int voicesActive = noiseboy_any_voice_active(&inst->engine);
+        l = noisegate_process(&inst->noiseGate, l, voicesActive, inst->engine.sampleRate);
+        r = noisegate_process(&inst->noiseGate, r, voicesActive, inst->engine.sampleRate);
 
         if (l > 1.0) l = 1.0;
         if (l < -1.0) l = -1.0;
