@@ -262,7 +262,8 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     e->params.masterLevel01 = 0.8;
     e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
-    tapesat_init(&e->tapeSat);
+    tapesat_init(&e->tapeSatL);
+    tapesat_init(&e->tapeSatR);
 
     noiseboy_randomize_recipe(e);
 }
@@ -332,9 +333,12 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
      * established "keep superseded options, don't delete" convention,
      * in case a future revision wants them back at a different
      * amount/design. */
-    vibrato_init(&v->vibrato);
-    moog_ladder_init(&v->outputLowpass, e->sampleRate);
-    korg35hp_init(&v->outputHighpass, e->sampleRate);
+    vibrato_init(&v->vibratoL);
+    vibrato_init(&v->vibratoR);
+    moog_ladder_init(&v->outputLowpassL, e->sampleRate);
+    moog_ladder_init(&v->outputLowpassR, e->sampleRate);
+    korg35hp_init(&v->outputHighpassL, e->sampleRate);
+    korg35hp_init(&v->outputHighpassR, e->sampleRate);
 
     /* Voice-level pitch-tracking filter -- randomized fresh per note
      * (Moog/Korg35LP, 50/50; Korg35HP deliberately excluded, same
@@ -343,8 +347,10 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
      * established per-note variety pattern now that filter choice is
      * no longer part of the fixed recipe. */
     v->pitchFilterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
-    moog_ladder_init(&v->pitchFilterMoog, e->sampleRate);
-    korg35lp_init(&v->pitchFilterKorgLp, e->sampleRate);
+    moog_ladder_init(&v->pitchFilterMoogL, e->sampleRate);
+    moog_ladder_init(&v->pitchFilterMoogR, e->sampleRate);
+    korg35lp_init(&v->pitchFilterKorgLpL, e->sampleRate);
+    korg35lp_init(&v->pitchFilterKorgLpR, e->sampleRate);
 
     v->numLayers = e->numRecipeLayers;
     for (int i = 0; i < v->numLayers; i++) {
@@ -460,8 +466,18 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
     return noisegen_process(&layer->noiseGen, layer->colour);
 }
 
-double noiseboy_process(NoiseboyEngine *e) {
-    double mix = 0.0;
+/* Equal-power pan law -- panPos in [-1,1] (-1=full left, 0=centre,
+ * +1=full right). Used by the Detune-driven stereo spreading feature
+ * (see noiseboy_process_stereo). */
+static void compute_pan_gains(double panPos, double *gainL, double *gainR) {
+    const double clamped = clampd(panPos, -1.0, 1.0);
+    const double angle = (clamped + 1.0) * (M_PI / 4.0);
+    *gainL = cos(angle);
+    *gainR = sin(angle);
+}
+
+void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
+    double mixL = 0.0, mixR = 0.0;
     const double dt = 1.0 / e->sampleRate;
 
     /* Smooth knob 8 (Output Filt) toward its target once per sample,
@@ -496,18 +512,46 @@ double noiseboy_process(NoiseboyEngine *e) {
             continue;
         }
 
-        double voiceSum = 0.0;
-        for (int li = 0; li < v->numLayers; li++) {
-            voiceSum += process_layer(e, v, &v->layers[li]);
-        }
-        if (v->numLayers > 0) voiceSum /= (double)v->numLayers;
-
-        /* AM phase updated here (before vibrato/AM/wavefold all need
-         * it) rather than down where AM itself used to compute it --
-         * vibrato needs the same shared phase too, per explicit
-         * request that it stays in sync with the tremolo. */
+        /* AM phase updated here, before layer mixing, since Karplus
+         * layers' auto-pan (below) needs it for this same sample --
+         * a one-sample-early read makes no audible difference for a
+         * continuously-incrementing phase accumulator. */
         v->amPhase += e->params.amRateHz * dt;
         if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
+
+        /* Stereo spreading, per explicit request: Detune (knob 7) now
+         * controls stereo width, not just pitch spread. Filtered-noise
+         * layers get a FIXED pan position, reusing each layer's own
+         * already-randomized detuneCents (the same +-15-cents-per-
+         * layer spread used for pitch, normalized to a pan position)
+         * so a layer's pitch-spread character and its stereo position
+         * are the same underlying randomization, not two unrelated
+         * ones. Karplus layers instead auto-pan back and forth at the
+         * AM rate (explicit request: "karplus pans back and forth at
+         * the AM rate"), using the SAME amPhase driving AM/wavefold/
+         * vibrato for a consistent, synchronized modulation source
+         * rather than a separate, unrelated LFO. Both scaled by
+         * detuneSpread01 -- at Detune=0 every layer collapses to dead
+         * centre (mono), matching noiseboy_process's own mono output
+         * exactly. */
+        double voiceSumL = 0.0, voiceSumR = 0.0;
+        for (int li = 0; li < v->numLayers; li++) {
+            const double layerOut = process_layer(e, v, &v->layers[li]);
+            double panPos;
+            if (v->layers[li].type == LAYER_KARPLUS_STRONG) {
+                panPos = sin(2.0 * M_PI * v->amPhase) * e->params.detuneSpread01;
+            } else {
+                panPos = clampd(v->layers[li].detuneCents / 15.0, -1.0, 1.0) * e->params.detuneSpread01;
+            }
+            double gainL, gainR;
+            compute_pan_gains(panPos, &gainL, &gainR);
+            voiceSumL += layerOut * gainL;
+            voiceSumR += layerOut * gainR;
+        }
+        if (v->numLayers > 0) {
+            voiceSumL /= (double)v->numLayers;
+            voiceSumR /= (double)v->numLayers;
+        }
 
         /* Vibrato, per explicit request -- introduces gentle pitch
          * modulation "in the noise and Karplus" (both already present
@@ -519,11 +563,13 @@ double noiseboy_process(NoiseboyEngine *e) {
          * knob -- "so that its gentle, like an acoustic instrument".
          * Max depth of 4 samples chosen as a reasoned, not ear-tuned,
          * starting point (see this project's own verification notes
-         * on why -- no way to listen to this directly). */
+         * on why -- no way to listen to this directly). Independent
+         * L/R instances (see VibratoDelay's own comment on why). */
         {
             const double vibratoDepthFactor01 = clampd(e->params.amDepth01 / 0.15, 0.0, 1.0);
             const double vibratoDepthSamples = vibratoDepthFactor01 * 4.0;
-            voiceSum = vibrato_process(&v->vibrato, voiceSum, v->amPhase, vibratoDepthSamples);
+            voiceSumL = vibrato_process(&v->vibratoL, voiceSumL, v->amPhase, vibratoDepthSamples);
+            voiceSumR = vibrato_process(&v->vibratoR, voiceSumR, v->amPhase, vibratoDepthSamples);
         }
 
         /* STEP 2 (bitcrush/rate-reduce) REMOVED entirely per explicit
@@ -547,7 +593,11 @@ double noiseboy_process(NoiseboyEngine *e) {
          * played harder; envelope making pitch audibly decay over a
          * long release, since the cutoff followed envLevel). This
          * filter's cutoff is now purely a function of the played note
-         * and the two relevant knobs -- nothing else.
+         * and the two relevant knobs -- nothing else. Independent L/R
+         * instances, same cutoff/resonance settings applied to both
+         * (only the filter STATE differs per channel, not its target
+         * parameters) so pitch accuracy stays identical between
+         * channels -- only the panning above differs L vs R.
          *
          * NOTE: a drive reduction (0.2 -> 0.05) was tried here as a
          * hypothesis fix for a reported "pitch tied to envelope"
@@ -563,11 +613,15 @@ double noiseboy_process(NoiseboyEngine *e) {
             const double pitchCutoff = clampd(v->freqHz * cutoffMul, 20.0, e->sampleRate * 0.45);
             const double pitchResonance = e->params.filterResonance01;
             if (v->pitchFilterKind == FILTER_MOOG) {
-                moog_ladder_set(&v->pitchFilterMoog, pitchCutoff, pitchResonance, 0.2);
-                voiceSum = moog_ladder_process(&v->pitchFilterMoog, voiceSum);
+                moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
+                moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);
+                voiceSumL = moog_ladder_process(&v->pitchFilterMoogL, voiceSumL);
+                voiceSumR = moog_ladder_process(&v->pitchFilterMoogR, voiceSumR);
             } else {
-                korg35lp_set(&v->pitchFilterKorgLp, pitchCutoff, pitchResonance, 0.2);
-                voiceSum = korg35lp_process(&v->pitchFilterKorgLp, voiceSum);
+                korg35lp_set(&v->pitchFilterKorgLpL, pitchCutoff, pitchResonance, 0.2);
+                korg35lp_set(&v->pitchFilterKorgLpR, pitchCutoff, pitchResonance, 0.2);
+                voiceSumL = korg35lp_process(&v->pitchFilterKorgLpL, voiceSumL);
+                voiceSumR = korg35lp_process(&v->pitchFilterKorgLpR, voiceSumR);
             }
         }
 
@@ -575,7 +629,9 @@ double noiseboy_process(NoiseboyEngine *e) {
          * depth/rate from knobs 3/4. amDepth01=0 leaves the voice
          * completely untouched (multiplying by 1.0 always), matching
          * "controlled by the knobs" rather than being a fixed always-on
-         * wobble. */
+         * wobble. Same gain applied to both channels -- AM is a shared
+         * volume envelope, not something that should itself vary L/R
+         * (only the source panning above does that). */
         const double amCyclePosition = 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase)); // 0 at the AM peak, 1 at the AM dip
         const double amGain = 1.0 - e->params.amDepth01 * amCyclePosition;
 
@@ -586,10 +642,12 @@ double noiseboy_process(NoiseboyEngine *e) {
          * rather than the two being unrelated. Zero when AM depth is
          * zero, matching "controlled by the knobs" like AM itself. */
         const double foldAmount = e->params.amDepth01 * amCyclePosition;
-        voiceSum = wavefold_process(voiceSum, foldAmount);
+        voiceSumL = wavefold_process(voiceSumL, foldAmount);
+        voiceSumR = wavefold_process(voiceSumR, foldAmount);
 
         /* STEP 4: amplitude envelope. */
-        voiceSum = voiceSum * v->envLevel * amGain;
+        voiceSumL = voiceSumL * v->envLevel * amGain;
+        voiceSumR = voiceSumR * v->envLevel * amGain;
 
         /* STEP 5: OUTPUT FILT -- the final stage. Rebuilt as a TILT
          * filter, per direct request. Knob centred (12 o'clock, 64) =
@@ -605,26 +663,33 @@ double noiseboy_process(NoiseboyEngine *e) {
          * highpass exclusively. No velocity or envelope influence, no
          * resonance -- purely a knob-controlled sweep, deliberately
          * simple and predictable given this replaces a previous
-         * design that wasn't landing as an audible, useful control. */
+         * design that wasn't landing as an audible, useful control.
+         * Independent L/R instances, identical target settings (only
+         * state differs), same reasoning as the pitch filter above. */
         {
             const double knob = e->outputFilterFreqSmoothed01;
             if (knob <= 0.5) {
                 const double t = clampd((0.5 - knob) / 0.5, 0.0, 1.0);
                 const double lpCutoff = clampd(20000.0 * pow(20.0 / 20000.0, t), 20.0, e->sampleRate * 0.45);
-                moog_ladder_set(&v->outputLowpass, lpCutoff, 0.0, 0.1);
-                voiceSum = moog_ladder_process(&v->outputLowpass, voiceSum);
+                moog_ladder_set(&v->outputLowpassL, lpCutoff, 0.0, 0.1);
+                moog_ladder_set(&v->outputLowpassR, lpCutoff, 0.0, 0.1);
+                voiceSumL = moog_ladder_process(&v->outputLowpassL, voiceSumL);
+                voiceSumR = moog_ladder_process(&v->outputLowpassR, voiceSumR);
                 /* Same supplemental fade as the highpass side, for a
                  * symmetric guarantee of true silence at both extremes
                  * rather than relying solely on each filter's own
                  * natural rolloff (which, like the highpass side,
                  * still leaves some audible signal through even at its
                  * most extreme setting). */
-                voiceSum *= (1.0 - t * t);
+                voiceSumL *= (1.0 - t * t);
+                voiceSumR *= (1.0 - t * t);
             } else {
                 const double t = clampd((knob - 0.5) / 0.5, 0.0, 1.0);
                 const double hpCutoff = clampd(20.0 * pow(20000.0 / 20.0, t), 20.0, e->sampleRate * 0.45);
-                korg35hp_set(&v->outputHighpass, hpCutoff, 0.0, 0.1);
-                voiceSum = korg35hp_process(&v->outputHighpass, voiceSum);
+                korg35hp_set(&v->outputHighpassL, hpCutoff, 0.0, 0.1);
+                korg35hp_set(&v->outputHighpassR, hpCutoff, 0.0, 0.1);
+                voiceSumL = korg35hp_process(&v->outputHighpassL, voiceSumL);
+                voiceSumR = korg35hp_process(&v->outputHighpassR, voiceSumR);
                 /* Supplemental gain fade, highpass side only -- verified
                  * directly (isolated filter test against white noise)
                  * that Korg35HP's own attenuation plateaus around ~29%
@@ -638,11 +703,13 @@ double noiseboy_process(NoiseboyEngine *e) {
                  * full-right guarantees "disappear" as explicitly
                  * requested, while the filter's own sweep character
                  * still dominates through most of the range. */
-                voiceSum *= (1.0 - t * t);
+                voiceSumL *= (1.0 - t * t);
+                voiceSumR *= (1.0 - t * t);
             }
         }
 
-        mix += voiceSum;
+        mixL += voiceSumL;
+        mixR += voiceSumR;
     }
 
     /* Single shared drive/saturation stage on the final mix, per
@@ -653,9 +720,11 @@ double noiseboy_process(NoiseboyEngine *e) {
      * filters) -- NOT normalized back down afterward, since the
      * saturation's natural loudness/density increase at higher drive
      * IS the "more volume" part of the request, not a side effect to
-     * cancel out. */
-    double driveGain = 1.0 + e->params.drive01 * 6.0;
-    mix = tanh(mix * driveGain);
+     * cancel out. Same gain applied to both channels (a global stage,
+     * not a stereo one). */
+    const double driveGain = 1.0 + e->params.drive01 * 6.0;
+    mixL = tanh(mixL * driveGain);
+    mixR = tanh(mixR * driveGain);
 
     /* Global, always-on tape saturation stage -- per explicit request,
      * distinct from the knob-controlled Drive above (which can be
@@ -663,8 +732,22 @@ double noiseboy_process(NoiseboyEngine *e) {
      * because it has its own built-in compressor, which tames whatever
      * loudness Drive added before the final tanh warms/rounds it off
      * -- a sensible "drive then tame" order rather than two unrelated
-     * saturation stages fighting each other. */
-    mix = tapesat_process(&e->tapeSat, mix, e->sampleRate);
+     * saturation stages fighting each other. Independent L/R instances
+     * -- a single shared instance was tried first but caught by this
+     * project's own stereo test: its envelope follower's internal
+     * state mutates on each call, so a shared instance processing L
+     * then R would see different state for each, producing a small
+     * but real L/R difference even at Detune=0 where the signal should
+     * collapse to true mono. */
+    mixL = tapesat_process(&e->tapeSatL, mixL, e->sampleRate);
+    mixR = tapesat_process(&e->tapeSatR, mixR, e->sampleRate);
 
-    return mix * e->params.masterLevel01;
+    *outL = mixL * e->params.masterLevel01;
+    *outR = mixR * e->params.masterLevel01;
+}
+
+double noiseboy_process(NoiseboyEngine *e) {
+    double l, r;
+    noiseboy_process_stereo(e, &l, &r);
+    return (l + r) * 0.5;
 }

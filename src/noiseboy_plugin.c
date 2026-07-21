@@ -263,16 +263,15 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
     if (!inst || !out_lr) return;
 
     for (int i = 0; i < frames; i++) {
-        double y = noiseboy_process(&inst->engine);
-
-        /* DBCELL always runs on the output, per explicit request --
-         * NOISEBOY's mono synthesis duplicated to both channels as
-         * db-cell's "dry" input; db-cell's own independent per-channel
-         * chain state naturally diverges the two over time even though
-         * they start identical each sample, so the combined result has
-         * some real stereo width NOISEBOY's own mono voice engine
-         * doesn't produce on its own. */
-        double l = y, r = y;
+        /* NOISEBOY now produces genuine stereo (Detune-driven layer
+         * panning, per explicit request), not a mono signal duplicated
+         * to both channels -- see noiseboy_process_stereo's own header
+         * comment. This IS the "dry" signal db-cell then processes;
+         * db-cell's own independent per-channel chain state further
+         * diverges the two beyond what NOISEBOY's own panning already
+         * provides. */
+        double l, r;
+        noiseboy_process_stereo(&inst->engine, &l, &r);
         dbcell_process(&inst->dbcell, &l, &r);
 
         /* Noise gate AFTER dbcell, per explicit correction -- db-cell's

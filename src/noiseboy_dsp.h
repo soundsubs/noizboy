@@ -214,8 +214,13 @@ typedef struct {
     double amPhase;
 
     /* Vibrato, applied once per voice after layers mix -- see
-     * VibratoDelay's own comment. */
-    VibratoDelay vibrato;
+     * VibratoDelay's own comment. Duplicated L/R (see this project's
+     * stereo panning feature, added with the Detune knob) -- separate
+     * instances per channel are required for a genuine stereo image;
+     * running the same filter state on both channels would collapse
+     * any panning right back to mono. */
+    VibratoDelay vibratoL;
+    VibratoDelay vibratoR;
 
     /* Voice-level pitch-tracking filter -- per explicit restructuring
      * request, this replaces the old per-layer filters entirely.
@@ -231,10 +236,13 @@ typedef struct {
      * note, matching this project's established per-note variety
      * pattern -- Korg35HP still deliberately excluded from
      * the choice, same reasoning as before (a highpass tuned to the
-     * played pitch works against sounding pitched, not for it). */
+     * played pitch works against sounding pitched, not for it).
+     * Duplicated L/R, same reasoning as vibrato above. */
     FilterKind pitchFilterKind;
-    MoogLadder pitchFilterMoog;
-    Korg35LP pitchFilterKorgLp;
+    MoogLadder pitchFilterMoogL;
+    MoogLadder pitchFilterMoogR;
+    Korg35LP pitchFilterKorgLpL;
+    Korg35LP pitchFilterKorgLpR;
 
     /* OUTPUT FILT -- the final stage, per explicit spec. Rebuilt as a
      * TILT filter, per direct request: knob centred (12 o'clock) =
@@ -247,9 +255,12 @@ typedef struct {
      * both at once) -- a true tilt, not two independent filters
      * stacked. No velocity or envelope influence, no resonance --
      * purely knob-controlled sweep in either direction, deliberately
-     * simple and predictable. */
-    MoogLadder outputLowpass;
-    Korg35HP outputHighpass;
+     * simple and predictable. Duplicated L/R, same reasoning as
+     * vibrato above. */
+    MoogLadder outputLowpassL;
+    MoogLadder outputLowpassR;
+    Korg35HP outputHighpassL;
+    Korg35HP outputHighpassR;
 } Voice;
 
 /* Layer RECIPE, decided once at module instantiation (not per-note) --
@@ -335,8 +346,18 @@ typedef struct {
 
     /* Global output stage -- always on, not knob-controlled, applied
      * once to the final mix after all voices are summed (and after
-     * DBCELL processing, in the plugin wrapper). */
-    TapeSaturation tapeSat;
+     * DBCELL processing, in the plugin wrapper). Duplicated L/R --
+     * a single shared instance called sequentially for L then R was
+     * tried first (simpler, one instance) but this project's own
+     * stereo test caught a real bug in that: the envelope follower's
+     * internal state mutates on each call, so processing L first
+     * changes what state the R call sees, producing a small but real
+     * L/R difference even at Detune=0 where the input is otherwise
+     * identical -- exactly the "should collapse to true mono" case
+     * the stereo feature explicitly promises. Independent instances
+     * fix this properly, matching every other voice-level stage. */
+    TapeSaturation tapeSatL;
+    TapeSaturation tapeSatR;
 
     /* Smoothed knob-8 (Output Filt) value -- params.outputFilterFreq01
      * is set instantly by set_param on each discrete MIDI CC step as
@@ -367,10 +388,19 @@ void noiseboy_all_notes_off(NoiseboyEngine *e);
  * own input and would otherwise leak through even with zero voices
  * playing. */
 int noiseboy_any_voice_active(const NoiseboyEngine *e);
-/* Processes and returns ONE mono sample -- there's no meaningful
- * stereo width to a noise+filter/Karplus-Strong source without adding
- * complexity that wasn't asked for, so the caller duplicates this to
- * both output channels. */
+/* Mono convenience wrapper around noiseboy_process_stereo (returns
+ * (L+R)/2) -- kept for the existing test suite and any caller that
+ * doesn't need real stereo output. The plugin wrapper uses the stereo
+ * version directly; this one exists so nothing that predates the
+ * stereo panning feature needed to change. */
 double noiseboy_process(NoiseboyEngine *e);
+/* Real stereo processing -- per explicit request, Detune (knob 7) now
+ * spreads the stereo image: filtered-noise layers pan to a fixed
+ * per-layer position (reusing each layer's existing randomized
+ * detuneCents, scaled by the Detune knob), Karplus layers auto-pan
+ * back and forth at the AM rate (knob 4) instead, also scaled by
+ * Detune. At Detune=0 (knob fully left) this collapses back to mono,
+ * identical to noiseboy_process's own output on both channels. */
+void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR);
 
 #endif /* NOISEBOY_DSP_H */

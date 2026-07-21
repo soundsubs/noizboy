@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.11.0",
+    "version": "0.12.0",
     "abbrev": "NOIZB",
-    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Knob 8 is now a TILT filter -- centre bypassed, left sweeps a lowpass down to silence, right sweeps a highpass up to silence. db-cell always runs on the output, gated silent between notes.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Detune (knob 7) now spreads the stereo image -- noise layers pan to fixed positions, Karplus layers auto-pan at the AM rate. db-cell always runs on the output, gated silent between notes.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",

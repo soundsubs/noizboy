@@ -58,13 +58,59 @@ amounts and ultimately removed entirely, per direct feedback -- see
 | 4 | AM Rate | amplitude modulation rate, 0.1-20 Hz |
 | 5 | Attack | envelope attack time, 0.5-200 ms |
 | 6 | Release | envelope release time, 5-2000 ms |
-| 7 | Detune | spread between layers' per-layer detune (0 = unison, up = richer/chorused) |
+| 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise layers pan to fixed positions (reusing each layer's own pitch-spread randomization); Karplus layers auto-pan back and forth at the AM rate instead |
 | 8 | Output Filt | TILT filter, the last stage before output. Centre (64) = fully bypassed. Turn left: lowpass sweeps down (20kHz to 20Hz), silencing from the top. Turn right: highpass sweeps up (20Hz to 20kHz), silencing from the bottom. Makes the sound disappear in either direction |
 | 9 | Drive | single shared drive/saturation stage on the final mix -- beyond the 8 physical knobs, reachable via the module's parameter menu |
 | 10 | Randomize | re-rolls the layer recipe on demand, without reinstantiating the module -- rising-edge trigger (any 0->nonzero move fires it once); also reachable as a single jog-wheel-click action in the module's own menu screen |
 | 11 | Level | master output level -- moved off knob 8 to make room for Output Filt; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.12.0** -- Detune (knob 7) now spreads the stereo image, not just
+pitch, per explicit request. This required making the whole voice
+processing chain stereo-aware for the first time (NOISEBOY was mono
+internally through v0.11.x, with the plugin wrapper just duplicating
+one signal to both channels) -- a genuinely large change, so handled
+carefully: the existing mono `noiseboy_process()` was kept working
+unchanged (now a thin wrapper around a new
+`noiseboy_process_stereo()`), so none of the existing test suite
+needed to change, and every voice-level stateful filter (vibrato,
+pitch-tracking filter, output tilt filter) was duplicated into
+independent L/R instances -- running the same filter state on both
+channels would have collapsed any panning straight back to mono.
+
+Panning behaviour, per spec: filtered-noise layers get a FIXED pan
+position, reusing each layer's own already-randomized `detuneCents`
+(the same per-layer spread already driving pitch) scaled by the
+Detune knob -- so a layer's pitch character and its stereo position
+come from the same underlying randomization, not two unrelated ones.
+Karplus layers instead auto-pan back and forth at the AM rate (same
+shared phase driving AM/wavefold/vibrato), also scaled by Detune. At
+Detune=0 everything collapses to exact mono.
+
+Caught and fixed a real bug via testing, not just implementation-by-
+inspection: the first version didn't collapse to EXACT mono at
+Detune=0 (a small but real L/R difference remained). Traced to the
+global tape saturation stage sharing one `TapeSaturation` instance
+called sequentially for L then R -- its internal envelope-follower
+state mutated between calls, so even identical input produced
+slightly different output per channel. Fixed by duplicating that
+instance too (matching every other voice-level stage's own pattern).
+Re-verified: exact 0.0 difference at Detune=0, confirmed via a new
+dedicated test (`make test-stereo`, now part of default `make test`)
+that also verifies spread scales substantially with the knob (0.027 at
+Detune=1 vs. 0.0 at Detune=0) and that Karplus layers' pan genuinely
+oscillates (confirmed swinging both left and right over one second at
+a 4Hz AM rate, not just moving once).
+
+Also updated `render_block` in the plugin wrapper to actually call the
+new stereo function and feed genuine L/R into db-cell, replacing the
+old mono-duplicated signal -- the piece that makes all of this reach
+the actual output, not just exist in the DSP layer.
+
+Full test suite re-run clean, including the 24,000-combination sweep
+-- the mono backward-compatibility wrapper meant zero existing tests
+needed modification for this change.
 
 **v0.11.1** -- fixed audible "zipper" stepping on knob 8 (Output Filt),
 per direct report. Root cause: `set_param` writes the knob's target

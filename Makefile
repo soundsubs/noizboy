@@ -2,9 +2,9 @@ CC ?= cc
 CFLAGS = -O2 -Wall -Wextra -std=c11
 LDFLAGS = -lm
 
-.PHONY: test test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper clean
+.PHONY: test test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo clean
 
-test: test_dsp test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper
+test: test_dsp test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo
 	./test_dsp
 
 test-dbcell: test_dbcell
@@ -24,6 +24,9 @@ test-tilt: test_tilt_filter
 
 test-zipper: test_zipper
 	./test_zipper
+
+test-stereo: test_stereo_pan
+	./test_stereo_pan
 
 test_dsp: src/distroy_dsp.c src/noiseboy_dsp.c test/test_dsp.c
 	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_dsp.c -o test_dsp $(LDFLAGS)
@@ -46,5 +49,8 @@ test_tilt_filter: src/distroy_dsp.c src/noiseboy_dsp.c test/test_tilt_filter.c
 test_zipper: src/distroy_dsp.c src/noiseboy_dsp.c test/test_zipper.c
 	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_zipper.c -o test_zipper $(LDFLAGS)
 
+test_stereo_pan: src/distroy_dsp.c src/noiseboy_dsp.c test/test_stereo_pan.c
+	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_stereo_pan.c -o test_stereo_pan $(LDFLAGS)
+
 clean:
-	rm -f test_dsp test_dbcell test_new_stages test_karplus_sustain test_comprehensive_sweep test_tilt_filter test_zipper *.o dsp.so
+	rm -f test_dsp test_dbcell test_new_stages test_karplus_sustain test_comprehensive_sweep test_tilt_filter test_zipper test_stereo_pan *.o dsp.so
