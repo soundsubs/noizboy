@@ -13,6 +13,189 @@ static double clampd(double x, double lo, double hi) {
     return x;
 }
 
+/* ---------------------------------------------------------------------
+ * Reused verbatim from distroy_dsp.c -- see that project's own test
+ * suite for verification of these specific algorithms; not re-derived
+ * or re-tested here, just carried over for sonic consistency with
+ * DISTROY (the stated use case chains NOISEBOY into DISTROY).
+ * ------------------------------------------------------------------- */
+
+void noise_init(SimpleNoise *n, unsigned int seed) {
+    n->state = seed != 0 ? seed : 1;
+}
+
+double noise_next(SimpleNoise *n) {
+    unsigned int s = n->state;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    n->state = s;
+    return ((double)s / (double)UINT32_MAX) * 2.0 - 1.0;
+}
+
+void noisegen_init(NoiseGen *n, unsigned int seed) {
+    noise_init(&n->white, seed);
+    n->pink_b0 = 0.0;
+    n->pink_b1 = 0.0;
+    n->pink_b2 = 0.0;
+    n->brown_state = 0.0;
+}
+
+double noisegen_process(NoiseGen *n, NoiseColour colour) {
+    double white = noise_next(&n->white);
+    switch (colour) {
+        case NOISE_PINK: {
+            n->pink_b0 = 0.99765 * n->pink_b0 + white * 0.0990460;
+            n->pink_b1 = 0.96300 * n->pink_b1 + white * 0.2965164;
+            n->pink_b2 = 0.57000 * n->pink_b2 + white * 1.0526913;
+            double pink = n->pink_b0 + n->pink_b1 + n->pink_b2 + white * 0.1848;
+            return pink * 0.11;
+        }
+        case NOISE_RED: {
+            n->brown_state = n->brown_state * 0.98 + white * 0.02;
+            return n->brown_state * 3.5;
+        }
+        case NOISE_WHITE:
+        default:
+            return white;
+    }
+}
+
+void moog_ladder_init(MoogLadder *f, double sample_rate) {
+    memset(f, 0, sizeof(*f));
+    f->sample_rate = sample_rate;
+    f->drive = 1.0;
+    moog_ladder_set(f, 1000.0, 0.0, 0.0);
+}
+
+void moog_ladder_set(MoogLadder *f, double cutoff_hz, double resonance01, double drive01) {
+    double fc = clampd(cutoff_hz / (f->sample_rate * 0.5), 0.0001, 0.99);
+    f->p = fc * (1.8 - 0.8 * fc);
+    f->k = 2.0 * sin(fc * M_PI * 0.5) - 1.0;
+    double t1 = (1.0 - f->p) * 1.386249;
+    double t2 = 12.0 + t1 * t1;
+    f->resonance = resonance01 * 3.5 * (t2 + 6.0 * t1) / (t2 - 6.0 * t1);
+    f->drive = 1.0 + drive01 * 11.0;
+}
+
+double moog_ladder_process(MoogLadder *f, double x) {
+    x *= f->drive;
+    x = tanh(x);
+
+    double input = x - f->resonance * f->stage[3];
+    f->stage[0] = input * f->p + f->delay[0] * f->p - f->k * f->stage[0];
+    f->stage[1] = f->stage[0] * f->p + f->delay[1] * f->p - f->k * f->stage[1];
+    f->stage[2] = f->stage[1] * f->p + f->delay[2] * f->p - f->k * f->stage[2];
+    f->stage[3] = f->stage[2] * f->p + f->delay[3] * f->p - f->k * f->stage[3];
+    f->stage[3] -= (f->stage[3] * f->stage[3] * f->stage[3]) / 6.0;
+
+    for (int i = 0; i < 4; i++) {
+        f->stage[i] = clampd(f->stage[i], -8.0, 8.0);
+    }
+
+    f->delay[0] = input;
+    f->delay[1] = f->stage[0];
+    f->delay[2] = f->stage[1];
+    f->delay[3] = f->stage[2];
+
+    return f->stage[3];
+}
+
+void korg35lp_init(Korg35LP *f, double sample_rate) {
+    memset(f, 0, sizeof(*f));
+    f->sample_rate = sample_rate;
+    f->drive = 1.0;
+    korg35lp_set(f, 1000.0, 0.0, 0.0);
+}
+
+void korg35lp_set(Korg35LP *f, double cutoff_hz, double resonance01, double drive01) {
+    double fc = clampd(cutoff_hz / (f->sample_rate * 0.5), 0.0001, 0.99);
+    f->p = fc * (1.8 - 0.8 * fc);
+    f->k = 2.0 * sin(fc * M_PI * 0.5) - 1.0;
+    double t1 = (1.0 - f->p) * 1.386249;
+    double t2 = 12.0 + t1 * t1;
+    f->resonance = resonance01 * 2.6 * (t2 + 6.0 * t1) / (t2 - 6.0 * t1);
+    f->drive = 1.0 + drive01 * 9.0;
+}
+
+double korg35lp_process(Korg35LP *f, double x) {
+    x *= f->drive;
+    x = tanh(x);
+
+    double input = x - f->resonance * f->stage[1];
+    f->stage[0] = input * f->p + f->delay[0] * f->p - f->k * f->stage[0];
+    f->stage[1] = f->stage[0] * f->p + f->delay[1] * f->p - f->k * f->stage[1];
+    f->stage[1] -= (f->stage[1] * f->stage[1] * f->stage[1]) / 6.0;
+
+    f->stage[0] = clampd(f->stage[0], -8.0, 8.0);
+    f->stage[1] = clampd(f->stage[1], -8.0, 8.0);
+
+    f->delay[0] = input;
+    f->delay[1] = f->stage[0];
+
+    return f->stage[1];
+}
+
+void korg35hp_init(Korg35HP *f, double sample_rate) {
+    korg35lp_init(&f->core, sample_rate);
+}
+
+void korg35hp_set(Korg35HP *f, double cutoff_hz, double resonance01, double drive01) {
+    korg35lp_set(&f->core, cutoff_hz, resonance01, drive01);
+}
+
+double korg35hp_process(Korg35HP *f, double x) {
+    double lp = korg35lp_process(&f->core, x);
+    return x - lp;
+}
+
+/* ---------------------------------------------------------------------
+ * New for NOISEBOY: Karplus-Strong plucked-string synthesis.
+ * ------------------------------------------------------------------- */
+
+void karplus_init(KarplusString *k) {
+    memset(k, 0, sizeof(*k));
+    k->damping = 0.99;
+}
+
+void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, NoiseGen *noiseGen, NoiseColour colour, double dampingAmount) {
+    int length = (int)(sample_rate / (freq_hz > 20.0 ? freq_hz : 20.0) + 0.5);
+    if (length < 2) length = 2;
+    if (length > NOISEBOY_KS_MAX_SAMPLES - 1) length = NOISEBOY_KS_MAX_SAMPLES - 1;
+    k->length = length;
+    k->writePos = 0;
+    k->lastOut = 0.0;
+    /* dampingAmount 0-1 -> damping coefficient 0.90-0.999: lower =
+     * darker/faster decay, higher = brighter/longer sustain -- the
+     * classic Karplus-Strong "string material" control. */
+    k->damping = 0.90 + clampd(dampingAmount, 0.0, 1.0) * 0.099;
+
+    for (int i = 0; i < length; i++) {
+        k->buffer[i] = noisegen_process(noiseGen, colour);
+    }
+}
+
+double karplus_process(KarplusString *k) {
+    int len = k->length;
+    if (len < 2) return 0.0;
+    int readPos = k->writePos;
+    int nextPos = (readPos + 1 < len) ? (readPos + 1) : 0;
+    double cur = k->buffer[readPos];
+    double next = k->buffer[nextPos];
+    /* Classic Karplus-Strong step: average two adjacent samples (a
+     * simple one-pole lowpass, softening the string's harmonics each
+     * pass) and apply the decay coefficient, writing the result back
+     * into the position just read so it feeds forward next cycle. */
+    double filtered = (cur + next) * 0.5;
+    k->buffer[readPos] = filtered * k->damping;
+    k->writePos = nextPos;
+    return cur;
+}
+
+/* ---------------------------------------------------------------------
+ * Engine: voice management, randomized recipe, MIDI, per-sample mix.
+ * ------------------------------------------------------------------- */
+
 static unsigned int xorshift_next(unsigned int *state) {
     unsigned int s = *state;
     s ^= s << 13;
@@ -26,207 +209,6 @@ static double rand01(unsigned int *state) {
     return (double)xorshift_next(state) / (double)UINT32_MAX;
 }
 
-
-/* ---------------------------------------------------------------------
- * New for NOISEBOY: Karplus-Strong plucked-string synthesis.
- * ------------------------------------------------------------------- */
-
-void karplus_init(KarplusString *k) {
-    memset(k, 0, sizeof(*k));
-    k->damping = 0.99;
-}
-
-void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, unsigned int *rngState, const NoiseColour *sourceColours, int numSources, double dampingAmount) {
-    int length = (int)(sample_rate / (freq_hz > 20.0 ? freq_hz : 20.0) + 0.5);
-    if (length < 2) length = 2;
-    if (length > NOISEBOY_KS_MAX_SAMPLES - 1) length = NOISEBOY_KS_MAX_SAMPLES - 1;
-    k->length = length;
-    k->writePos = 0;
-    k->lastOut = 0.0;
-    /* dampingAmount 0-1 -> damping coefficient 0.90-0.999: lower =
-     * darker/faster decay, higher = brighter/longer sustain -- the
-     * classic Karplus-Strong "string material" control. */
-    k->damping = 0.90 + clampd(dampingAmount, 0.0, 1.0) * 0.099;
-
-    /* Excitation burst summed from numSources independently-seeded
-     * generators (one per recipe layer's colour, per direct feedback
-     * -- see this struct's own comment for why), normalized by count
-     * so more sources doesn't mean a louder pluck, just a richer one. */
-    if (numSources < 1) numSources = 1;
-    if (numSources > NOISEBOY_MAX_LAYERS) numSources = NOISEBOY_MAX_LAYERS;
-    NoiseGen sources[NOISEBOY_MAX_LAYERS];
-    for (int s = 0; s < numSources; s++) {
-        noisegen_init(&sources[s], xorshift_next(rngState));
-    }
-
-    for (int i = 0; i < length; i++) {
-        double sum = 0.0;
-        for (int s = 0; s < numSources; s++) {
-            sum += noisegen_process(&sources[s], sourceColours[s]);
-        }
-        k->buffer[i] = sum / (double)numSources;
-    }
-}
-
-double karplus_process(KarplusString *k, double sustainFeedSample, double sustainAmount) {
-    int len = k->length;
-    if (len < 2) return 0.0;
-    int readPos = k->writePos;
-    int nextPos = (readPos + 1 < len) ? (readPos + 1) : 0;
-    double cur = k->buffer[readPos];
-    double next = k->buffer[nextPos];
-    /* Classic Karplus-Strong step: average two adjacent samples (a
-     * simple one-pole lowpass, softening the string's harmonics each
-     * pass) and apply the decay coefficient, writing the result back
-     * into the position just read so it feeds forward next cycle.
-     * sustainFeedSample*sustainAmount adds a small continuous
-     * injection while the note is held (sustainAmount=0 after
-     * release), keeping the string ringing rather than only decaying
-     * from the initial pluck -- see this struct's own comment. */
-    double filtered = (cur + next) * 0.5;
-    k->buffer[readPos] = filtered * k->damping + sustainFeedSample * sustainAmount;
-    k->writePos = nextPos;
-    return cur;
-}
-
-/* ---------------------------------------------------------------------
- * New for NOISEBOY: sample-and-hold pitched noise stage.
- * ------------------------------------------------------------------- */
-
-void pitchedhold_init(PitchedHold *h) {
-    h->heldValue = 0.0;
-    h->phase = 0.0;
-}
-
-double pitchedhold_process(PitchedHold *h, double newSample, double freqHz, double sampleRate, double holdMultiplier) {
-    /* Advances a phase accumulator at freqHz*holdMultiplier cycles per
-     * second; each time it wraps, latches newSample as the held value
-     * -- a sample-and-hold whose rate itself tracks the played pitch,
-     * giving the noise a buzzy/quantized character with a much
-     * stronger, more obvious relationship to the note than filter
-     * resonance alone provides. holdMultiplier > 1 holds at a multiple
-     * of the fundamental (still musically related, just a higher
-     * "grain rate") rather than always exactly at it, for some
-     * per-layer variety. */
-    double rate = freqHz * (holdMultiplier > 0.01 ? holdMultiplier : 1.0);
-    h->phase += rate / sampleRate;
-    if (h->phase >= 1.0) {
-        h->phase -= floor(h->phase);
-        h->heldValue = newSample;
-    }
-    return h->heldValue;
-}
-
-double bitcrush_process(double x, int bits) {
-    /* Standard bit-depth quantizer, covering the full [-1,1] signal
-     * range with 2^bits discrete levels. bits=1 crushes to essentially
-     * {-1,0,1}; bits=15 is close to imperceptible (step ~0.00006). */
-    if (bits < 1) bits = 1;
-    if (bits > 16) bits = 16;
-    double levels = pow(2.0, (double)bits);
-    double step = 2.0 / levels;
-    double quantized = floor(x / step + 0.5) * step;
-    /* Never fully silence a genuinely nonzero input -- a real bug this
-     * caught: at low bit depths (step is huge relative to typical
-     * signal amplitudes -- 0.5 for bits=2), a small-but-real signal
-     * (a Karplus-Strong voice sampled through the rate-reducer) can
-     * round to exactly 0 on EVERY sample for the note's entire
-     * duration, silencing the voice outright rather than just sounding
-     * crunchy. Nudge to the nearest nonzero step in the input's own
-     * direction instead -- keeps the extreme, harsh character low bit
-     * depths are supposed to have, while guaranteeing some signal
-     * always gets through. */
-    if (quantized == 0.0 && fabs(x) > 1e-9) {
-        quantized = (x > 0.0) ? step : -step;
-    }
-    return quantized;
-}
-
-double wavefold_process(double x, double amount) {
-    /* Reflective wavefolder: pre-gain scales with amount, then any
-     * excursion past +-1 bounces back into range (a triangle-wave-
-     * style fold) rather than clipping -- the classic wavefolding
-     * technique for rich, FM-like harmonics. Iteration count capped at
-     * 8 as a safety net against runaway loops on extreme inputs; in
-     * practice folds rarely need more than 1-2 reflections at the
-     * amounts this is actually driven with. */
-    if (amount <= 0.0001) return x;
-    double driven = x * (1.0 + amount * 4.0);
-    for (int i = 0; i < 8; i++) {
-        if (driven > 1.0) driven = 2.0 - driven;
-        else if (driven < -1.0) driven = -2.0 - driven;
-        else break;
-    }
-    return driven;
-}
-
-void vibrato_init(VibratoDelay *v) {
-    memset(v->buffer, 0, sizeof(v->buffer));
-    v->writePos = 0;
-}
-
-double vibrato_process(VibratoDelay *v, double x, double phase01, double depthSamples) {
-    v->buffer[v->writePos] = x;
-
-    /* Fixed 32-sample centre delay (well inside the 512-sample buffer
-     * even at the largest depthSamples this is ever driven with),
-     * modulated +-depthSamples by a sine at the same phase driving
-     * AM/wavefold. Linear interpolation between the two nearest
-     * integer samples for a smooth fractional read position -- this
-     * is what actually produces the pitch-bend sensation, unlike an
-     * integer-only read which would just add a stepped/gritty comb
-     * artifact instead of a smooth vibrato. */
-    double lfo = sin(2.0 * M_PI * phase01);
-    double delaySamples = 32.0 + lfo * depthSamples;
-
-    double readPos = (double)v->writePos - delaySamples;
-    while (readPos < 0.0) readPos += (double)NOISEBOY_VIBRATO_BUFFER_SIZE;
-
-    int readPosInt = (int)readPos;
-    double frac = readPos - (double)readPosInt;
-    int readPosNext = (readPosInt + 1) % NOISEBOY_VIBRATO_BUFFER_SIZE;
-
-    double sample = v->buffer[readPosInt] * (1.0 - frac) + v->buffer[readPosNext] * frac;
-
-    v->writePos = (v->writePos + 1) % NOISEBOY_VIBRATO_BUFFER_SIZE;
-    return sample;
-}
-
-void tapesat_init(TapeSaturation *t) {
-    t->envelope = 0.0;
-}
-
-double tapesat_process(TapeSaturation *t, double x, double sampleRate) {
-    /* Simple envelope-follower compressor (5ms attack, 80ms release,
-     * threshold 0.3, ratio 3:1) feeding a fixed 2x drive into tanh
-     * saturation -- "compresses, drives, and saturates", per explicit
-     * request, kept deliberately simple/cheap rather than modeling
-     * tape wow/flutter or head-bump EQ, matching the CPU-light mandate
-     * this whole project follows. */
-    double absX = fabs(x);
-    const double attackCoeff = exp(-1.0 / (0.001 * 5.0 * sampleRate));
-    const double releaseCoeff = exp(-1.0 / (0.001 * 80.0 * sampleRate));
-    const double coeff = absX > t->envelope ? attackCoeff : releaseCoeff;
-    t->envelope = absX + (t->envelope - absX) * coeff;
-
-    const double threshold = 0.3;
-    const double ratio = 3.0;
-    double gainReduction = 1.0;
-    if (t->envelope > threshold) {
-        const double excess = t->envelope - threshold;
-        const double compressedExcess = excess / ratio;
-        gainReduction = (threshold + compressedExcess) / t->envelope;
-    }
-
-    const double compressed = x * gainReduction;
-    const double driven = compressed * 2.0;
-    return tanh(driven);
-}
-
-/* ---------------------------------------------------------------------
- * Engine: voice management, randomized recipe, MIDI, per-sample mix.
- * ------------------------------------------------------------------- */
-
 static double midi_note_to_freq(int midiNote) {
     return 440.0 * pow(2.0, (midiNote - 69) / 12.0);
 }
@@ -235,7 +217,6 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     memset(e, 0, sizeof(*e));
     e->sampleRate = sampleRate;
     e->rngState = seed != 0 ? seed : 1;
-    e->lastRandomizeTriggerRaw = 0;
 
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         e->voices[v].active = 0;
@@ -243,36 +224,19 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
 
     /* Reasonable defaults -- overwritten by set_param once the host
      * reads knob positions, but these keep the instrument playable
-     * (and not silent/broken) even before any knob has been touched.
-     * filterResonance01 default raised significantly (was 0.3) --
-     * per direct feedback/diagnosis that the noise "isn't quite
-     * pitched": a resonant filter needs to sit much closer to
-     * self-oscillation than 0.3 to produce an audible peak at its
-     * cutoff from noise input, which is the whole mechanism "pitched
-     * noise via resonant filter" depends on. */
+     * (and not silent/broken) even before any knob has been touched. */
     e->params.filterCutoffOffset01 = 0.5;  /* neutral: filter tracks exactly at the played pitch */
-    e->params.filterResonance01 = 0.82;
+    e->params.filterResonance01 = 0.3;
     e->params.amRateHz = 4.0;
     e->params.amDepth01 = 0.0;             /* off by default -- AM is a deliberate extra character, not a default-on wobble */
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
     e->params.masterLevel01 = 0.8;
-    e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
-    tapesat_init(&e->tapeSat);
-
-    noiseboy_randomize_recipe(e);
-}
-
-void noiseboy_randomize_recipe(NoiseboyEngine *e) {
-    /* 1-3 layers, per explicit spec ("every time you instantiate, its
-     * a randomized noise block"). Also callable on demand (not just at
-     * instantiation) per explicit request for a way to get a new
-     * randomized set without reloading the whole module -- uses the
-     * engine's own ongoing RNG state, so repeated calls keep producing
-     * fresh, non-repeating recipes rather than resetting to the same
-     * sequence. */
+    /* The randomized recipe -- decided ONCE here, per explicit spec
+     * ("every time you instantiate, its a randomized noise block").
+     * 1-3 layers. */
     e->numRecipeLayers = 1 + (int)(rand01(&e->rngState) * 3.0);
     if (e->numRecipeLayers > NOISEBOY_MAX_LAYERS) e->numRecipeLayers = NOISEBOY_MAX_LAYERS;
 
@@ -281,24 +245,13 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
         /* Per explicit clarification: filtered-noise layers always
          * track pitch via their filter; Karplus-Strong is the second,
          * separately-pitched method, chosen randomly per layer. */
-        /* 25% per-layer chance, not 50% -- per direct feedback that
-         * Karplus-Strong felt like it was on "most patches". Worked
-         * out why: with 1-3 layers per recipe, a 50/50 per-layer coin
-         * flip means the probability of AT LEAST ONE Karplus layer
-         * appearing compounds across layers (50% at 1 layer, 75% at 2,
-         * 87.5% at 3 -- averaging ~71% overall, which matches the
-         * complaint). 25% per-layer brings that average down to ~42%,
-         * a genuinely "sometimes" rate rather than "usually". */
-        r->type = (rand01(&e->rngState) < 0.25) ? LAYER_KARPLUS_STRONG : LAYER_FILTERED_NOISE;
+        r->type = (rand01(&e->rngState) < 0.5) ? LAYER_FILTERED_NOISE : LAYER_KARPLUS_STRONG;
 
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
 
-        /* FILTER_KORG_HP deliberately excluded from selection -- see
-         * FilterKind's header comment for why a highpass tuned to the
-         * played pitch actively works against sounding pitched.
-         * Moog/Korg35LP only, 50/50. */
-        r->filterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
+        double filterRoll = rand01(&e->rngState);
+        r->filterKind = (filterRoll < 0.34) ? FILTER_MOOG : (filterRoll < 0.67) ? FILTER_KORG_LP : FILTER_KORG_HP;
 
         /* Detune spread across layers -- first layer stays at 0 cents
          * (an anchor pitch), the rest spread out symmetrically so
@@ -325,20 +278,6 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->gateOpen = 1;
     v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't AM in lockstep */
 
-    /* Per-voice bitcrusher (1-15 bits) and pitch-following sample-rate
-     * reducer, randomized fresh each note-on per explicit request.
-     * rateReducerMultiplier is randomized per note so different notes
-     * on the same recipe get some variety in how aggressively reduced
-     * they sound, not just where the reduction rate sits -- the
-     * reduction rate itself (freqHz * multiplier, floored at 100Hz,
-     * ceiled at Nyquist in noiseboy_process) is what actually "follows
-     * played note numbers". */
-    v->bitDepth = 1 + (int)(rand01(&e->rngState) * 15.0);
-    if (v->bitDepth > 15) v->bitDepth = 15;
-    v->rateReducerMultiplier = 0.5 + rand01(&e->rngState) * 7.5;
-    pitchedhold_init(&v->rateReducer);
-    vibrato_init(&v->vibrato);
-
     v->numLayers = e->numRecipeLayers;
     for (int i = 0; i < v->numLayers; i++) {
         Layer *layer = &v->layers[i];
@@ -357,25 +296,12 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             moog_ladder_init(&layer->moog, e->sampleRate);
             korg35lp_init(&layer->korgLp, e->sampleRate);
             korg35hp_init(&layer->korgHp, e->sampleRate);
-            pitchedhold_init(&layer->pitchedHold);
         } else {
             karplus_init(&layer->karplus);
-            /* noiseGen initialized here too (previously only used for
-             * filtered-noise layers) -- karplus's ongoing sustain feed
-             * in process_layer reuses it. */
-            noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
-            /* Excitation summed from ALL of this recipe's layer
-             * colours (including this layer's own), not just its own
-             * single colour -- per direct feedback that the Karplus
-             * layer should be "fed from the sum of the noise it's
-             * randomized with", so it blends with the rest of the
-             * patch's noise palette rather than sounding isolated. */
-            NoiseColour sourceColours[NOISEBOY_MAX_LAYERS];
-            for (int ci = 0; ci < v->numLayers; ci++) {
-                sourceColours[ci] = e->recipe[ci].colour;
-            }
+            NoiseGen seedGen;
+            noisegen_init(&seedGen, xorshift_next(&e->rngState));
             double damping = clampd(r->dampingAmount01 * 0.5 + e->params.filterResonance01 * 0.5, 0.0, 1.0);
-            karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, damping);
+            karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &seedGen, r->colour, damping);
         }
     }
 }
@@ -416,63 +342,21 @@ void noiseboy_all_notes_off(NoiseboyEngine *e) {
     }
 }
 
-int noiseboy_any_voice_active(const NoiseboyEngine *e) {
-    for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-        if (e->voices[v].active) return 1;
-    }
-    return 0;
-}
-
 static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
     if (layer->type == LAYER_KARPLUS_STRONG) {
-        /* Small ongoing noise injection while the note is held (0
-         * once released, letting the string decay/ring out naturally
-         * via its own damping) -- per direct feedback for "short
-         * sustained notes that ring out" rather than only a single
-         * decaying pluck. Reuses layer->noiseGen/colour (otherwise
-         * unused on a Karplus layer) rather than the multi-source sum
-         * the initial pluck uses -- the ongoing feed doesn't need to
-         * be as elaborate as the defining initial burst. */
-        double sustainFeed = noisegen_process(&layer->noiseGen, layer->colour);
-        double sustainAmount = v->gateOpen ? 0.02 : 0.0;
-        return karplus_process(&layer->karplus, sustainFeed, sustainAmount);
+        return karplus_process(&layer->karplus);
     }
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
 
-    /* Sample-and-hold pitch stage, applied BEFORE the filter -- per
-     * direct feedback that filter tracking alone wasn't reading as
-     * clearly pitched. Hold multiplier varies per layer (via
-     * resonanceBias01, reused here rather than adding yet another
-     * recipe field) between 1x and 3x the fundamental, so multiple
-     * layers don't all buzz at exactly the same grain rate. */
     double detuneMul = pow(2.0, (layer->detuneCents * e->params.detuneSpread01) / 1200.0);
-    double holdMultiplier = 1.0 + layer->resonanceBias01 * 2.0;
-    raw = pitchedhold_process(&layer->pitchedHold, raw, v->freqHz * detuneMul, e->sampleRate, holdMultiplier);
-
     /* filterCutoffOffset01: 0.5 = neutral (filter sits exactly at the
      * played pitch, i.e. always tracks it); away from 0.5 brightens or
      * darkens the filter RELATIVE TO the tracked pitch, but never
      * stops tracking it -- the offset is a multiplier applied to the
      * pitch-derived base cutoff, not a replacement for it. */
     double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
-    /* Velocity always brightens the filter, per explicit request
-     * matching acoustic-instrument behaviour (harder strikes/plucks
-     * excite more high-frequency energy) -- NOT knob-controlled or
-     * optional, always applied. Up to 2.5x cutoff multiplier at
-     * maximum velocity, 1x (no change) at zero velocity. */
-    double velocityMul = 1.0 + v->velocity01 * 1.5;
-    /* Filter cutoff also follows the amplitude envelope itself (rises
-     * during attack, falls during release), capped to a max 20%
-     * brightening at the envelope's own peak -- per explicit request.
-     * envLevel is normalized by velocity01 first since envLevel's own
-     * range is 0..velocity01, not 0..1 -- without normalizing, a
-     * quietly-played (low velocity) note would only ever reach a
-     * fraction of the 20% cap, when the intent is that EVERY note's
-     * own envelope shape drives this the same relative amount. */
-    double envNorm = (v->velocity01 > 0.001) ? clampd(v->envLevel / v->velocity01, 0.0, 1.0) : 0.0;
-    double envelopeMul = 1.0 + envNorm * 0.20;
-    double cutoffHz = clampd(v->freqHz * detuneMul * cutoffMul * velocityMul * envelopeMul, 20.0, e->sampleRate * 0.45);
+    double cutoffHz = clampd(v->freqHz * detuneMul * cutoffMul, 20.0, e->sampleRate * 0.45);
     double resonance = clampd(e->params.filterResonance01 + (layer->resonanceBias01 - 0.5) * 0.2, 0.0, 0.95);
 
     switch (layer->filterKind) {
@@ -519,100 +403,17 @@ double noiseboy_process(NoiseboyEngine *e) {
         }
         if (v->numLayers > 0) voiceSum /= (double)v->numLayers;
 
-        /* AM phase updated here (before vibrato/AM/wavefold all need
-         * it) rather than down where AM itself used to compute it --
-         * vibrato needs the same shared phase too, per explicit
-         * request that it stays in sync with the tremolo. */
-        v->amPhase += e->params.amRateHz * dt;
-        if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
-
-        /* Vibrato, per explicit request -- introduces gentle pitch
-         * modulation "in the noise and Karplus" (both already present
-         * in voiceSum by this point, so one instance covers both layer
-         * types). Depth saturates at just 15% of AM Depth's own knob
-         * travel -- i.e. vibrato reaches its own (small) maximum
-         * quickly and stays there for the rest of the knob's range,
-         * rather than growing all the way to a dramatic wobble at full
-         * knob -- "so that its gentle, like an acoustic instrument".
-         * Max depth of 4 samples chosen as a reasoned, not ear-tuned,
-         * starting point (see this project's own verification notes
-         * on why -- no way to listen to this directly). */
-        {
-            const double vibratoDepthFactor01 = clampd(e->params.amDepth01 / 0.15, 0.0, 1.0);
-            const double vibratoDepthSamples = vibratoDepthFactor01 * 4.0;
-            voiceSum = vibrato_process(&v->vibrato, voiceSum, v->amPhase, vibratoDepthSamples);
-        }
-
-        /* Per-voice bitcrusher + pitch-following sample-rate reducer,
-         * applied to the mixed voice signal (after layers, before AM)
-         * -- per explicit request. Rate reducer's rate is derived from
-         * the played note (freqHz * this voice's randomized
-         * multiplier), floored at 100Hz and ceiled at Nyquist so it
-         * always sits somewhere between "100Hz crunch" and "full
-         * resolution" as requested, while still tracking pitch.
-         *
-         * ORDER MATTERS HERE, discovered via a real bug: rate-reduce
-         * (sample-and-hold) MUST run before bitcrush, not after. At
-         * low bit depths (bitDepth can randomize as low as 1-2),
-         * bitcrush quantizes most small-amplitude samples straight to
-         * 0 -- a Karplus-Strong voice's naturally quiet signal level
-         * meant well over 80% of samples were landing exactly on 0
-         * after crushing. Sampling THAT with a sparse hold (updating
-         * only every ~46 samples at typical rates) had a real, non-
-         * negligible chance of every single hold-update landing on one
-         * of those zeroed samples, silencing the entire voice for the
-         * whole note. Caught this via a debug seed sweep (seed=1
-         * reproduced it consistently) rather than reasoning it out in
-         * advance -- worth remembering that new per-voice per-note
-         * randomization (bitDepth, rateReducerMultiplier) needs the
-         * same seed-sweep verification as everything else, not just
-         * the small sample of seeds a manual test happens to try. */
-        {
-            const double reducerRate = clampd(v->freqHz * v->rateReducerMultiplier, 100.0, e->sampleRate * 0.5);
-            voiceSum = pitchedhold_process(&v->rateReducer, voiceSum, reducerRate, e->sampleRate, 1.0);
-        }
-        voiceSum = bitcrush_process(voiceSum, v->bitDepth);
-
         /* Per-voice amplitude modulation -- a simple sine tremolo,
          * depth/rate from knobs 3/4. amDepth01=0 leaves the voice
          * completely untouched (multiplying by 1.0 always), matching
          * "controlled by the knobs" rather than being a fixed always-on
          * wobble. */
-        const double amCyclePosition = 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase)); // 0 at the AM peak, 1 at the AM dip
-        const double amGain = 1.0 - e->params.amDepth01 * amCyclePosition;
-
-        /* Wavefolder linked to the SAME AM cycle, per explicit request
-         * that it "comes in and out with the AM" -- fold amount peaks
-         * exactly when amGain is at its quietest, so the dip in volume
-         * is accompanied by a dip into more distorted/folded texture
-         * rather than the two being unrelated. Zero when AM depth is
-         * zero, matching "controlled by the knobs" like AM itself. */
-        const double foldAmount = e->params.amDepth01 * amCyclePosition;
-        voiceSum = wavefold_process(voiceSum, foldAmount);
+        v->amPhase += e->params.amRateHz * dt;
+        if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
+        double amGain = 1.0 - e->params.amDepth01 * 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase));
 
         mix += voiceSum * v->envLevel * amGain;
     }
-
-    /* Single shared drive/saturation stage on the final mix, per
-     * explicit request for something to give the noise more volume
-     * and colour -- deliberately one block applied once here, not
-     * per-voice or per-layer. Simple pre-gain into tanh (same
-     * saturation approach used throughout this project family's
-     * filters) -- NOT normalized back down afterward, since the
-     * saturation's natural loudness/density increase at higher drive
-     * IS the "more volume" part of the request, not a side effect to
-     * cancel out. */
-    double driveGain = 1.0 + e->params.drive01 * 6.0;
-    mix = tanh(mix * driveGain);
-
-    /* Global, always-on tape saturation stage -- per explicit request,
-     * distinct from the knob-controlled Drive above (which can be
-     * turned down to 0; this can't). Placed after Drive specifically
-     * because it has its own built-in compressor, which tames whatever
-     * loudness Drive added before the final tanh warms/rounds it off
-     * -- a sensible "drive then tame" order rather than two unrelated
-     * saturation stages fighting each other. */
-    mix = tapesat_process(&e->tapeSat, mix, e->sampleRate);
 
     return mix * e->params.masterLevel01;
 }

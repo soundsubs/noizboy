@@ -1,12 +1,13 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.4.1",
+    "version": "0.6.1",
     "abbrev": "NOIZB",
-    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument with per-voice bitcrush/rate-reduce, AM-linked wavefolding, always-on tape saturation, and db-cell's chain always running on the output. Single-press Randomize in the menu.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Gentle vibrato, envelope-following cutoff, velocity brightness. db-cell always runs on the output, gated silent between notes. Single-press Randomize via jog click.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",
+    "raw_ui": true,
     "api_version": 2,
     "capabilities": {
         "audio_out": true,
@@ -30,20 +31,20 @@
                 "default": 104
             },
             {
-                "key": "am_rate",
-                "name": "AM Rate",
-                "type": "int",
-                "min": 0,
-                "max": 127,
-                "default": 25
-            },
-            {
                 "key": "am_depth",
                 "name": "AM Depth",
                 "type": "int",
                 "min": 0,
                 "max": 127,
                 "default": 0
+            },
+            {
+                "key": "am_rate",
+                "name": "AM Rate",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 25
             },
             {
                 "key": "attack",
