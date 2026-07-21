@@ -337,6 +337,15 @@ typedef struct {
      * once to the final mix after all voices are summed (and after
      * DBCELL processing, in the plugin wrapper). */
     TapeSaturation tapeSat;
+
+    /* Smoothed knob-8 (Output Filt) value -- params.outputFilterFreq01
+     * is set instantly by set_param on each discrete MIDI CC step as
+     * the knob turns, which without smoothing produces audible
+     * "zipper" stepping in the filter's cutoff (especially noticeable
+     * here given the tilt filter's wide, silence-at-both-extremes
+     * sweep range). This glides toward the target each sample instead
+     * of jumping to it -- see its use in noiseboy_process. */
+    double outputFilterFreqSmoothed01;
 } NoiseboyEngine;
 
 void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int seed);

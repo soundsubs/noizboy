@@ -66,6 +66,32 @@ amounts and ultimately removed entirely, per direct feedback -- see
 
 ## Status
 
+**v0.11.1** -- fixed audible "zipper" stepping on knob 8 (Output Filt),
+per direct report. Root cause: `set_param` writes the knob's target
+value instantly on every discrete MIDI CC step as a physical knob
+turns, and the tilt filter previously read that target directly with
+no smoothing -- each step caused an instant jump in cutoff frequency,
+audible as stepping rather than a smooth sweep. Especially noticeable
+here given the tilt filter's wide range and silence-at-both-extremes
+design, where even small target jumps near the extremes produce large
+audible changes.
+
+Fix: knob 8's value now glides toward its target (~15ms time constant,
+smoothed once per sample) rather than jumping to it. Verified directly
+with a dedicated test that simulates discrete knob steps (like real
+MIDI CC messages arriving as a knob turns) and confirms the actual
+smoothed value used by the filter changes by no more than ~0.0007 per
+sample, vs. up to 0.1 in a single sample without smoothing (`make
+test-zipper`, now part of the default `make test`).
+
+This required updating the existing tilt-filter silence test too --
+with smoothing now taking ~250ms to fully converge from centre to an
+extreme, the test's original 500ms peak-measurement window was
+capturing the transition period (filter still partway open) rather
+than steady-state behaviour. Fixed by letting the smoothing settle
+first, then measuring -- the correct fix given the new, intentional
+smoothing behavior, not a loosened threshold papering over it.
+
 **v0.11.0** -- Output Filt (knob 8) rebuilt as a TILT filter, per
 direct request. Checked the previous design first rather than
 assuming it was broken -- `set_param`, `get_param`, and the

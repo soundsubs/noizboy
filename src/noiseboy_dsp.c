@@ -257,7 +257,8 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
-    e->params.outputFilterFreq01 = 0.5;    /* neutral -- no change to the velocity-driven base range */
+    e->params.outputFilterFreq01 = 0.5;    /* neutral -- centre position, tilt filter fully bypassed */
+    e->outputFilterFreqSmoothed01 = 0.5;   /* starts matching the target, no smoothing transient on load */
     e->params.masterLevel01 = 0.8;
     e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
@@ -463,6 +464,18 @@ double noiseboy_process(NoiseboyEngine *e) {
     double mix = 0.0;
     const double dt = 1.0 / e->sampleRate;
 
+    /* Smooth knob 8 (Output Filt) toward its target once per sample,
+     * globally -- not knob-specific to any one voice, since it's a
+     * shared engine parameter. ~15ms time constant: fast enough to
+     * feel responsive as the knob turns, slow enough to eliminate the
+     * "zipper" stepping a direct instant-jump would produce (see this
+     * field's own header comment). */
+    {
+        const double smoothCoeff = exp(-1.0 / (0.001 * 15.0 * e->sampleRate));
+        e->outputFilterFreqSmoothed01 = e->params.outputFilterFreq01
+            + (e->outputFilterFreqSmoothed01 - e->params.outputFilterFreq01) * smoothCoeff;
+    }
+
     /* Envelope smoothing coefficients recomputed from the current knob
      * values each sample -- cheap (a couple of exp() calls per ACTIVE
      * voice, not per layer), and lets attack/release knob changes take
@@ -594,7 +607,7 @@ double noiseboy_process(NoiseboyEngine *e) {
          * simple and predictable given this replaces a previous
          * design that wasn't landing as an audible, useful control. */
         {
-            const double knob = e->params.outputFilterFreq01;
+            const double knob = e->outputFilterFreqSmoothed01;
             if (knob <= 0.5) {
                 const double t = clampd((0.5 - knob) / 0.5, 0.0, 1.0);
                 const double lpCutoff = clampd(20000.0 * pow(20.0 / 20000.0, t), 20.0, e->sampleRate * 0.45);

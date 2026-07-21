@@ -9,6 +9,17 @@ static double measure_peak(unsigned int seed, double knobValue, int notesToPlay)
     for (int i = 0; i < notesToPlay; i++) {
         noiseboy_note_on(&e, 48 + i * 5, 0.8);
     }
+
+    /* Let the knob-8 smoothing (added to fix reported "zipper"
+     * stepping) fully settle before measuring -- otherwise this test
+     * captures the transition period (filter still partway open while
+     * gliding toward its target) rather than steady-state behaviour.
+     * ~15ms time constant means well under 300ms is enough for full
+     * convergence; run 400ms and discard it. */
+    for (int i = 0; i < (int)(48000 * 0.4); i++) {
+        noiseboy_process(&e);
+    }
+
     double peak = 0.0;
     for (int i = 0; i < (int)(48000 * 0.5); i++) {
         double y = noiseboy_process(&e);
