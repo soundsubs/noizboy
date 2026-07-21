@@ -178,6 +178,16 @@ typedef struct {
      * stack) -- no longer relevant to filtered-noise layers now that
      * they have no per-layer filter of their own to detune. */
     double detuneCents;
+
+    /* Smoothed sustain-feed amount for Karplus layers -- avoids an
+     * instantaneous on/off snap in the string's excitation level
+     * exactly at the release boundary (was a hard gate: 0.02 while
+     * held, 0.0 the instant released). A discontinuous excitation
+     * change happening exactly when release begins is one plausible
+     * contributor to a reported "pitch tied to envelope" perception --
+     * smoothing it removes that specific discontinuity regardless of
+     * whether it's the full explanation. */
+    double sustainAmountSmoothed;
 } Layer;
 
 typedef struct {

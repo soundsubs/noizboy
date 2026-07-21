@@ -1,7 +1,7 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.9.0",
+    "version": "0.9.1",
     "abbrev": "NOIZB",
     "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Signal chain restructured: sources -> bitcrush/rate-reduce -> pitch-tracking filter -> envelope -> output filter. Pitch no longer drifts with velocity or envelope. db-cell always runs on the output, gated silent between notes.",
     "author": "soundsubs",

@@ -378,6 +378,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
         } else {
             karplus_init(&layer->karplus);
+            layer->sustainAmountSmoothed = 0.0; /* starts at 0, smooths up toward the held target -- symmetric with how it smooths down at release */
             /* noiseGen initialized here too (previously only used for
              * filtered-noise layers) -- karplus's ongoing sustain feed
              * in process_layer reuses it. */
@@ -452,17 +453,22 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
      * avoid touching every call site. */
     (void)e;
     if (layer->type == LAYER_KARPLUS_STRONG) {
-        /* Small ongoing noise injection while the note is held (0
-         * once released, letting the string decay/ring out naturally
-         * via its own damping) -- per direct feedback for "short
-         * sustained notes that ring out" rather than only a single
-         * decaying pluck. Reuses layer->noiseGen/colour (otherwise
-         * unused on a Karplus layer) rather than the multi-source sum
-         * the initial pluck uses -- the ongoing feed doesn't need to
-         * be as elaborate as the defining initial burst. */
+        /* Small ongoing noise injection while the note is held (fades
+         * toward 0 once released, letting the string decay/ring out
+         * naturally via its own damping) -- per direct feedback for
+         * "short sustained notes that ring out" rather than only a
+         * single decaying pluck. Reuses layer->noiseGen/colour
+         * (otherwise unused on a Karplus layer) rather than the
+         * multi-source sum the initial pluck uses -- the ongoing feed
+         * doesn't need to be as elaborate as the defining initial
+         * burst. Target amount is smoothed (10ms time constant) rather
+         * than snapped instantly at the release boundary -- see
+         * sustainAmountSmoothed's own comment for why. */
         double sustainFeed = noisegen_process(&layer->noiseGen, layer->colour);
-        double sustainAmount = v->gateOpen ? 0.02 : 0.0;
-        return karplus_process(&layer->karplus, sustainFeed, sustainAmount);
+        double sustainTarget = v->gateOpen ? 0.02 : 0.0;
+        const double smoothCoeff = 0.999; /* ~10ms-ish at typical sample rates, gentle enough to remove the discontinuity without noticeably delaying the release character */
+        layer->sustainAmountSmoothed = sustainTarget + (layer->sustainAmountSmoothed - sustainTarget) * smoothCoeff;
+        return karplus_process(&layer->karplus, sustainFeed, layer->sustainAmountSmoothed);
     }
 
     return noisegen_process(&layer->noiseGen, layer->colour);
@@ -566,7 +572,17 @@ double noiseboy_process(NoiseboyEngine *e) {
          * played harder; envelope making pitch audibly decay over a
          * long release, since the cutoff followed envLevel). This
          * filter's cutoff is now purely a function of the played note
-         * and the two relevant knobs -- nothing else. */
+         * and the two relevant knobs -- nothing else.
+         *
+         * NOTE: a drive reduction (0.2 -> 0.05) was tried here as a
+         * hypothesis fix for a reported "pitch tied to envelope"
+         * complaint, on the theory that a saturating feedback path at
+         * high resonance could let the resonant peak shift with input
+         * amplitude. Reverted -- it measurably WEAKENED pitch tracking
+         * (this project's own zero-crossing test ratio dropped from
+         * ~3.5x to ~1.5x, further from the true 16x for a 4-octave
+         * span), a confirmed regression for a speculative, unconfirmed
+         * benefit. Left at the original 0.2. */
         {
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
             const double pitchCutoff = clampd(v->freqHz * cutoffMul, 20.0, e->sampleRate * 0.45);

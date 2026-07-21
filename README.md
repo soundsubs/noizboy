@@ -43,6 +43,43 @@ release to avoid clicks, not a sustained pad envelope).
 
 ## Status
 
+**v0.9.1** -- investigation into a "dive bomb" / "pitch attached to
+envelope" report. Being direct about what was actually verified vs.
+hypothesized here, since this one wasn't a clean bug-with-a-fix:
+
+**Verified, not the cause**: exhaustively traced every use of
+`envLevel` in the codebase (8 total) -- none of them touch any
+frequency/cutoff/rate parameter. Specifically confirmed the rate-
+reducer's rate is mathematically constant for a note's entire
+duration: both `v->freqHz` and `v->rateReducerMultiplier` are set once
+at note-on and never touched again, so "sample rate reduction attached
+to envelope" cannot happen as literally described -- there's no code
+path for it. Bitcrush's bit depth is likewise fixed at note-on.
+Vibrato was also ruled out: its depth comes from the AM Depth knob
+(fixed, defaults to 0) and even when active is a symmetric oscillation
+around centre, not a one-directional sweep.
+
+**Best hypothesis, addressed**: Karplus-Strong's sustain-feed was
+hard-gated (an instant on/off snap in excitation level at the exact
+release boundary), which could produce an audible spectral
+discontinuity right at the moment release begins -- smoothed this to
+a gradual fade instead (both directions: fades in from 0 at note-on,
+fades out at release) rather than an instant step.
+
+**Tried and reverted**: reduced the pitch-tracking filter's drive
+(0.2->0.05) on the theory that a saturating feedback path at high
+resonance could let the resonant peak shift with input amplitude/
+transients. This measurably WEAKENED pitch tracking -- this project's
+own zero-crossing test ratio dropped from ~3.5x to ~1.5x (further from
+the true 16x for a 4-octave span) -- a confirmed regression for an
+unconfirmed benefit, so reverted back to 0.2.
+
+**Still open**: asked whether the effect happens on pure-filtered-
+noise patches (no Karplus) to help isolate whether this is Karplus-
+specific or more general -- no answer yet. If the smoothing above
+doesn't resolve it, that answer is the next real lead, since it would
+rule the Karplus-specific hypothesis in or out directly.
+
 **v0.9.0** -- major signal chain restructuring, per explicit spec, plus
 the root cause of a real reported bug found and fixed:
 
