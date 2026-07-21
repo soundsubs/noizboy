@@ -211,15 +211,15 @@ static const char *NOISEBOY_UI_HIERARCHY_JSON =
     "{\"levels\":{\"root\":{\"name\":\"NOISEBOY\",\"params\":["
     "{\"key\":\"filter_cutoff\",\"name\":\"Filter Offset\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"am_rate\",\"name\":\"AM Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"am_depth\",\"name\":\"AM Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"am_rate\",\"name\":\"AM Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"detune_spread\",\"name\":\"Detune\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127}"
-    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"am_rate\",\"am_depth\",\"attack\",\"release\",\"detune_spread\",\"master_level\"]}}}";
+    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"am_depth\",\"am_rate\",\"attack\",\"release\",\"detune_spread\",\"master_level\"]}}}";
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;

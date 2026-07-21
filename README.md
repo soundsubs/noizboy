@@ -42,6 +42,95 @@ release to avoid clicks, not a sustained pad envelope).
 
 ## Status
 
+**v0.6.0** -- this round covers a real bug catch plus three feature
+requests, and a full rewrite of the Randomize menu using verified
+(not guessed) Schwung UI source:
+
+1. **Real bug: a voice could go completely silent for an entire
+   note.** At low randomized bit-crush depths (as low as 1-2 bits),
+   the quantization step (0.5 for 2-bit) could exceed a Karplus
+   voice's actual signal amplitude entirely -- every sample rounded to
+   exactly 0, silencing the whole note, not just sounding crunchy.
+   First fix attempt (reordering bitcrush vs. the rate-reducer) helped
+   but didn't fully resolve it; the real fix is in `bitcrush_process`
+   itself, which now guarantees it never rounds a genuinely nonzero
+   signal all the way to silence -- nudges to the nearest nonzero
+   quantization step instead, preserving the harsh low-bit-depth
+   character while eliminating total silence. Caught this via a
+   comprehensive sweep (3000 seeds x 8 notes = 24,000 combinations,
+   now a permanent test via `make test-sweep`) after a small hand-
+   picked sample of seeds initially masked it -- worth remembering
+   that per-note randomization needs the same scale of verification as
+   everything else, not just a few manually-tried seeds.
+2. **Vibrato** ("in the noise and Karplus... gentle, like an acoustic
+   instrument") -- implemented as a modulated delay line with linear
+   interpolation (the standard, safe way to add pitch modulation
+   without touching Karplus's own delay-length-defines-pitch
+   internals), applied once per voice after layers mix so it covers
+   both layer types. Depth saturates at just 15% of AM Depth's own
+   knob travel as requested -- verified the saturation curve hits
+   exactly 1.0 at 0.15 and stays there for the rest of the range.
+3. **Filter cutoff follows the amplitude envelope**, capped at a 20%
+   max brightening at the envelope's own peak, per explicit request
+   matching acoustic-instrument behaviour.
+4. **Randomize menu rewritten from scratch using verified real
+   source**, not documentation. The v0.4.0 draft never actually
+   loaded -- turned out to be using relative import paths
+   ('../../shared/menu_items.mjs') when real Schwung modules use
+   ABSOLUTE filesystem paths (/data/UserData/schwung/shared/...), and
+   missing the "raw_ui": true flag in module.json entirely (a real
+   module.json field discovered by having the checkout inspected
+   directly, not documented anywhere I could find). Rewrote using
+   patterns copied directly from three real, working files pulled from
+   a local Schwung checkout: tools/ui-test/ui.js, text-test/ui.js, and
+   audio_fx/freeverb/ui_chain.js -- host_module_set_param(key,
+   stringValue) is confirmed directly from freeverb's real chain UI,
+   not guessed. Single jog-wheel click now triggers Randomize.
+
+All four existing test suites plus the new comprehensive sweep re-run
+clean (`make test`).
+
+**v0.5.0** -- four items from real playing feedback:
+
+1. **Karplus-Strong now blends the recipe's noise, and rings while
+   held.** Excitation is summed from ALL of the recipe's layer colours
+   (not just its own single colour) -- normalized average of
+   independently-seeded generators, one per colour -- so a Karplus
+   layer blends with the rest of the patch rather than sounding like
+   an isolated source. Separately: a single pluck decays on its own
+   timescale regardless of the envelope's attack time, which meant a
+   long attack could make the pluck nearly inaudible by the time the
+   slow envelope let it through, and there was no way to get a
+   sustained/ringing character. Fixed with a small ongoing noise
+   injection while the note is held (stops at release, letting the
+   string ring out via its own damping) -- verified with a dedicated
+   test: even at maximum attack (200ms), signal stays clearly audible
+   deep into the hold (0.235 vs. 0.278 initial peak) rather than
+   decaying to near-silence, and still properly releases to full
+   silence within a second of note-off.
+2. **AM Depth and AM Rate swapped** -- Depth is knob 3, Rate is knob 4
+   now, matching the requested order. Updated in both `module.json`'s
+   chain_params and the matching `ui_hierarchy` JSON (re-validated the
+   hand-built JSON string parses correctly after the edit).
+3. **Velocity always brightens the filter** -- up to 2.5x cutoff
+   multiplier at maximum velocity, matching how acoustic instruments
+   naturally get brighter when played harder. Not knob-controlled;
+   always on, per explicit request. Confirmed audible: the existing
+   pitch-tracking test's zero-crossing counts jumped noticeably once
+   this landed (13->21 low note, 214->355 high note), since the
+   velocities used in that test now genuinely brighten the signal.
+4. **Randomize single-button-press -- still open.** Feedback was that
+   it's still the old multi-step parameter interaction (scroll to it,
+   select it, dial from 0 to a nonzero value), which suggests the
+   `ui.js` Shadow UI menu added in v0.4.0 either didn't load or got
+   bypassed on-device. Needs on-device diagnosis (what the menu screen
+   actually shows) before attempting a fix -- see the project's
+   conversation history for the open question on this.
+
+All four existing test suites re-run clean after this round's changes,
+plus a new dedicated `test_karplus_sustain.c` (also part of the
+default `make test`).
+
 **v0.4.1** -- signal chain correction: db-cell's forced-always-present
 Noiz slot generates sound regardless of NOISEBOY's own input, so a
 noise gate is now placed AFTER db-cell (not before, and not on

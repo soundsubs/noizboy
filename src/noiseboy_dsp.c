@@ -13,6 +13,19 @@ static double clampd(double x, double lo, double hi) {
     return x;
 }
 
+static unsigned int xorshift_next(unsigned int *state) {
+    unsigned int s = *state;
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    *state = s;
+    return s;
+}
+
+static double rand01(unsigned int *state) {
+    return (double)xorshift_next(state) / (double)UINT32_MAX;
+}
+
 
 /* ---------------------------------------------------------------------
  * New for NOISEBOY: Karplus-Strong plucked-string synthesis.
@@ -23,7 +36,7 @@ void karplus_init(KarplusString *k) {
     k->damping = 0.99;
 }
 
-void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, NoiseGen *noiseGen, NoiseColour colour, double dampingAmount) {
+void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, unsigned int *rngState, const NoiseColour *sourceColours, int numSources, double dampingAmount) {
     int length = (int)(sample_rate / (freq_hz > 20.0 ? freq_hz : 20.0) + 0.5);
     if (length < 2) length = 2;
     if (length > NOISEBOY_KS_MAX_SAMPLES - 1) length = NOISEBOY_KS_MAX_SAMPLES - 1;
@@ -35,12 +48,27 @@ void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, NoiseGe
      * classic Karplus-Strong "string material" control. */
     k->damping = 0.90 + clampd(dampingAmount, 0.0, 1.0) * 0.099;
 
+    /* Excitation burst summed from numSources independently-seeded
+     * generators (one per recipe layer's colour, per direct feedback
+     * -- see this struct's own comment for why), normalized by count
+     * so more sources doesn't mean a louder pluck, just a richer one. */
+    if (numSources < 1) numSources = 1;
+    if (numSources > NOISEBOY_MAX_LAYERS) numSources = NOISEBOY_MAX_LAYERS;
+    NoiseGen sources[NOISEBOY_MAX_LAYERS];
+    for (int s = 0; s < numSources; s++) {
+        noisegen_init(&sources[s], xorshift_next(rngState));
+    }
+
     for (int i = 0; i < length; i++) {
-        k->buffer[i] = noisegen_process(noiseGen, colour);
+        double sum = 0.0;
+        for (int s = 0; s < numSources; s++) {
+            sum += noisegen_process(&sources[s], sourceColours[s]);
+        }
+        k->buffer[i] = sum / (double)numSources;
     }
 }
 
-double karplus_process(KarplusString *k) {
+double karplus_process(KarplusString *k, double sustainFeedSample, double sustainAmount) {
     int len = k->length;
     if (len < 2) return 0.0;
     int readPos = k->writePos;
@@ -50,9 +78,13 @@ double karplus_process(KarplusString *k) {
     /* Classic Karplus-Strong step: average two adjacent samples (a
      * simple one-pole lowpass, softening the string's harmonics each
      * pass) and apply the decay coefficient, writing the result back
-     * into the position just read so it feeds forward next cycle. */
+     * into the position just read so it feeds forward next cycle.
+     * sustainFeedSample*sustainAmount adds a small continuous
+     * injection while the note is held (sustainAmount=0 after
+     * release), keeping the string ringing rather than only decaying
+     * from the initial pluck -- see this struct's own comment. */
     double filtered = (cur + next) * 0.5;
-    k->buffer[readPos] = filtered * k->damping;
+    k->buffer[readPos] = filtered * k->damping + sustainFeedSample * sustainAmount;
     k->writePos = nextPos;
     return cur;
 }
@@ -93,7 +125,21 @@ double bitcrush_process(double x, int bits) {
     if (bits > 16) bits = 16;
     double levels = pow(2.0, (double)bits);
     double step = 2.0 / levels;
-    return floor(x / step + 0.5) * step;
+    double quantized = floor(x / step + 0.5) * step;
+    /* Never fully silence a genuinely nonzero input -- a real bug this
+     * caught: at low bit depths (step is huge relative to typical
+     * signal amplitudes -- 0.5 for bits=2), a small-but-real signal
+     * (a Karplus-Strong voice sampled through the rate-reducer) can
+     * round to exactly 0 on EVERY sample for the note's entire
+     * duration, silencing the voice outright rather than just sounding
+     * crunchy. Nudge to the nearest nonzero step in the input's own
+     * direction instead -- keeps the extreme, harsh character low bit
+     * depths are supposed to have, while guaranteeing some signal
+     * always gets through. */
+    if (quantized == 0.0 && fabs(x) > 1e-9) {
+        quantized = (x > 0.0) ? step : -step;
+    }
+    return quantized;
 }
 
 double wavefold_process(double x, double amount) {
@@ -112,6 +158,38 @@ double wavefold_process(double x, double amount) {
         else break;
     }
     return driven;
+}
+
+void vibrato_init(VibratoDelay *v) {
+    memset(v->buffer, 0, sizeof(v->buffer));
+    v->writePos = 0;
+}
+
+double vibrato_process(VibratoDelay *v, double x, double phase01, double depthSamples) {
+    v->buffer[v->writePos] = x;
+
+    /* Fixed 32-sample centre delay (well inside the 512-sample buffer
+     * even at the largest depthSamples this is ever driven with),
+     * modulated +-depthSamples by a sine at the same phase driving
+     * AM/wavefold. Linear interpolation between the two nearest
+     * integer samples for a smooth fractional read position -- this
+     * is what actually produces the pitch-bend sensation, unlike an
+     * integer-only read which would just add a stepped/gritty comb
+     * artifact instead of a smooth vibrato. */
+    double lfo = sin(2.0 * M_PI * phase01);
+    double delaySamples = 32.0 + lfo * depthSamples;
+
+    double readPos = (double)v->writePos - delaySamples;
+    while (readPos < 0.0) readPos += (double)NOISEBOY_VIBRATO_BUFFER_SIZE;
+
+    int readPosInt = (int)readPos;
+    double frac = readPos - (double)readPosInt;
+    int readPosNext = (readPosInt + 1) % NOISEBOY_VIBRATO_BUFFER_SIZE;
+
+    double sample = v->buffer[readPosInt] * (1.0 - frac) + v->buffer[readPosNext] * frac;
+
+    v->writePos = (v->writePos + 1) % NOISEBOY_VIBRATO_BUFFER_SIZE;
+    return sample;
 }
 
 void tapesat_init(TapeSaturation *t) {
@@ -148,19 +226,6 @@ double tapesat_process(TapeSaturation *t, double x, double sampleRate) {
 /* ---------------------------------------------------------------------
  * Engine: voice management, randomized recipe, MIDI, per-sample mix.
  * ------------------------------------------------------------------- */
-
-static unsigned int xorshift_next(unsigned int *state) {
-    unsigned int s = *state;
-    s ^= s << 13;
-    s ^= s >> 17;
-    s ^= s << 5;
-    *state = s;
-    return s;
-}
-
-static double rand01(unsigned int *state) {
-    return (double)xorshift_next(state) / (double)UINT32_MAX;
-}
 
 static double midi_note_to_freq(int midiNote) {
     return 440.0 * pow(2.0, (midiNote - 69) / 12.0);
@@ -272,6 +337,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     if (v->bitDepth > 15) v->bitDepth = 15;
     v->rateReducerMultiplier = 0.5 + rand01(&e->rngState) * 7.5;
     pitchedhold_init(&v->rateReducer);
+    vibrato_init(&v->vibrato);
 
     v->numLayers = e->numRecipeLayers;
     for (int i = 0; i < v->numLayers; i++) {
@@ -294,10 +360,22 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             pitchedhold_init(&layer->pitchedHold);
         } else {
             karplus_init(&layer->karplus);
-            NoiseGen seedGen;
-            noisegen_init(&seedGen, xorshift_next(&e->rngState));
+            /* noiseGen initialized here too (previously only used for
+             * filtered-noise layers) -- karplus's ongoing sustain feed
+             * in process_layer reuses it. */
+            noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
+            /* Excitation summed from ALL of this recipe's layer
+             * colours (including this layer's own), not just its own
+             * single colour -- per direct feedback that the Karplus
+             * layer should be "fed from the sum of the noise it's
+             * randomized with", so it blends with the rest of the
+             * patch's noise palette rather than sounding isolated. */
+            NoiseColour sourceColours[NOISEBOY_MAX_LAYERS];
+            for (int ci = 0; ci < v->numLayers; ci++) {
+                sourceColours[ci] = e->recipe[ci].colour;
+            }
             double damping = clampd(r->dampingAmount01 * 0.5 + e->params.filterResonance01 * 0.5, 0.0, 1.0);
-            karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &seedGen, r->colour, damping);
+            karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, damping);
         }
     }
 }
@@ -347,7 +425,17 @@ int noiseboy_any_voice_active(const NoiseboyEngine *e) {
 
 static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
     if (layer->type == LAYER_KARPLUS_STRONG) {
-        return karplus_process(&layer->karplus);
+        /* Small ongoing noise injection while the note is held (0
+         * once released, letting the string decay/ring out naturally
+         * via its own damping) -- per direct feedback for "short
+         * sustained notes that ring out" rather than only a single
+         * decaying pluck. Reuses layer->noiseGen/colour (otherwise
+         * unused on a Karplus layer) rather than the multi-source sum
+         * the initial pluck uses -- the ongoing feed doesn't need to
+         * be as elaborate as the defining initial burst. */
+        double sustainFeed = noisegen_process(&layer->noiseGen, layer->colour);
+        double sustainAmount = v->gateOpen ? 0.02 : 0.0;
+        return karplus_process(&layer->karplus, sustainFeed, sustainAmount);
     }
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
@@ -368,7 +456,23 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
      * stops tracking it -- the offset is a multiplier applied to the
      * pitch-derived base cutoff, not a replacement for it. */
     double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
-    double cutoffHz = clampd(v->freqHz * detuneMul * cutoffMul, 20.0, e->sampleRate * 0.45);
+    /* Velocity always brightens the filter, per explicit request
+     * matching acoustic-instrument behaviour (harder strikes/plucks
+     * excite more high-frequency energy) -- NOT knob-controlled or
+     * optional, always applied. Up to 2.5x cutoff multiplier at
+     * maximum velocity, 1x (no change) at zero velocity. */
+    double velocityMul = 1.0 + v->velocity01 * 1.5;
+    /* Filter cutoff also follows the amplitude envelope itself (rises
+     * during attack, falls during release), capped to a max 20%
+     * brightening at the envelope's own peak -- per explicit request.
+     * envLevel is normalized by velocity01 first since envLevel's own
+     * range is 0..velocity01, not 0..1 -- without normalizing, a
+     * quietly-played (low velocity) note would only ever reach a
+     * fraction of the 20% cap, when the intent is that EVERY note's
+     * own envelope shape drives this the same relative amount. */
+    double envNorm = (v->velocity01 > 0.001) ? clampd(v->envLevel / v->velocity01, 0.0, 1.0) : 0.0;
+    double envelopeMul = 1.0 + envNorm * 0.20;
+    double cutoffHz = clampd(v->freqHz * detuneMul * cutoffMul * velocityMul * envelopeMul, 20.0, e->sampleRate * 0.45);
     double resonance = clampd(e->params.filterResonance01 + (layer->resonanceBias01 - 0.5) * 0.2, 0.0, 0.95);
 
     switch (layer->filterKind) {
@@ -415,26 +519,65 @@ double noiseboy_process(NoiseboyEngine *e) {
         }
         if (v->numLayers > 0) voiceSum /= (double)v->numLayers;
 
+        /* AM phase updated here (before vibrato/AM/wavefold all need
+         * it) rather than down where AM itself used to compute it --
+         * vibrato needs the same shared phase too, per explicit
+         * request that it stays in sync with the tremolo. */
+        v->amPhase += e->params.amRateHz * dt;
+        if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
+
+        /* Vibrato, per explicit request -- introduces gentle pitch
+         * modulation "in the noise and Karplus" (both already present
+         * in voiceSum by this point, so one instance covers both layer
+         * types). Depth saturates at just 15% of AM Depth's own knob
+         * travel -- i.e. vibrato reaches its own (small) maximum
+         * quickly and stays there for the rest of the knob's range,
+         * rather than growing all the way to a dramatic wobble at full
+         * knob -- "so that its gentle, like an acoustic instrument".
+         * Max depth of 4 samples chosen as a reasoned, not ear-tuned,
+         * starting point (see this project's own verification notes
+         * on why -- no way to listen to this directly). */
+        {
+            const double vibratoDepthFactor01 = clampd(e->params.amDepth01 / 0.15, 0.0, 1.0);
+            const double vibratoDepthSamples = vibratoDepthFactor01 * 4.0;
+            voiceSum = vibrato_process(&v->vibrato, voiceSum, v->amPhase, vibratoDepthSamples);
+        }
+
         /* Per-voice bitcrusher + pitch-following sample-rate reducer,
          * applied to the mixed voice signal (after layers, before AM)
          * -- per explicit request. Rate reducer's rate is derived from
          * the played note (freqHz * this voice's randomized
          * multiplier), floored at 100Hz and ceiled at Nyquist so it
          * always sits somewhere between "100Hz crunch" and "full
-         * resolution" as requested, while still tracking pitch. */
-        voiceSum = bitcrush_process(voiceSum, v->bitDepth);
+         * resolution" as requested, while still tracking pitch.
+         *
+         * ORDER MATTERS HERE, discovered via a real bug: rate-reduce
+         * (sample-and-hold) MUST run before bitcrush, not after. At
+         * low bit depths (bitDepth can randomize as low as 1-2),
+         * bitcrush quantizes most small-amplitude samples straight to
+         * 0 -- a Karplus-Strong voice's naturally quiet signal level
+         * meant well over 80% of samples were landing exactly on 0
+         * after crushing. Sampling THAT with a sparse hold (updating
+         * only every ~46 samples at typical rates) had a real, non-
+         * negligible chance of every single hold-update landing on one
+         * of those zeroed samples, silencing the entire voice for the
+         * whole note. Caught this via a debug seed sweep (seed=1
+         * reproduced it consistently) rather than reasoning it out in
+         * advance -- worth remembering that new per-voice per-note
+         * randomization (bitDepth, rateReducerMultiplier) needs the
+         * same seed-sweep verification as everything else, not just
+         * the small sample of seeds a manual test happens to try. */
         {
             const double reducerRate = clampd(v->freqHz * v->rateReducerMultiplier, 100.0, e->sampleRate * 0.5);
             voiceSum = pitchedhold_process(&v->rateReducer, voiceSum, reducerRate, e->sampleRate, 1.0);
         }
+        voiceSum = bitcrush_process(voiceSum, v->bitDepth);
 
         /* Per-voice amplitude modulation -- a simple sine tremolo,
          * depth/rate from knobs 3/4. amDepth01=0 leaves the voice
          * completely untouched (multiplying by 1.0 always), matching
          * "controlled by the knobs" rather than being a fixed always-on
          * wobble. */
-        v->amPhase += e->params.amRateHz * dt;
-        if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
         const double amCyclePosition = 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase)); // 0 at the AM peak, 1 at the AM dip
         const double amGain = 1.0 - e->params.amDepth01 * amCyclePosition;
 

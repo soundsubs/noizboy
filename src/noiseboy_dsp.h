@@ -46,7 +46,24 @@
  * back through a simple one-pole damping filter (lower damping =
  * brighter/longer sustain, higher = darker/shorter -- the classic
  * "string material" control). Pitch comes from delay length itself,
- * not from any separate resonant filter. */
+ * not from any separate resonant filter.
+ *
+ * Per direct feedback: (1) the excitation should be built from the
+ * SUM of whatever noise colours the rest of the recipe's layers are
+ * using, not just this layer's own single colour, so a Karplus layer
+ * blends with the rest of the patch's noise palette rather than
+ * sounding like an isolated source; (2) a single pluck decays away on
+ * its own timescale regardless of the envelope's attack time, so a
+ * long attack could make the pluck nearly inaudible by the time the
+ * envelope let it through, and there was no way to get a sustained,
+ * ringing character rather than a single decaying pluck. Both
+ * addressed by karplus_process taking an ongoing small noise feed
+ * (same multi-colour-sum source) applied continuously while the note
+ * is held -- keeps the string genuinely alive/ringing for as long as
+ * it's held ("short sustained notes that ring out"), and since the
+ * string stays energized rather than just decaying from one initial
+ * burst, it also fixes the long-attack-makes-it-inaudible problem as
+ * a side effect. */
 typedef struct {
     double buffer[NOISEBOY_KS_MAX_SAMPLES];
     int length;       /* current delay length in samples, set per note */
@@ -56,13 +73,20 @@ typedef struct {
 } KarplusString;
 
 void karplus_init(KarplusString *k);
-/* Reseeds the delay line with noise and sets its length for freq_hz at
- * the given sample rate -- call once on note-on. noiseGen supplies the
- * excitation burst (reusing the same three-colour noise generator so
- * the pluck's initial timbre can vary the same way filtered-noise
- * layers do). */
-void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, NoiseGen *noiseGen, NoiseColour colour, double dampingAmount);
-double karplus_process(KarplusString *k);
+/* Reseeds the delay line and sets its length for freq_hz at the given
+ * sample rate -- call once on note-on. The excitation burst is built
+ * by summing `numSources` independently-seeded noise generators (one
+ * per colour in sourceColours), normalized by numSources -- see the
+ * struct comment above for why this replaced a single dedicated
+ * NoiseGen. rngState seeds the temporary generators created inside
+ * this call. */
+void karplus_pluck(KarplusString *k, double freq_hz, double sample_rate, unsigned int *rngState, const NoiseColour *sourceColours, int numSources, double dampingAmount);
+/* sustainFeedSample/sustainAmount: an ongoing small noise injection
+ * (sustainAmount > 0 while the note is held, 0 after release) that
+ * keeps the string ringing rather than only decaying from the initial
+ * pluck -- see the struct comment above. Pass sustainAmount=0 for the
+ * original single-decaying-pluck behaviour if ever needed. */
+double karplus_process(KarplusString *k, double sustainFeedSample, double sustainAmount);
 
 /* Sample-and-hold "pitched noise" stage -- an additional, distinct
  * pitch mechanism layered in on top of resonant filter tracking, per
@@ -92,6 +116,31 @@ double bitcrush_process(double x, int bits);
  * itself repeatedly when it exceeds +-1, producing rich, FM-like
  * harmonics rather than hard clipping. */
 double wavefold_process(double x, double amount);
+
+/* Vibrato via a small modulated delay line with linear interpolation
+ * -- the classic, safe way to add pitch modulation to an arbitrary
+ * signal without touching the source generator's own internals
+ * (particularly important for the Karplus-Strong layers, where
+ * directly modulating the delay-line length that defines pitch would
+ * risk clicks/glitches from reading uninitialized buffer regions).
+ * Applied once per voice, after layers are mixed, per explicit
+ * request for vibrato "in the noise and Karplus" -- since both are
+ * already combined into one signal by then, one instance covers both
+ * layer types. */
+#define NOISEBOY_VIBRATO_BUFFER_SIZE 512
+typedef struct {
+    double buffer[NOISEBOY_VIBRATO_BUFFER_SIZE];
+    int writePos;
+} VibratoDelay;
+
+void vibrato_init(VibratoDelay *v);
+/* phase01: 0-1, the SAME phase driving AM/wavefold (see NoiseboyEngine
+ * voice processing) so vibrato pulses in sync with the tremolo rather
+ * than drifting independently. depthSamples: max delay-time deviation
+ * in samples -- kept intentionally small by the caller (see
+ * noiseboy_process's own comment) for a gentle, acoustic-instrument-
+ * like vibrato rather than a dramatic pitch wobble. */
+double vibrato_process(VibratoDelay *v, double x, double phase01, double depthSamples);
 
 typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG } LayerType;
 /* FILTER_KORG_HP is intentionally no longer selected by the
@@ -167,6 +216,10 @@ typedef struct {
     int bitDepth;
     PitchedHold rateReducer;
     double rateReducerMultiplier; /* how far above the 100Hz floor this voice's reduction rate can reach, randomized per note */
+
+    /* Vibrato, applied once per voice after layers mix -- see
+     * VibratoDelay's own comment. */
+    VibratoDelay vibrato;
 } Voice;
 
 /* Layer RECIPE, decided once at module instantiation (not per-note) --
