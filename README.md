@@ -25,22 +25,62 @@ Playing is polyphonic (up to 8 voices), gated by key press -- a note
 produces sound only while held (with a short knob-controlled attack/
 release to avoid clicks, not a sustained pad envelope).
 
-## Controls (10 chain_params -- knobs 1-8, plus 2 more via the parameter menu)
+## Controls (11 chain_params -- knobs 1-8, plus 3 more via the parameter menu)
 
 | Knob | Parameter | Range |
 |---|---|---|
 | 1 | Filter Offset | brightens/darkens filtered-noise layers relative to the tracked pitch -- centre (64) = filter sits exactly at the played note, never stops tracking it |
 | 2 | Resonance | filter resonance (filtered-noise layers); also blends into Karplus-Strong pluck damping |
-| 3 | AM Rate | amplitude modulation rate, 0.1-20 Hz |
-| 4 | AM Depth | amplitude modulation depth, 0 = off (default) |
+| 3 | AM Depth | amplitude modulation depth, 0 = off (default) |
+| 4 | AM Rate | amplitude modulation rate, 0.1-20 Hz |
 | 5 | Attack | envelope attack time, 0.5-200 ms |
 | 6 | Release | envelope release time, 5-2000 ms |
 | 7 | Detune | spread between layers' per-layer detune (0 = unison, up = richer/chorused) |
-| 8 | Level | master output level |
+| 8 | Output Filt | the LAST stage before the envelope/output -- a second, velocity-brightened, zero-resonance lowpass; this knob multiplies that velocity-driven range up or down (centre/64 = neutral). Deliberately the final knob in the signal path |
 | 9 | Drive | single shared drive/saturation stage on the final mix -- beyond the 8 physical knobs, reachable via the module's parameter menu |
-| 10 | Randomize | re-rolls the layer recipe on demand, without reinstantiating the module -- rising-edge trigger (any 0->nonzero move fires it once) |
+| 10 | Randomize | re-rolls the layer recipe on demand, without reinstantiating the module -- rising-edge trigger (any 0->nonzero move fires it once); also reachable as a single jog-wheel-click action in the module's own menu screen |
+| 11 | Level | master output level -- moved off knob 8 to make room for Output Filt; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.8.0** -- three changes from real playing feedback, plus a note on
+what turned out NOT to be a code problem:
+
+1. **Bitcrush reduced again.** Was 8-15 (already halved once from an
+   original 1-15). Halved the worst-case distance from full
+   resolution a second time: floor raised to 12, range now 12-15.
+   Worth noting: the rate-reducer running alongside bitcrush (down to
+   100Hz) may itself be contributing to a perceived "crushed"
+   character independent of bit depth -- flagged, not changed, since
+   only bitcrushing specifically was reported as excessive.
+2. **Output Filt's resonance removed entirely** (was a modest fixed
+   0.15, now hardcoded 0.0) -- per direct correction that even that
+   modest resonance was still creating a perceivable pitch-like
+   artifact. A filter with no pitch-defining role shouldn't have any
+   resonant peak at all.
+3. **Knob 8 moved from Level to Output Filt**, per explicit request
+   to make it "the final knob to control audible sound" -- Output
+   Filt is the last processing stage before the envelope/output, so
+   controlling it from the last physical knob is a deliberate,
+   meaningful pairing. Knob 8's value now multiplies the velocity-
+   driven cutoff range up or down (same offset-around-neutral pattern
+   knob 1 already used), rather than setting output level. Level
+   moved to a menu-only position (still fully controllable, just not
+   on a dedicated knob) -- 11 chain_params total now, 8 on physical
+   knobs, 3 menu-only (Drive, Randomize, Level).
+
+On investigating the "still too much bitcrushing compared to last
+night's build" report: this session also uncovered that this
+project's local files had drifted significantly out of sync with what
+was actually being tested (module.json still read "0.1.0", and
+noiseboy_dsp.c/noiseboy_plugin.c were hundreds of lines short of
+current) -- so "last night's build" and tonight's build may not have
+been comparable in the way it seemed. Given that, some of the
+perceived difference may be explained by that drift rather than by
+anything changed in the DSP itself between those two sessions. Fixed
+via a full clean replacement of the affected files rather than another
+partial merge, and confirmed via exact line-count matches before
+proceeding.
 
 **v0.7.0** -- musicality fix plus a lighter bitcrush, per direct
 feedback after real playing:

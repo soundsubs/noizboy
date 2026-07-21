@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "abbrev": "NOIZB",
-    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Velocity brightness moved to a separate post-mix OUTPUT FILT so it no longer detunes notes. Lighter bitcrush. db-cell always runs on the output, gated silent between notes.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Knob 8 is now OUTPUT FILT (zero-resonance, velocity-brightened, final stage before output) instead of Level. Lighter bitcrush. db-cell always runs on the output, gated silent between notes.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",
@@ -71,12 +71,12 @@
                 "default": 64
             },
             {
-                "key": "master_level",
-                "name": "Level",
+                "key": "output_filter_freq",
+                "name": "Output Filt",
                 "type": "int",
                 "min": 0,
                 "max": 127,
-                "default": 102
+                "default": 64
             },
             {
                 "key": "drive",
@@ -93,6 +93,14 @@
                 "min": 0,
                 "max": 127,
                 "default": 0
+            },
+            {
+                "key": "master_level",
+                "name": "Level",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 102
             }
         ]
     }

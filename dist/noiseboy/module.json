@@ -1,11 +1,13 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.1.0",
+    "version": "0.8.0",
     "abbrev": "NOIZB",
-    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Randomizes 1-3 layers on load; run into DISTROY for extra character.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong instrument. Knob 8 is now OUTPUT FILT (zero-resonance, velocity-brightened, final stage before output) instead of Level. Lighter bitcrush. db-cell always runs on the output, gated silent between notes.",
     "author": "soundsubs",
     "dsp": "dsp.so",
+    "ui": "ui.js",
+    "raw_ui": true,
     "api_version": 2,
     "capabilities": {
         "audio_out": true,
@@ -26,15 +28,7 @@
                 "type": "int",
                 "min": 0,
                 "max": 127,
-                "default": 38
-            },
-            {
-                "key": "am_rate",
-                "name": "AM Rate",
-                "type": "int",
-                "min": 0,
-                "max": 127,
-                "default": 25
+                "default": 104
             },
             {
                 "key": "am_depth",
@@ -43,6 +37,14 @@
                 "min": 0,
                 "max": 127,
                 "default": 0
+            },
+            {
+                "key": "am_rate",
+                "name": "AM Rate",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 25
             },
             {
                 "key": "attack",
@@ -67,6 +69,30 @@
                 "min": 0,
                 "max": 127,
                 "default": 64
+            },
+            {
+                "key": "output_filter_freq",
+                "name": "Output Filt",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 64
+            },
+            {
+                "key": "drive",
+                "name": "Drive",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 32
+            },
+            {
+                "key": "randomize",
+                "name": "Randomize",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "default": 0
             },
             {
                 "key": "master_level",

@@ -257,6 +257,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
+    e->params.outputFilterFreq01 = 0.5;    /* neutral -- no change to the velocity-driven base range */
     e->params.masterLevel01 = 0.8;
     e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
@@ -334,13 +335,19 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
      * ceiled at Nyquist in noiseboy_process) is what actually "follows
      * played note numbers".
      *
-     * Bit-crush range backed off 50% per direct feedback ("too much
-     * bitcrushing on randomize") -- was a full 1-15 bit range
-     * (distance from full 16-bit resolution spanning 1 to 15). Halving
-     * that worst-case distance means the floor is now 8, not 1: range
-     * 8-15 instead of 1-15. Eliminates the most extreme, harshest
-     * crushing entirely while keeping some randomized variety. */
-    v->bitDepth = 8 + (int)(rand01(&e->rngState) * 8.0);
+     * Bit-crush range backed off AGAIN per direct feedback ("still too
+     * much bitcrushing") -- was 8-15 (already halved once from an
+     * original 1-15). Halving the worst-case distance from full 16-bit
+     * resolution a second time: floor raised from 8 to 12, so the
+     * range is now 12-15. At bitDepth=12 the quantization step is
+     * already quite fine (~0.0005 of the signal range) -- this range
+     * should read as a subtle texture rather than an obvious crush.
+     * Worth noting: the rate-reducer just below (down to 100Hz) runs
+     * alongside bitcrush and may itself be contributing to a
+     * perceived "crushed" character independent of bit depth --
+     * flagged, not changed here, since only bitcrushing specifically
+     * was reported as excessive. */
+    v->bitDepth = 12 + (int)(rand01(&e->rngState) * 4.0);
     if (v->bitDepth > 15) v->bitDepth = 15;
     v->rateReducerMultiplier = 0.5 + rand01(&e->rngState) * 7.5;
     pitchedhold_init(&v->rateReducer);
@@ -606,20 +613,27 @@ double noiseboy_process(NoiseboyEngine *e) {
         const double foldAmount = e->params.amDepth01 * amCyclePosition;
         voiceSum = wavefold_process(voiceSum, foldAmount);
 
-        /* OUTPUT FILT -- per explicit request, a second lowpass
-         * applied after the whole synth signal (everything above:
-         * layers, vibrato, bitcrush, rate-reduce, AM, wavefold) but
-         * before the amplitude envelope. This is where velocity-driven
-         * brightness lives now instead of on the per-layer pitch-
-         * tracking filters (see voice_start's own comment on why that
-         * was wrong). 800Hz (soft) to 16kHz (bright) across the
-         * velocity range -- a reasoned starting range, not ear-tuned
-         * (no way to listen to this directly); modest fixed resonance
-         * for a little character without turning it into a second
-         * pitch-defining resonant peak. */
+        /* OUTPUT FILT -- a second lowpass applied after the whole
+         * synth signal (everything above: layers, vibrato, bitcrush,
+         * rate-reduce, AM, wavefold) but before the amplitude
+         * envelope. Velocity-driven brightness lives here instead of
+         * on the per-layer pitch-tracking filters (see voice_start's
+         * own comment on why that was wrong). 800Hz (soft) to 16kHz
+         * (bright) across the velocity range is the base, further
+         * multiplied by knob 8 (same offset-around-neutral pattern as
+         * knob 1's filterCutoffOffset01) -- knob 8 was deliberately
+         * moved here from Level per explicit request, making it "the
+         * final knob to control audible sound" since this filter is
+         * the last stage before the envelope/output. Resonance is
+         * fixed at 0.0 (NOT knob-controlled, not even the small fixed
+         * 0.15 this had before) per direct correction -- even that
+         * modest resonance was apparently still creating a perceivable
+         * pitch-like artifact, which a filter with zero pitch-defining
+         * role shouldn't be doing at all. */
         {
-            const double outputCutoff = clampd(800.0 + v->velocity01 * 15200.0, 20.0, e->sampleRate * 0.45);
-            moog_ladder_set(&v->outputFilter, outputCutoff, 0.15, 0.1);
+            const double outputCutoffMul = pow(2.0, (e->params.outputFilterFreq01 - 0.5) * 4.0);
+            const double outputCutoff = clampd((800.0 + v->velocity01 * 15200.0) * outputCutoffMul, 20.0, e->sampleRate * 0.45);
+            moog_ladder_set(&v->outputFilter, outputCutoff, 0.0, 0.1);
             voiceSum = moog_ladder_process(&v->outputFilter, voiceSum);
         }
 

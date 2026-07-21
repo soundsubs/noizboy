@@ -172,6 +172,8 @@ static void set_param(void *instance, const char *key, const char *val) {
         p->releaseMs = 5.0 + raw01 * 1995.0; /* 5-2000 ms */
     } else if (strcmp(key, "detune_spread") == 0) {
         p->detuneSpread01 = raw01;
+    } else if (strcmp(key, "output_filter_freq") == 0) {
+        p->outputFilterFreq01 = raw01;
     } else if (strcmp(key, "master_level") == 0) {
         p->masterLevel01 = raw01;
     } else if (strcmp(key, "drive") == 0) {
@@ -216,10 +218,11 @@ static const char *NOISEBOY_UI_HIERARCHY_JSON =
     "{\"key\":\"attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"detune_spread\",\"name\":\"Detune\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"output_filter_freq\",\"name\":\"Output Filt\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127}"
-    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"am_depth\",\"am_rate\",\"attack\",\"release\",\"detune_spread\",\"master_level\"]}}}";
+    "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127}"
+    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"am_depth\",\"am_rate\",\"attack\",\"release\",\"detune_spread\",\"output_filter_freq\"]}}}";
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
@@ -239,6 +242,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     else if (strcmp(key, "attack") == 0) val01 = (p->attackMs - 0.5) / 199.5;
     else if (strcmp(key, "release") == 0) val01 = (p->releaseMs - 5.0) / 1995.0;
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;
+    else if (strcmp(key, "output_filter_freq") == 0) val01 = p->outputFilterFreq01;
     else if (strcmp(key, "master_level") == 0) val01 = p->masterLevel01;
     else if (strcmp(key, "drive") == 0) val01 = p->drive01;
     else if (strcmp(key, "randomize") == 0) {

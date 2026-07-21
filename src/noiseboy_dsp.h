@@ -251,9 +251,9 @@ typedef struct {
 
 /* Knob-controlled parameters, shared across all voices (not per-voice
  * state) -- set via set_param in the Schwung plugin wrapper, mapped to
- * knobs 1-8 (plus two additional chain_params beyond the 8 physical
- * knobs -- drive and randomize-trigger -- still reachable via the
- * module's parameter menu). */
+ * knobs 1-8 (plus three additional chain_params beyond the 8 physical
+ * knobs -- drive, master level, and randomize-trigger -- still
+ * reachable via the module's parameter menu). */
 typedef struct {
     double filterCutoffOffset01;  /* knob 1: brightens/darkens the pitch-tracked filter cutoff, -1..1 mapped from 0..1 */
     double filterResonance01;     /* knob 2 */
@@ -262,8 +262,21 @@ typedef struct {
     double attackMs;              /* knob 5: 0.5-200 ms */
     double releaseMs;             /* knob 6: 5-2000 ms */
     double detuneSpread01;        /* knob 7: scales each layer's per-layer detuneCents, 0 = unison, 1 = full spread */
-    double masterLevel01;         /* knob 8 */
-    double drive01;               /* chain_param 9: single shared drive/saturation stage on the final mix -- see noiseboy_process */
+    /* knob 8: deliberately the LAST knob in the signal path, per
+     * explicit request -- controls OUTPUT FILT (the post-mix,
+     * velocity-brightened, zero-resonance lowpass in noiseboy_process),
+     * making it "the final knob to control audible sound" rather than
+     * a level control. 0.5 = neutral (no change to the velocity-driven
+     * base range); away from 0.5 multiplies that range up or down,
+     * same pattern as filterCutoffOffset01. Master level moved off
+     * knob 8 to a menu-only position (see masterLevel01 below) to make
+     * room for this. */
+    double outputFilterFreq01;
+    double drive01;               /* chain_param: single shared drive/saturation stage on the final mix -- see noiseboy_process */
+    /* Moved off knob 8 (was there through v0.7.0) to make room for
+     * outputFilterFreq01 -- still fully controllable, just via the
+     * parameter menu rather than a dedicated physical knob now. */
+    double masterLevel01;
 } NoiseboyParams;
 
 /* Global, always-on tape-style saturation stage on the final mixed
