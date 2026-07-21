@@ -213,21 +213,6 @@ typedef struct {
      * sources than one synchronized tremolo. */
     double amPhase;
 
-    /* Per-voice bitcrusher and pitch-following sample-rate reducer,
-     * per explicit request -- randomized fresh on every note-on (not
-     * part of the fixed recipe), so different notes played on the
-     * same recipe get some additional per-note variety. bitDepth is
-     * literal (1-15 bits, quantization applied directly). The rate
-     * reducer reuses the same PitchedHold mechanism the per-layer
-     * pitch stage uses (a sample-and-hold whose rate tracks the
-     * played note), applied here at the VOICE level (after layers are
-     * mixed) rather than per-layer -- "the ear will detect this as
-     * pitch" is the same principle as PitchedHold's own rationale,
-     * just as a second, voice-wide instance of it. */
-    int bitDepth;
-    PitchedHold rateReducer;
-    double rateReducerMultiplier; /* how far above the 100Hz floor this voice's reduction rate can reach, randomized per note */
-
     /* Vibrato, applied once per voice after layers mix -- see
      * VibratoDelay's own comment. */
     VibratoDelay vibrato;
@@ -243,8 +228,8 @@ typedef struct {
      * was a real, reported bug (pitch audibly decaying over a long
      * release, since the old per-layer filter's cutoff followed
      * envLevel). Filter type (Moog/Korg35LP) randomized fresh per
-     * note, matching bitDepth/rateReducerMultiplier's own per-note
-     * variety pattern -- Korg35HP still deliberately excluded from
+     * note, matching this project's established per-note variety
+     * pattern -- Korg35HP still deliberately excluded from
      * the choice, same reasoning as before (a highpass tuned to the
      * played pitch works against sounding pitched, not for it). */
     FilterKind pitchFilterKind;
@@ -273,7 +258,7 @@ typedef struct {
  * session, rather than re-randomizing per note. Filter choice is NOT
  * part of the recipe anymore -- the filter moved to voice level and is
  * randomized fresh per note instead (see Voice's own pitchFilterKind),
- * matching bitDepth/rateReducerMultiplier's per-note variety pattern
+ * matching this project's established per-note variety pattern
  * rather than being fixed for the whole session. */
 typedef struct {
     LayerType type;

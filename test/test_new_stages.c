@@ -26,16 +26,9 @@ int main(void) {
         if (fabs(y) > peak) peak = fabs(y);
     }
 
-    printf("Max AM/drive/wavefold/bitcrush/tapesat stress test: finite_ok=%d peak=%.4f\n", finite_ok, peak);
+    printf("Max AM/drive/wavefold/tapesat stress test: finite_ok=%d peak=%.4f\n", finite_ok, peak);
     if (!finite_ok) all_ok = 0;
     if (peak > 1.5) { printf("  WARN: unusually high peak\n"); }
-
-    /* Check bitDepth/rateReducerMultiplier actually vary across notes */
-    printf("Per-voice bitDepth values across notes:");
-    for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-        if (e.voices[v].active) printf(" %d", e.voices[v].bitDepth);
-    }
-    printf("\n");
 
     printf(all_ok ? "\nALL NEW-STAGE CHECKS PASSED\n" : "\nSOME NEW-STAGE CHECKS FAILED\n");
     return all_ok ? 0 : 1;

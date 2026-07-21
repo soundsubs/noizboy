@@ -322,40 +322,24 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->gateOpen = 1;
     v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't AM in lockstep */
 
-    /* Per-voice bitcrusher and pitch-following sample-rate reducer,
-     * randomized fresh each note-on per explicit request.
-     * rateReducerMultiplier is randomized per note so different notes
-     * on the same recipe get some variety in how aggressively reduced
-     * they sound, not just where the reduction rate sits -- the
-     * reduction rate itself (freqHz * multiplier, floored at 100Hz,
-     * ceiled at Nyquist in noiseboy_process) is what actually "follows
-     * played note numbers".
-     *
-     * Bit-crush range backed off AGAIN per direct feedback ("still too
-     * much bitcrushing") -- was 8-15 (already halved once from an
-     * original 1-15). Halving the worst-case distance from full 16-bit
-     * resolution a second time: floor raised from 8 to 12, so the
-     * range is now 12-15. At bitDepth=12 the quantization step is
-     * already quite fine (~0.0005 of the signal range) -- this range
-     * should read as a subtle texture rather than an obvious crush.
-     * Worth noting: the rate-reducer just below (down to 100Hz) runs
-     * alongside bitcrush and may itself be contributing to a
-     * perceived "crushed" character independent of bit depth --
-     * flagged, not changed here, since only bitcrushing specifically
-     * was reported as excessive. */
-    v->bitDepth = 12 + (int)(rand01(&e->rngState) * 4.0);
-    if (v->bitDepth > 15) v->bitDepth = 15;
-    v->rateReducerMultiplier = 0.5 + rand01(&e->rngState) * 7.5;
-    pitchedhold_init(&v->rateReducer);
+    /* Bitcrush and pitch-following sample-rate reduction REMOVED
+     * entirely per explicit request, after several rounds of trying to
+     * find a subtle-enough setting still drew "too much bitcrushing
+     * and sample rate reduction" -- rather than keep tuning it,
+     * removed outright. bitcrush_process/pitchedhold_process remain
+     * defined in noiseboy_dsp.c/h (unused) per this project's
+     * established "keep superseded options, don't delete" convention,
+     * in case a future revision wants them back at a different
+     * amount/design. */
     vibrato_init(&v->vibrato);
     moog_ladder_init(&v->outputFilter, e->sampleRate);
 
     /* Voice-level pitch-tracking filter -- randomized fresh per note
      * (Moog/Korg35LP, 50/50; Korg35HP deliberately excluded, same
      * reasoning as before: a highpass tuned to the played pitch works
-     * against sounding pitched, not for it), matching
-     * bitDepth/rateReducerMultiplier's own per-note variety pattern
-     * now that filter choice is no longer part of the fixed recipe. */
+     * against sounding pitched, not for it), matching this project's
+     * established per-note variety pattern now that filter choice is
+     * no longer part of the fixed recipe. */
     v->pitchFilterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
     moog_ladder_init(&v->pitchFilterMoog, e->sampleRate);
     korg35lp_init(&v->pitchFilterKorgLp, e->sampleRate);
@@ -528,41 +512,18 @@ double noiseboy_process(NoiseboyEngine *e) {
             voiceSum = vibrato_process(&v->vibrato, voiceSum, v->amPhase, vibratoDepthSamples);
         }
 
-        /* STEP 1 (sources) is done above; STEP 2 (bitcrush/rate-reduce)
-         * is here, per explicit 5-step signal chain spec: sources ->
-         * bitcrush/rate-reduce -> pitch-tracking filter -> amplitude
-         * envelope -> output filter. Rate reducer's rate is derived
-         * purely from the played note (freqHz * this voice's
-         * randomized multiplier) -- deliberately has NO dependency on
-         * envLevel or anything else amplitude-related, per direct
-         * correction that a rate/pitch-adjacent stage following the
-         * amplitude envelope was audibly making pitch decay over a
-         * long release. Floored at 100Hz and ceiled at Nyquist so it
-         * always sits somewhere between "100Hz crunch" and "full
-         * resolution" as requested, while still tracking pitch.
+        /* STEP 2 (bitcrush/rate-reduce) REMOVED entirely per explicit
+         * request -- after several rounds of reducing bitcrush's
+         * aggressiveness (1-15 bits -> 8-15 -> 12-15) it still drew
+         * "too much bitcrushing and sample rate reduction", so both
+         * were pulled out rather than tuned further. Signal now goes
+         * straight from sources (STEP 1) to the pitch-tracking filter
+         * (STEP 3 below) with nothing in between. See voice_start's
+         * own comment for where bitcrush_process/pitchedhold_process
+         * are still defined (unused) if a future revision wants them
+         * back.
          *
-         * ORDER MATTERS HERE, discovered via a real bug: rate-reduce
-         * (sample-and-hold) MUST run before bitcrush, not after. At
-         * low bit depths, bitcrush quantizes most small-amplitude
-         * samples straight to 0 -- a Karplus-Strong voice's naturally
-         * quiet signal level meant well over 80% of samples were
-         * landing exactly on 0 after crushing. Sampling THAT with a
-         * sparse hold (updating only every ~46 samples at typical
-         * rates) had a real, non-negligible chance of every single
-         * hold-update landing on one of those zeroed samples,
-         * silencing the entire voice for the whole note. Caught this
-         * via a debug seed sweep (seed=1 reproduced it consistently)
-         * rather than reasoning it out in advance -- worth remembering
-         * that new per-voice per-note randomization needs the same
-         * seed-sweep verification as everything else, not just the
-         * small sample of seeds a manual test happens to try. */
-        {
-            const double reducerRate = clampd(v->freqHz * v->rateReducerMultiplier, 100.0, e->sampleRate * 0.5);
-            voiceSum = pitchedhold_process(&v->rateReducer, voiceSum, reducerRate, e->sampleRate, 1.0);
-        }
-        voiceSum = bitcrush_process(voiceSum, v->bitDepth);
-
-        /* STEP 3: voice-level pitch-tracking filter -- per explicit
+         * STEP 3: voice-level pitch-tracking filter -- per explicit
          * restructuring request, this REPLACES the old per-layer
          * filters entirely. High resonance, tracks v->freqHz directly
          * (knob 1 offset, knob 2 resonance). Deliberately NO envelope

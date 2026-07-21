@@ -14,16 +14,38 @@ Every time the module is instantiated, it randomizes a "recipe" of
 layer is independently either:
 
 - **Filtered noise**: a noise generator (random colour: white/pink/
-  red) through a resonant filter (randomly Moog Ladder or Korg35
-  LP/HP) whose cutoff always tracks the played note's pitch.
+  red).
 - **Karplus-Strong**: a noise-excited, damped delay line -- the
   classic plucked-string algorithm -- whose delay length itself
-  defines the pitch, picked randomly per layer as a second,
-  independent pitch-defining method alongside filter tracking.
+  defines the pitch.
+
+Per voice, the layers mix together first (raw, unfiltered), then pass
+through a single, shared, voice-level pitch-tracking filter (randomly
+Moog Ladder or Korg35LP, high resonance, tuned to the played note),
+then the amplitude envelope, then a final output filter (velocity-
+brightened, knob-8-controlled, zero resonance). See "Signal chain"
+below for the exact order.
 
 Playing is polyphonic (up to 8 voices), gated by key press -- a note
 produces sound only while held (with a short knob-controlled attack/
 release to avoid clicks, not a sustained pad envelope).
+
+## Signal chain
+
+1. Sources -- up to 3 noise/Karplus layers, mixed together (raw, no
+   per-layer filtering).
+2. Voice-level pitch-tracking filter -- high resonance, tracks the
+   played note directly (knobs 1-2), no envelope or velocity
+   influence.
+3. Amplitude modulation (tremolo) + wavefolder, both knob 3/4
+   controlled and linked to the same cycle.
+4. Amplitude envelope (attack/release, knobs 5-6).
+5. Output Filt -- velocity-brightened, zero-resonance, knob 8
+   controlled; the last stage before output.
+
+Bitcrush and sample-rate reduction were both tried at various
+amounts and ultimately removed entirely, per direct feedback -- see
+"Status" below.
 
 ## Controls (11 chain_params -- knobs 1-8, plus 3 more via the parameter menu)
 
@@ -42,6 +64,38 @@ release to avoid clicks, not a sustained pad envelope).
 | 11 | Level | master output level -- moved off knob 8 to make room for Output Filt; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.10.0** -- bitcrush and sample-rate reduction removed entirely,
+per explicit request, after several rounds of trying to find a
+subtle-enough amount kept drawing "too much bitcrushing and sample
+rate reduction". Rather than keep tuning it, both are gone. Signal
+chain is now: sources -> pitch-tracking filter -> AM/wavefold ->
+envelope -> output filter, with nothing between sources and the
+filter.
+
+Notable side effect, not the point of the change but real and
+measured: pitch-tracking accuracy improved substantially.
+This project's own zero-crossing test ratio (low note vs. a note 4
+octaves higher) jumped from ~3.5x to ~7.2x (true value for a 4-octave
+span is 16x) once the rate-reducer was removed -- direct confirmation
+of a tradeoff flagged back in v0.9.0's restructuring notes ("the
+rate-reducer now runs BEFORE the pitch filter and can compete
+with/mask its resonant peak"). Removing it didn't just address the
+"too much crushing" complaint -- it also fixed that tradeoff as a
+side effect.
+
+`bitcrush_process`/`pitchedhold_process` remain defined in
+`noiseboy_dsp.c/h` (unused now) per this project's established "keep
+superseded options, don't delete" convention, in case a future
+revision wants a lighter version of either back. All references to
+the removed per-voice `bitDepth`/`rateReducer`/`rateReducerMultiplier`
+state were removed from `Voice`, and the test that checked per-voice
+bitDepth variation was updated to no longer reference the removed
+field (it would not have compiled otherwise).
+
+Full test suite re-run clean, including the 24,000-combination sweep
+(still zero silent cases -- if anything, more robustly so now that
+there's no bitcrush-related silencing failure mode possible at all).
 
 **v0.9.1** -- investigation into a "dive bomb" / "pitch attached to
 envelope" report. Being direct about what was actually verified vs.
