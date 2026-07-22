@@ -2,6 +2,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -89,30 +90,98 @@ double karplus_process(KarplusString *k, double sustainFeedSample, double sustai
     return cur;
 }
 
-void loop_capture(LoopSource *lp, unsigned int *rngState, NoiseColour colour, double freqHz, double referenceFreqHz) {
-    NoiseGen ng;
-    noisegen_init(&ng, xorshift_next(rngState));
-    for (int i = 0; i < NOISEBOY_LOOP_BUFFER_SIZE; i++) {
-        lp->buffer[i] = noisegen_process(&ng, colour);
+int postfilter_loop_alloc(PostFilterLoop *lp) {
+    lp->bufferL = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_MAX_SAMPLES);
+    lp->bufferR = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_MAX_SAMPLES);
+    if (!lp->bufferL || !lp->bufferR) {
+        free(lp->bufferL);
+        free(lp->bufferR);
+        lp->bufferL = NULL;
+        lp->bufferR = NULL;
+        return 0;
     }
-    lp->readPos = 0.0;
-    lp->playbackRate = freqHz / referenceFreqHz;
+    return 1;
 }
 
-double loop_process(LoopSource *lp) {
-    /* Nearest-neighbor read (plain int truncation, no interpolation)
-     * -- this is deliberate, see LoopSource's own comment on why the
-     * artifacts from this cheap technique ARE the intended "poorly
-     * looped sample" character, not a flaw to smooth over. */
-    int idx = (int)lp->readPos;
-    if (idx >= NOISEBOY_LOOP_BUFFER_SIZE) idx = idx % NOISEBOY_LOOP_BUFFER_SIZE;
-    double sample = lp->buffer[idx];
+void postfilter_loop_free(PostFilterLoop *lp) {
+    free(lp->bufferL);
+    free(lp->bufferR);
+    lp->bufferL = NULL;
+    lp->bufferR = NULL;
+}
 
-    lp->readPos += lp->playbackRate;
-    if (lp->readPos >= (double)NOISEBOY_LOOP_BUFFER_SIZE) {
-        lp->readPos -= (double)NOISEBOY_LOOP_BUFFER_SIZE * floor(lp->readPos / (double)NOISEBOY_LOOP_BUFFER_SIZE);
+void postfilter_loop_reset(PostFilterLoop *lp, int captureLengthSamples) {
+    if (captureLengthSamples < 2) captureLengthSamples = 2;
+    if (captureLengthSamples > NOISEBOY_LOOP_MAX_SAMPLES) captureLengthSamples = NOISEBOY_LOOP_MAX_SAMPLES;
+    lp->captureLengthSamples = captureLengthSamples;
+    lp->writePos = 0;
+    lp->filled = 0;
+    lp->readPos = 0.0;
+}
+
+void postfilter_loop_process(PostFilterLoop *lp, double drySampleL, double drySampleR, double readRateMul, double *outL, double *outR) {
+    if (!lp->bufferL || !lp->bufferR) {
+        /* Allocation failure fallback -- see postfilter_loop_alloc's
+         * own comment. No buffer to capture into or read from, so
+         * just pass the dry signal through unaffected rather than
+         * crashing on a NULL dereference. */
+        *outL = drySampleL;
+        *outR = drySampleR;
+        return;
     }
-    return sample;
+    if (!lp->filled) {
+        /* Still capturing -- record this sample.
+         *
+         * REAL BUG FOUND AND FIXED HERE: this used to output silence
+         * (0.0) here, on the theory that "the caller blends this
+         * against the dry signal by LOOP INTENSITY, so silence means
+         * no loop character yet". That reasoning was wrong -- the
+         * caller's blend is `dry*(1-intensity) + loopOut*intensity`,
+         * and with loopOut=0 that becomes `dry*(1-intensity)`, which
+         * at intensity=1 evaluates to fully SILENT, not "fully dry".
+         * Confirmed directly: comparing intensity=0 vs intensity=1
+         * during capture showed a large, real difference where there
+         * should have been none. Fix: output the dry sample itself
+         * here instead of silence -- then `dry*(1-i) + dry*i = dry`
+         * holds for every intensity value, which is what "no loop
+         * character yet, sounds untouched" actually requires. */
+        if (lp->writePos < lp->captureLengthSamples) {
+            lp->bufferL[lp->writePos] = drySampleL;
+            lp->bufferR[lp->writePos] = drySampleR;
+            lp->writePos++;
+            if (lp->writePos >= lp->captureLengthSamples) lp->filled = 1;
+        }
+        *outL = drySampleL;
+        *outR = drySampleR;
+        return;
+    }
+
+    /* Nearest-neighbor read (plain int truncation, no interpolation)
+     * -- matches this project's established "the artifacts are the
+     * point" philosophy for lo-fi sample-style rate shifting, same
+     * reasoning as the original pre-filter LOOP design. */
+    int idx = (int)lp->readPos;
+    if (idx >= lp->captureLengthSamples) idx = idx % lp->captureLengthSamples;
+
+    /* Decay to near-silence by 97% through the loop, per explicit
+     * spec -- a PROPORTION of the captured length, not an absolute
+     * time, so this holds regardless of loop length or live SPEED
+     * adjustment (frac is always 0..1 relative to the buffer itself).
+     * Exponential (matching this project's established preference for
+     * natural-sounding decays elsewhere), tuned so decayGain reaches
+     * 0.001 (-60dB, a reasonable "near-silence" floor) at frac=0.97:
+     * exp(-k*0.97)=0.001 -> k = -ln(0.001)/0.97 ~= 7.12. */
+    const double frac = lp->readPos / (double)lp->captureLengthSamples;
+    const double decayGain = exp(-7.12 * frac);
+    *outL = lp->bufferL[idx] * decayGain;
+    *outR = lp->bufferR[idx] * decayGain;
+
+    double rate = readRateMul;
+    if (rate < 0.01) rate = 0.01; /* defensive floor -- avoids a near-stuck or reversed read position from a pathological knob value */
+    lp->readPos += rate;
+    if (lp->readPos >= (double)lp->captureLengthSamples) {
+        lp->readPos -= (double)lp->captureLengthSamples * floor(lp->readPos / (double)lp->captureLengthSamples);
+    }
 }
 
 
@@ -219,6 +288,43 @@ double vibrato_process(VibratoDelay *v, double x, double phase01, double depthSa
     return sample;
 }
 
+void tape_wobble_init(TapeWobble *w, unsigned int seed) {
+    w->state = 0.0;
+    w->rngState = seed != 0 ? seed : 1;
+}
+
+double tape_wobble_process(TapeWobble *w, double rateHz, double sampleRate) {
+    /* Fresh white noise sample each call, heavily lowpassed (one-pole,
+     * time constant set by rateHz) to produce a slowly-wandering value
+     * instead of audio-rate texture -- see TapeWobble's own header
+     * comment for why that distinction matters.
+     *
+     * REAL BUG FOUND AND FIXED HERE: a one-pole lowpass applied to
+     * white noise doesn't just slow down how fast the signal wanders
+     * -- it also drastically shrinks its actual amplitude range, since
+     * heavy averaging of independent random samples reduces variance
+     * (var(y) = var(x)*(1-coeff)/(1+coeff) for this filter structure).
+     * At the rate this is actually used (1Hz, 48kHz sample rate),
+     * measured directly: the output only ever wandered within roughly
+     * +-0.015, not anywhere near the nominal [-1,1] range this
+     * function's own header comment describes -- meaning the ACTUAL
+     * modulation depth applied at mellotronDepth01's intended 1%-5%
+     * would really have been more like 0.015%-0.075%, over 60x weaker
+     * than specified and practically inaudible. Fixed by normalizing
+     * the output by the inverse of that same variance-reduction
+     * factor, restoring the output to the same variance as the
+     * original (uniform [-1,1]) white noise input regardless of how
+     * heavily it's being smoothed. */
+    const double white = rand01(&w->rngState) * 2.0 - 1.0;
+    const double coeff = exp(-2.0 * M_PI * rateHz / sampleRate);
+    w->state = white * (1.0 - coeff) + w->state * coeff;
+    const double normFactor = (coeff < 0.999999) ? sqrt((1.0 + coeff) / (1.0 - coeff)) : 1.0;
+    double out = w->state * normFactor;
+    if (out > 1.0) out = 1.0;
+    if (out < -1.0) out = -1.0;
+    return out;
+}
+
 void tapesat_init(TapeSaturation *t) {
     t->envelope = 0.0;
 }
@@ -250,6 +356,57 @@ double tapesat_process(TapeSaturation *t, double x, double sampleRate) {
     return tanh(driven);
 }
 
+void tilt_filter_init(TiltFilter *t, double sampleRate) {
+    korg35hp_init(&t->highpassL, sampleRate);
+    korg35hp_init(&t->highpassR, sampleRate);
+    moog_ladder_init(&t->lowpassL, sampleRate);
+    moog_ladder_init(&t->lowpassR, sampleRate);
+    t->smoothedTilt01 = 0.5; /* starts at neutral, matching the default knob position -- no smoothing transient on load */
+}
+
+void tilt_filter_process(TiltFilter *t, double *l, double *r, double tiltTarget01, double sampleRate) {
+    /* ~15ms smoothing time constant, matching this project's other
+     * knob-smoothing stages. */
+    const double smoothCoeff = exp(-1.0 / (0.001 * 15.0 * sampleRate));
+    t->smoothedTilt01 = tiltTarget01 + (t->smoothedTilt01 - tiltTarget01) * smoothCoeff;
+
+    double highpassCutoff = 100.0;
+    double lowpassCutoff = 10000.0;
+    if (t->smoothedTilt01 < 0.5) {
+        const double amt = (0.5 - t->smoothedTilt01) / 0.5; /* 0 at centre, 1 at full bass emphasis */
+        lowpassCutoff = 800.0 * pow(10000.0 / 800.0, 1.0 - amt);
+    } else if (t->smoothedTilt01 > 0.5) {
+        const double amt = (t->smoothedTilt01 - 0.5) / 0.5; /* 0 at centre, 1 at full treble emphasis */
+        highpassCutoff = 100.0 * pow(1500.0 / 100.0, amt);
+    }
+
+    const double nyquistGuard = sampleRate * 0.45;
+    highpassCutoff = clampd(highpassCutoff, 20.0, nyquistGuard);
+    lowpassCutoff = clampd(lowpassCutoff, 20.0, nyquistGuard);
+
+    korg35hp_set(&t->highpassL, highpassCutoff, 0.0, 0.1);
+    korg35hp_set(&t->highpassR, highpassCutoff, 0.0, 0.1);
+    moog_ladder_set(&t->lowpassL, lowpassCutoff, 0.0, 0.1);
+    moog_ladder_set(&t->lowpassR, lowpassCutoff, 0.0, 0.1);
+
+    /* REAL BUG FOUND AND FIXED HERE while verifying this filter's
+     * actual frequency response: order matters a lot more than
+     * expected for a series combination of these two filters, because
+     * they're not purely linear (both have a tanh saturation stage
+     * internally) -- series gain magnitudes don't simply multiply the
+     * way they would for pure LTI filters. Measured directly: with
+     * highpass-then-lowpass ordering, 50Hz (one octave below the
+     * 100Hz highpass edge) measured only -0.5dB attenuation -- barely
+     * a "roll off" at all, versus -3.1dB for the highpass measured in
+     * isolation. Lowpass-then-highpass ordering measured -2.7dB at
+     * the same point, much closer to that isolated character, while
+     * leaving the 1kHz passband essentially unchanged either way. */
+    *l = moog_ladder_process(&t->lowpassL, *l);
+    *l = korg35hp_process(&t->highpassL, *l);
+    *r = moog_ladder_process(&t->lowpassR, *r);
+    *r = korg35hp_process(&t->highpassR, *r);
+}
+
 /* ---------------------------------------------------------------------
  * Engine: voice management, randomized recipe, MIDI, per-sample mix.
  * ------------------------------------------------------------------- */
@@ -259,6 +416,14 @@ static double midi_note_to_freq(int midiNote) {
 }
 
 void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int seed) {
+    /* See initMagic's own header comment for why this check matters
+     * and can't just be a NULL-check on the buffer pointers. */
+    if (e->initMagic == NOISEBOY_ENGINE_INIT_MAGIC) {
+        for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
+            postfilter_loop_free(&e->voices[v].loop);
+        }
+    }
+
     memset(e, 0, sizeof(*e));
     e->sampleRate = sampleRate;
     e->rngState = seed != 0 ? seed : 1;
@@ -266,7 +431,17 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
 
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         e->voices[v].active = 0;
+        if (!postfilter_loop_alloc(&e->voices[v].loop)) {
+            /* Allocation failure -- leave this voice's loop buffers
+             * NULL. postfilter_loop_process guards against NULL
+             * buffers (see its own comment) by falling back to
+             * passing the dry signal through unaffected, so a failed
+             * allocation degrades to "LOOP has no effect on this
+             * voice" rather than crashing. */
+        }
     }
+
+    e->initMagic = NOISEBOY_ENGINE_INIT_MAGIC;
 
     /* Reasonable defaults -- overwritten by set_param once the host
      * reads knob positions, but these keep the instrument playable
@@ -279,13 +454,12 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
      * noise via resonant filter" depends on. */
     e->params.filterCutoffOffset01 = 0.5;  /* neutral: filter tracks exactly at the played pitch */
     e->params.filterResonance01 = 0.82;
-    e->params.amRateHz = 4.0;
-    e->params.amDepth01 = 0.0;             /* off by default -- AM is a deliberate extra character, not a default-on wobble */
+    e->params.loopSpeedMul = 1.0;          /* neutral -- plays the captured buffer at its natural rate */
+    e->params.loopIntensity01 = 0.0;       /* off by default -- LOOP is a deliberate extra character, not a default-on effect (matches this project's established philosophy for AM/wavefold before it) */
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
-    e->params.outputFilterFreq01 = 0.5;    /* neutral -- centre position, tilt filter fully bypassed */
-    e->outputFilterFreqSmoothed01 = 0.5;   /* starts matching the target, no smoothing transient on load */
+    e->params.tiltAmount01 = 0.5;    /* neutral -- centre position, tape-bandwidth window with no bass/treble emphasis */
     e->params.masterLevel01 = 0.8;
     e->params.drive01 = 0.25;              /* modest default drive, per explicit request for a built-in stage to add volume/colour -- not maxed out by default */
 
@@ -296,15 +470,15 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
 }
 
 void noiseboy_randomize_recipe(NoiseboyEngine *e) {
-    /* 1-3 layers, per explicit spec ("every time you instantiate, its
-     * a randomized noise block"). Also callable on demand (not just at
-     * instantiation) per explicit request for a way to get a new
-     * randomized set without reloading the whole module -- uses the
-     * engine's own ongoing RNG state, so repeated calls keep producing
-     * fresh, non-repeating recipes rather than resetting to the same
-     * sequence. */
-    e->numRecipeLayers = 1 + (int)(rand01(&e->rngState) * 3.0);
-    if (e->numRecipeLayers > NOISEBOY_MAX_LAYERS) e->numRecipeLayers = NOISEBOY_MAX_LAYERS;
+    /* RESTRUCTURED per explicit request -- see LayerRecipe's own
+     * header comment for the full rationale. Always exactly 3 sources
+     * now (was 1-3, randomly typed); only mix level is randomized per
+     * source. Also callable on demand (not just at instantiation) per
+     * explicit request for a way to get a new randomized set without
+     * reloading the whole module -- uses the engine's own ongoing RNG
+     * state, so repeated calls keep producing fresh, non-repeating
+     * results rather than resetting to the same sequence. */
+    e->numRecipeLayers = NOISEBOY_MAX_LAYERS;
 
     /* Recipe-level timbre character -- see this field's own header
      * comment for the full investigation (resonance tried first,
@@ -313,45 +487,52 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
      * +-15%, i.e. 0.85x-1.15x. */
     e->timbreCharacterMul = 0.85 + rand01(&e->rngState) * 0.3;
 
+    /* Loop length -- see this field's own header comment. Randomized
+     * ONCE here (not per-note), per explicit request. Linear 0-1
+     * random draw across the 0.25-3.0s range -- no particular reason
+     * to weight toward either end, unlike some of this project's other
+     * exponential/log-scale mappings which exist specifically to give
+     * a KNOB more control resolution at one end; a one-time random
+     * pick doesn't have that concern. */
+    e->loopLengthSeconds = NOISEBOY_LOOP_MIN_SECONDS + rand01(&e->rngState) * (NOISEBOY_LOOP_MAX_SECONDS - NOISEBOY_LOOP_MIN_SECONDS);
+
+    /* Tape wobble depth -- see this field's own header comment. 1%-5%
+     * (0.01-0.05), per explicit spec. */
+    e->mellotronDepth01 = 0.01 + rand01(&e->rngState) * 0.04;
+
     for (int i = 0; i < e->numRecipeLayers; i++) {
         LayerRecipe *r = &e->recipe[i];
-        /* Per explicit clarification: filtered-noise layers always
-         * track pitch via their filter; Karplus-Strong is the second,
-         * separately-pitched method, chosen randomly per layer. */
-        /* 25% per-layer chance, not 50% -- per direct feedback that
-         * Karplus-Strong felt like it was on "most patches". Worked
-         * out why: with 1-3 layers per recipe, a 50/50 per-layer coin
-         * flip means the probability of AT LEAST ONE Karplus layer
-         * appearing compounds across layers (50% at 1 layer, 75% at 2,
-         * 87.5% at 3 -- averaging ~71% overall, which matches the
-         * complaint). 25% per-layer brings that average down to ~42%,
-         * a genuinely "sometimes" rate rather than "usually".
-         *
-         * LAYER_LOOP added as a third method per explicit request,
-         * "randomly add" -- kept as a smaller slice (15%) than either
-         * existing type, since it's meant as an occasional glitch
-         * character rather than a dominant, expected-every-time one. */
-        {
-            const double typeRoll = rand01(&e->rngState);
-            if (typeRoll < 0.15) r->type = LAYER_LOOP;
-            else if (typeRoll < 0.15 + 0.25) r->type = LAYER_KARPLUS_STRONG;
-            else r->type = LAYER_FILTERED_NOISE;
-        }
+
+        /* Fixed type by index now, not randomized -- layers 0 and 1
+         * are always filtered-noise, layer 2 is always Karplus-Strong.
+         * See LayerRecipe's own comment for the full rationale. */
+        r->type = (i < 2) ? LAYER_FILTERED_NOISE : LAYER_KARPLUS_STRONG;
 
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
 
-        /* Detune spread across layers -- first layer stays at 0 cents
-         * (an anchor pitch), the rest spread out symmetrically so
-         * stacking layers doesn't just shift the whole chord sharp or
-         * flat. +-15 cents max range, modest enough to read as
-         * "richness" rather than an obvious chorus effect. Only
-         * meaningful for Karplus-type layers now (their own pitch);
-         * filtered-noise layers no longer have a per-layer filter to
-         * detune. */
+        /* Detune -- layer 0 (the first noise source) stays at 0 cents
+         * as a stereo-pan anchor (centred), layer 1 (the second noise
+         * source) gets a randomized spread so the two noise sources
+         * land at different, distinct pan positions rather than both
+         * sitting dead centre. Layer 2 (Karplus) still gets its own
+         * small randomized detune too -- unlike the noise layers,
+         * Karplus doesn't use detuneCents for panning (it auto-pans at
+         * the AM rate instead, see noiseboy_process_stereo's own
+         * panning comment), but detuneCents still feeds its own pitch
+         * tuning directly. */
         r->detuneCents = (i == 0) ? 0.0 : (rand01(&e->rngState) * 2.0 - 1.0) * 15.0;
 
         r->dampingAmount01 = rand01(&e->rngState);
+
+        /* Mix level, per explicit request -- the ONE thing that's
+         * randomized about each of these three fixed sources now.
+         * Full 0-1 range (0-100%) -- deliberately allows a source to
+         * randomize down to fully silent, which is a legitimate,
+         * useful outcome (e.g. landing on "just the two noise sources,
+         * no audible Karplus this time" some fraction of the time)
+         * rather than an accidental one. */
+        r->mixLevel01 = rand01(&e->rngState);
     }
 }
 
@@ -374,23 +555,47 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->gateOpen = 1;
     v->pendingSteal = 0;
     v->minHoldSamplesRemaining = 0;
-    v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't AM in lockstep */
+    v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't cycle in lockstep (vibrato/auto-pan/loop-sync all read this) */
 
-    /* Bitcrush and pitch-following sample-rate reduction REMOVED
-     * entirely per explicit request, after several rounds of trying to
-     * find a subtle-enough setting still drew "too much bitcrushing
-     * and sample rate reduction" -- rather than keep tuning it,
-     * removed outright. bitcrush_process/pitchedhold_process remain
-     * defined in noiseboy_dsp.c/h (unused) per this project's
-     * established "keep superseded options, don't delete" convention,
-     * in case a future revision wants them back at a different
-     * amount/design. */
+    /* Fresh loop capture every note, per PostFilterLoop's own comment
+     * -- explicit reset here (not just the lazy length-mismatch guard
+     * in noiseboy_process_stereo) matters specifically for a REUSED
+     * (stolen) voice: since loopLengthSeconds is recipe-level and
+     * fixed for the whole session, a new note landing on a voice whose
+     * PREVIOUS note used the same length would otherwise silently
+     * inherit that old note's already-captured (or partially-
+     * captured) buffer content instead of starting its own fresh
+     * capture. */
+    postfilter_loop_reset(&v->loop, (int)(e->loopLengthSeconds * e->sampleRate));
+
+    /* Fresh wobble seed per note, per-voice-distinct (not shared with
+     * the engine's own rngState directly, to avoid correlating with
+     * other per-note randomization) -- see TapeWobble's own comment. */
+    tape_wobble_init(&v->wobble, xorshift_next(&e->rngState));
+
+    /* Bitcrush and pitch-following sample-rate reduction
+     * REINTRODUCED per explicit request -- see this state's own
+     * header comment in Voice for the full position/tradeoff
+     * rationale (post-mixer, pre-filter -- the same spot v0.10.0
+     * measured as harmful to pitch-tracking accuracy, reintroduced
+     * here as an informed, explicit choice rather than an oversight).
+     * Randomized fresh per note (not recipe-level), matching this
+     * feature's own prior design before removal. Ranges chosen from
+     * this project's own tuning history, not guessed fresh: bitDepth
+     * 12-15 was the last, lightest setting reached before full
+     * removal (after two earlier reductions from an original 1-15,
+     * each time per direct feedback that it was too aggressive) --
+     * starting back at that same, already-most-conservative point
+     * rather than re-walking the same tuning journey from scratch.
+     * rateReducerMultiplier 1.0-2.0 keeps the hold rate close to the
+     * fundamental (musically related, per pitchedhold_process's own
+     * comment) while still giving some per-note variety. */
+    v->bitDepth = 12 + (int)(rand01(&e->rngState) * 4.0); /* 12-15 */
+    v->rateReducerMultiplier = 1.0 + rand01(&e->rngState) * 1.0; /* 1.0-2.0 */
+    pitchedhold_init(&v->rateReducerL);
+    pitchedhold_init(&v->rateReducerR);
     vibrato_init(&v->vibratoL);
     vibrato_init(&v->vibratoR);
-    moog_ladder_init(&v->outputLowpassL, e->sampleRate);
-    moog_ladder_init(&v->outputLowpassR, e->sampleRate);
-    korg35hp_init(&v->outputHighpassL, e->sampleRate);
-    korg35hp_init(&v->outputHighpassR, e->sampleRate);
 
     /* Voice-level pitch-tracking filter -- per direct investigation
      * request, no longer randomized between Moog/Korg35LP. Measured
@@ -430,6 +635,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
         layer->type = r->type;
         layer->colour = r->colour;
         layer->detuneCents = r->detuneCents;
+        layer->mixLevel01 = r->mixLevel01;
 
         double detuneMul = pow(2.0, (layer->detuneCents * e->params.detuneSpread01) / 1200.0);
         double layerFreq = v->freqHz * detuneMul;
@@ -440,17 +646,6 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
              * for the full restructuring rationale. */
             noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
             layer->releaseDarkenState = 0.0; /* starts fully bright/unfiltered -- see releaseDarkenState's own comment */
-        } else if (layer->type == LAYER_LOOP) {
-            /* Third sound generation method -- see LoopSource's own
-             * comment. Reference frequency is middle C (MIDI 60), per
-             * explicit spec's own example ("if middle C was 8000
-             * samples..."). detuneMul intentionally NOT applied here --
-             * this layer's pitch transposition comes entirely from the
-             * loop's own playback rate mechanism, not the same
-             * cents-based detune the other layer types use, since that
-             * would double up two different transposition mechanisms
-             * on the same layer. */
-            loop_capture(&layer->loop, &e->rngState, layer->colour, v->freqHz, midi_note_to_freq(60));
         } else {
             karplus_init(&layer->karplus);
             layer->sustainAmountSmoothed = 0.0; /* starts at 0, smooths up toward the held target -- symmetric with how it smooths down at release */
@@ -468,8 +663,61 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             for (int ci = 0; ci < v->numLayers; ci++) {
                 sourceColours[ci] = e->recipe[ci].colour;
             }
-            double damping = clampd(r->dampingAmount01 * 0.5 + e->params.filterResonance01 * 0.5, 0.0, 1.0);
-            karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, damping);
+            /* Karplus decay character, per explicit request: "Karplus
+             * is always plucky... randomly modulate the decay so that
+             * 66% of the time it's plucky, but has a varying decay
+             * like a real string... tie this to the Attack/Release
+             * knobs." Rolled fresh per note (not recipe-level), same
+             * lifecycle as bitDepth/rateReducerMultiplier above --
+             * this is meant to vary note-to-note, not settle into one
+             * fixed instrument character.
+             *
+             * PLUCKY mode (66%): close to this project's existing
+             * damping formula (dampingAmount01/Resonance blend), with
+             * a modest tie to Attack -- a snappier (shorter) Attack
+             * setting nudges toward a tighter, more percussive decay,
+             * keeping "plucky" feeling coherent with a quick attack
+             * rather than the two being unrelated.
+             *
+             * STRING mode (34%): damping pushed much closer to 1.0
+             * (Karplus-Strong's decay time grows sharply as damping
+             * approaches its self-sustaining limit), scaled by the
+             * Release knob's own position -- a long Release setting
+             * pushes the string's OWN internal ring-out time longer
+             * too, so the amplitude envelope's release and the
+             * string's own natural decay stay roughly in step instead
+             * of the string dying out silently while a long Release
+             * fades an already-silent signal. Some added per-note
+             * random spread within the mode for "varying" character,
+             * not a fixed formula every time. */
+            const int karplusStringMode = rand01(&e->rngState) < 0.34;
+            double dampingAmount;
+            if (karplusStringMode) {
+                /* REAL BUG FOUND AND FIXED HERE while verifying this
+                 * feature: karplus_pluck's own dampingAmount parameter
+                 * is a 0-1 INPUT that it internally remaps to the
+                 * actual k->damping range of 0.90-0.999 (see
+                 * karplus_pluck's own comment). An earlier version of
+                 * this code computed a value ALREADY in the 0.90-0.999
+                 * range and passed it straight through as that 0-1
+                 * input, double-mapping it and badly compressing the
+                 * intended range (confirmed directly: measured actual
+                 * k->damping values landed around 0.989-0.999 instead
+                 * of the intended 0.90-0.999, and the Release knob's
+                 * tie-in barely moved the decay time as a result).
+                 * Fixed by computing the TARGET k->damping value
+                 * directly, then inverting karplus_pluck's own mapping
+                 * to find the correct 0-1 input that produces it. */
+                const double releaseNorm01 = clampd(log(e->params.releaseMs / 0.02) / log(4000.0 / 0.02), 0.0, 1.0);
+                const double targetKDamping = clampd(0.95 + releaseNorm01 * 0.048 + rand01(&e->rngState) * 0.001, 0.90, 0.999);
+                dampingAmount = clampd((targetKDamping - 0.90) / 0.099, 0.0, 1.0);
+            } else {
+                const double attackNorm01 = clampd((e->params.attackMs - 0.5) / 199.5, 0.0, 1.0);
+                dampingAmount = clampd(r->dampingAmount01 * 0.5 + e->params.filterResonance01 * 0.5, 0.0, 1.0);
+                dampingAmount *= (0.85 + attackNorm01 * 0.15); /* shorter attack -> pulled slightly tighter/snappier */
+            }
+            dampingAmount = clampd(dampingAmount, 0.0, 1.0);
+            karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, dampingAmount);
         }
     }
 }
@@ -606,10 +854,6 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
         return karplus_process(&layer->karplus, sustainFeed, layer->sustainAmountSmoothed);
     }
 
-    if (layer->type == LAYER_LOOP) {
-        return loop_process(&layer->loop);
-    }
-
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
 
     /* Release-only darkening -- see releaseDarkenState's own header
@@ -642,18 +886,6 @@ static void compute_pan_gains(double panPos, double *gainL, double *gainR) {
 void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
     double mixL = 0.0, mixR = 0.0;
     const double dt = 1.0 / e->sampleRate;
-
-    /* Smooth knob 8 (Output Filt) toward its target once per sample,
-     * globally -- not knob-specific to any one voice, since it's a
-     * shared engine parameter. ~15ms time constant: fast enough to
-     * feel responsive as the knob turns, slow enough to eliminate the
-     * "zipper" stepping a direct instant-jump would produce (see this
-     * field's own header comment). */
-    {
-        const double smoothCoeff = exp(-1.0 / (0.001 * 15.0 * e->sampleRate));
-        e->outputFilterFreqSmoothed01 = e->params.outputFilterFreq01
-            + (e->outputFilterFreqSmoothed01 - e->params.outputFilterFreq01) * smoothCoeff;
-    }
 
     /* Envelope smoothing coefficients recomputed from the current knob
      * values each sample -- cheap (a couple of exp() calls per ACTIVE
@@ -755,11 +987,23 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             }
         }
 
-        /* AM phase updated here, before layer mixing, since Karplus
+        /* Phase updated here, before layer mixing, since Karplus
          * layers' auto-pan (below) needs it for this same sample --
          * a one-sample-early read makes no audible difference for a
-         * continuously-incrementing phase accumulator. */
-        v->amPhase += e->params.amRateHz * dt;
+         * continuously-incrementing phase accumulator.
+         *
+         * REDESIGNED: this phase used to be driven directly by the AM
+         * Rate knob (one cycle per AM period). AM/wavefold are gone
+         * now (see PostFilterLoop's own comment for what replaced
+         * them), but Karplus's own auto-pan (below) still needs SOME
+         * rate to cycle at -- rather than introduce a separate,
+         * unrelated rate, this now derives from the loop's own
+         * effective repeat rate (loopSpeedMul / loopLengthSeconds --
+         * one full phase cycle per loop repetition), so a Karplus
+         * layer's stereo pan and the loop's own repeat cycle stay
+         * visibly/audibly tied together instead of drifting
+         * independently. */
+        v->amPhase += (e->params.loopSpeedMul / e->loopLengthSeconds) * dt;
         if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
 
         /* Stereo spreading, per explicit request: Detune (knob 7) now
@@ -769,17 +1013,17 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * layer spread used for pitch, normalized to a pan position)
          * so a layer's pitch-spread character and its stereo position
          * are the same underlying randomization, not two unrelated
-         * ones. Karplus layers instead auto-pan back and forth at the
-         * AM rate (explicit request: "karplus pans back and forth at
-         * the AM rate"), using the SAME amPhase driving AM/wavefold/
-         * vibrato for a consistent, synchronized modulation source
-         * rather than a separate, unrelated LFO. Both scaled by
+         * ones. Karplus layers instead auto-pan back and forth once
+         * per loop repetition (see this phase's own comment above),
+         * using the SAME amPhase driving that synchronization rather
+         * than a separate, unrelated LFO. Both scaled by
          * detuneSpread01 -- at Detune=0 every layer collapses to dead
          * centre (mono), matching noiseboy_process's own mono output
          * exactly. */
         double voiceSumL = 0.0, voiceSumR = 0.0;
+        double voiceWobbleMul = 1.0; /* set inside the pitch filter block below, per-sample tape wobble -- see TapeWobble's own comment; reused later for output level so all three modulation targets share the same underlying wobble value */
         for (int li = 0; li < v->numLayers; li++) {
-            const double layerOut = process_layer(e, v, &v->layers[li]);
+            const double layerOut = process_layer(e, v, &v->layers[li]) * v->layers[li].mixLevel01;
             double panPos;
             if (v->layers[li].type == LAYER_KARPLUS_STRONG) {
                 panPos = sin(2.0 * M_PI * v->amPhase) * e->params.detuneSpread01;
@@ -796,21 +1040,52 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             voiceSumR /= (double)v->numLayers;
         }
 
+        /* Bitcrush + pitch-following sample-rate reduction,
+         * REINTRODUCED per explicit request -- see this state's own
+         * header comment in Voice (bitDepth/rateReducerMultiplier)
+         * for the full position/tradeoff rationale. Rate-reduction
+         * (via PitchedHold's sample-and-hold) applied first, then
+         * bitcrush on the held result -- matches this project's own
+         * prior ordering from before v0.10.0's removal. Independent
+         * L/R instances (same convention as vibrato/the pitch filter
+         * below) so this doesn't collapse the stereo image back to
+         * mono. "Sample rate follows key number" per explicit request
+         * -- PitchedHold's hold rate is freqHz*rateReducerMultiplier,
+         * directly proportional to the played note's own frequency,
+         * so lower notes get a proportionally lower effective sample
+         * rate and higher notes a proportionally higher one, not a
+         * fixed rate applied uniformly across the keyboard. */
+        voiceSumL = pitchedhold_process(&v->rateReducerL, voiceSumL, v->freqHz, e->sampleRate, v->rateReducerMultiplier);
+        voiceSumR = pitchedhold_process(&v->rateReducerR, voiceSumR, v->freqHz, e->sampleRate, v->rateReducerMultiplier);
+        voiceSumL = bitcrush_process(voiceSumL, v->bitDepth);
+        voiceSumR = bitcrush_process(voiceSumR, v->bitDepth);
+
         /* Vibrato, per explicit request -- introduces gentle pitch
          * modulation "in the noise and Karplus" (both already present
          * in voiceSum by this point, so one instance covers both layer
-         * types). Depth saturates at just 15% of AM Depth's own knob
-         * travel -- i.e. vibrato reaches its own (small) maximum
-         * quickly and stays there for the rest of the knob's range,
-         * rather than growing all the way to a dramatic wobble at full
-         * knob -- "so that its gentle, like an acoustic instrument".
-         * Max depth of 4 samples chosen as a reasoned, not ear-tuned,
-         * starting point (see this project's own verification notes
-         * on why -- no way to listen to this directly). Independent
-         * L/R instances (see VibratoDelay's own comment on why). */
+         * types).
+         *
+         * Depth WAS scaled by (and saturated at just 15% of) the old
+         * AM Depth knob's travel -- i.e. vibrato reached its own
+         * (small) maximum quickly and stayed there for the rest of
+         * the knob's range, rather than growing all the way to a
+         * dramatic wobble at full knob -- "so that its gentle, like an
+         * acoustic instrument". Now that knob is LOOP Intensity
+         * instead (see PostFilterLoop's own comment), and vibrato's
+         * depth has nothing meaningful to do with how much loop effect
+         * is blended in -- coupling them would mean turning up LOOP
+         * Intensity also, confusingly, turns up vibrato. Decoupled:
+         * fixed permanently at the same saturated depth the old
+         * scheme settled into for MOST of the old knob's range (any
+         * setting above 0.15, i.e. the majority of it), rather than
+         * introducing a new knob or dropping vibrato's character
+         * entirely. Max depth of 4 samples chosen as a reasoned, not
+         * ear-tuned, starting point (see this project's own
+         * verification notes on why -- no way to listen to this
+         * directly). Independent L/R instances (see VibratoDelay's own
+         * comment on why). */
         {
-            const double vibratoDepthFactor01 = clampd(e->params.amDepth01 / 0.15, 0.0, 1.0);
-            const double vibratoDepthSamples = vibratoDepthFactor01 * 4.0;
+            const double vibratoDepthSamples = 4.0;
             voiceSumL = vibrato_process(&v->vibratoL, voiceSumL, v->amPhase, vibratoDepthSamples);
             voiceSumR = vibrato_process(&v->vibratoR, voiceSumR, v->amPhase, vibratoDepthSamples);
         }
@@ -874,10 +1149,21 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * 0.94) -- a real, substantial improvement, though not
          * perfectly flat given that hard ceiling. */
         {
+            /* Tape wobble, per explicit request -- see TapeWobble's
+             * own header comment. One shared wobble value per voice
+             * per sample, applied to cutoff, resonance, and (further
+             * down, post-envelope) output level together. 1.0Hz rate
+             * -- slow, wow/flutter-like drift, not audio-rate texture
+             * (see TapeWobble's own comment for why that distinction
+             * matters). Depth (mellotronDepth01, 1%-5%) is recipe-
+             * level, not re-rolled here. */
+            const double wobble = tape_wobble_process(&v->wobble, 1.0, e->sampleRate);
+            voiceWobbleMul = 1.0 + wobble * e->mellotronDepth01;
+
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
-            const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul, 20.0, e->sampleRate * 0.45);
+            const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
-            const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul, 2.0);
+            const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul * voiceWobbleMul, 2.0);
             if (v->pitchFilterKind == FILTER_MOOG) {
                 moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
                 moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);
@@ -891,88 +1177,42 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             }
         }
 
-        /* Per-voice amplitude modulation -- a simple sine tremolo,
-         * depth/rate from knobs 3/4. amDepth01=0 leaves the voice
-         * completely untouched (multiplying by 1.0 always), matching
-         * "controlled by the knobs" rather than being a fixed always-on
-         * wobble. Same gain applied to both channels -- AM is a shared
-         * volume envelope, not something that should itself vary L/R
-         * (only the source panning above does that). */
-        const double amCyclePosition = 0.5 * (1.0 - cos(2.0 * M_PI * v->amPhase)); // 0 at the AM peak, 1 at the AM dip
-        const double amGain = 1.0 - e->params.amDepth01 * amCyclePosition;
-
-        /* Wavefolder linked to the SAME AM cycle, per explicit request
-         * that it "comes in and out with the AM" -- fold amount peaks
-         * exactly when amGain is at its quietest, so the dip in volume
-         * is accompanied by a dip into more distorted/folded texture
-         * rather than the two being unrelated. Zero when AM depth is
-         * zero, matching "controlled by the knobs" like AM itself. */
-        const double foldAmount = e->params.amDepth01 * amCyclePosition;
-        voiceSumL = wavefold_process(voiceSumL, foldAmount);
-        voiceSumR = wavefold_process(voiceSumR, foldAmount);
-
-        /* STEP 4: amplitude envelope. */
-        voiceSumL = voiceSumL * v->envLevel * amGain;
-        voiceSumR = voiceSumR * v->envLevel * amGain;
-
-        /* STEP 5: OUTPUT FILT -- the final stage. Rebuilt as a TILT
-         * filter, per direct request. Knob centred (12 o'clock, 64) =
-         * completely bypassed, full signal through. Turning left
-         * engages a lowpass whose cutoff falls (log scale, 20kHz down
-         * to 20Hz) the further left you go, silencing the signal from
-         * the top down. Turning right engages a highpass whose cutoff
-         * rises (log scale, 20Hz up to 20kHz) the further right you
-         * go, silencing the signal from the bottom up -- "make it
-         * disappear either direction". Only ONE side is ever active at
-         * a time (a true tilt, not two filters stacked) -- below
-         * centre uses the lowpass exclusively, above centre uses the
-         * highpass exclusively. No velocity or envelope influence, no
-         * resonance -- purely a knob-controlled sweep, deliberately
-         * simple and predictable given this replaces a previous
-         * design that wasn't landing as an audible, useful control.
-         * Independent L/R instances, identical target settings (only
-         * state differs), same reasoning as the pitch filter above. */
+        /* Post-filter LOOP, per explicit request -- replaces the old
+         * AM/wavefold stage entirely. See PostFilterLoop's own comment
+         * for the full design. Capture length is fixed once at
+         * note-on (from the recipe-level loopLengthSeconds), not
+         * recomputed here every sample -- the guard below only
+         * protects against the rare case of a global re-randomize
+         * changing loopLengthSeconds while this voice is still
+         * mid-capture from an earlier setting, resetting cleanly
+         * rather than reading mismatched buffer state. */
         {
-            const double knob = e->outputFilterFreqSmoothed01;
-            if (knob <= 0.5) {
-                const double t = clampd((0.5 - knob) / 0.5, 0.0, 1.0);
-                const double lpCutoff = clampd(20000.0 * pow(20.0 / 20000.0, t), 20.0, e->sampleRate * 0.45);
-                moog_ladder_set(&v->outputLowpassL, lpCutoff, 0.0, 0.1);
-                moog_ladder_set(&v->outputLowpassR, lpCutoff, 0.0, 0.1);
-                voiceSumL = moog_ladder_process(&v->outputLowpassL, voiceSumL);
-                voiceSumR = moog_ladder_process(&v->outputLowpassR, voiceSumR);
-                /* Same supplemental fade as the highpass side, for a
-                 * symmetric guarantee of true silence at both extremes
-                 * rather than relying solely on each filter's own
-                 * natural rolloff (which, like the highpass side,
-                 * still leaves some audible signal through even at its
-                 * most extreme setting). */
-                voiceSumL *= (1.0 - t * t);
-                voiceSumR *= (1.0 - t * t);
-            } else {
-                const double t = clampd((knob - 0.5) / 0.5, 0.0, 1.0);
-                const double hpCutoff = clampd(20.0 * pow(20000.0 / 20.0, t), 20.0, e->sampleRate * 0.45);
-                korg35hp_set(&v->outputHighpassL, hpCutoff, 0.0, 0.1);
-                korg35hp_set(&v->outputHighpassR, hpCutoff, 0.0, 0.1);
-                voiceSumL = korg35hp_process(&v->outputHighpassL, voiceSumL);
-                voiceSumR = korg35hp_process(&v->outputHighpassR, voiceSumR);
-                /* Supplemental gain fade, highpass side only -- verified
-                 * directly (isolated filter test against white noise)
-                 * that Korg35HP's own attenuation plateaus around ~29%
-                 * RMS remaining no matter how close the cutoff gets to
-                 * Nyquist, a structural limit of this filter topology
-                 * at extreme cutoff ratios, not something tunable away
-                 * by pushing the cutoff further. The lowpass side needs
-                 * no such help -- it naturally reaches near-total
-                 * silence on its own. Quadratic fade (gentle at first,
-                 * accelerating toward full silence exactly at t=1) so
-                 * full-right guarantees "disappear" as explicitly
-                 * requested, while the filter's own sweep character
-                 * still dominates through most of the range. */
-                voiceSumL *= (1.0 - t * t);
-                voiceSumR *= (1.0 - t * t);
+            const int captureLengthSamples = (int)(e->loopLengthSeconds * e->sampleRate);
+            if (v->loop.captureLengthSamples != captureLengthSamples) {
+                postfilter_loop_reset(&v->loop, captureLengthSamples);
             }
+            double loopOutL, loopOutR;
+            postfilter_loop_process(&v->loop, voiceSumL, voiceSumR, e->params.loopSpeedMul, &loopOutL, &loopOutR);
+            voiceSumL = voiceSumL * (1.0 - e->params.loopIntensity01) + loopOutL * e->params.loopIntensity01;
+            voiceSumR = voiceSumR * (1.0 - e->params.loopIntensity01) + loopOutR * e->params.loopIntensity01;
         }
+
+        /* STEP 4: amplitude envelope, with tape wobble also applied to
+         * output level -- see TapeWobble's own header comment. Same
+         * per-sample wobble value that modulated the filter above,
+         * reused here (not a fresh call) so all three targets ride
+         * the same underlying "tape speed" fluctuation coherently. */
+        voiceSumL = voiceSumL * v->envLevel * voiceWobbleMul;
+        voiceSumR = voiceSumR * v->envLevel * voiceWobbleMul;
+
+        /* Output Filt / TILT REMOVED from here, per explicit request:
+         * "lets move the db-cell technology to before the TILT... this
+         * emulates failing electronics [and] shouldn't have to be
+         * noise gated". Per-voice output shaping doesn't fit that
+         * request -- TILT needs to sit on the FINAL mix, AFTER
+         * db-cell, not per-voice before it. See TiltFilter's own
+         * comment (noiseboy_dsp.h) and render_block's own comment
+         * (noiseboy_plugin.c) for where this now lives and why. */
 
         mixL += voiceSumL;
         mixR += voiceSumR;

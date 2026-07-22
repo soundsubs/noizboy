@@ -3,9 +3,11 @@
 #include <math.h>
 
 int main(void) {
-    NoiseboyEngine e;
-    noiseboy_engine_init(&e, 48000.0, 42u);
-    noiseboy_note_on(&e, 60, 0.8);
+    /* Per the TILT redesign (see TiltFilter's own comment), knob
+     * smoothing now lives in TiltFilter itself, not NoiseboyEngine --
+     * test it directly there instead. */
+    TiltFilter t;
+    tilt_filter_init(&t, 48000.0);
 
     /* Simulate a knob being turned through discrete steps over time,
      * like real MIDI CC messages arriving as a physical knob turns --
@@ -13,15 +15,16 @@ int main(void) {
      * value (what the filter actually uses) changes gradually rather
      * than snapping to each new target instantly. */
     double maxJumpPerSample = 0.0;
-    double lastSmoothed = e.outputFilterFreqSmoothed01;
+    double lastSmoothed = t.smoothedTilt01;
 
     for (int step = 0; step < 10; step++) {
-        e.params.outputFilterFreq01 = step / 10.0; /* discrete jump, like a new MIDI CC value arriving */
+        double target = step / 10.0; /* discrete jump, like a new MIDI CC value arriving */
         for (int i = 0; i < 2400; i++) { /* 50ms per step at 48kHz */
-            noiseboy_process(&e);
-            double jump = fabs(e.outputFilterFreqSmoothed01 - lastSmoothed);
+            double l = 0.0, r = 0.0;
+            tilt_filter_process(&t, &l, &r, target, 48000.0);
+            double jump = fabs(t.smoothedTilt01 - lastSmoothed);
             if (jump > maxJumpPerSample) maxJumpPerSample = jump;
-            lastSmoothed = e.outputFilterFreqSmoothed01;
+            lastSmoothed = t.smoothedTilt01;
         }
     }
 

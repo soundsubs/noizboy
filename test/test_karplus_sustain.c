@@ -7,25 +7,30 @@ static int check_finite(double x) { return !(isnan(x) || isinf(x)); }
 int main(void) {
     int all_ok = 1;
 
-    /* Find a seed that gives an all-Karplus recipe, to isolate the effect. */
+    /* Per the fixed 3-source mixer restructuring (layers 0/1 always
+     * filtered-noise, layer 2 always Karplus-Strong -- see
+     * LayerRecipe's own header comment), there's no more "all-Karplus
+     * recipe" to search for -- layer 2 is always Karplus by
+     * construction. Isolate it directly via mix levels instead (mute
+     * the two noise sources, keep Karplus at full level) so this test
+     * measures the Karplus sustain behaviour specifically, not a mix
+     * of all three sources. */
     NoiseboyEngine e;
-    unsigned int seed = 0;
-    for (unsigned int s = 1; s < 10000; s++) {
-        noiseboy_engine_init(&e, 48000.0, s * 7919u);
-        int allKarplus = 1;
-        for (int i = 0; i < e.numRecipeLayers; i++) {
-            if (e.recipe[i].type != LAYER_KARPLUS_STRONG) allKarplus = 0;
-        }
-        if (allKarplus) { seed = s; break; }
-    }
-    if (seed == 0) { printf("Could not find an all-Karplus recipe in 10000 tries\n"); return 1; }
-    printf("Using seed %u (%d all-Karplus layers)\n", seed, e.numRecipeLayers);
+    unsigned int seed = 12345u;
+    noiseboy_engine_init(&e, 48000.0, seed);
+    e.recipe[0].mixLevel01 = 0.0;
+    e.recipe[1].mixLevel01 = 0.0;
+    e.recipe[2].mixLevel01 = 1.0;
+    printf("Using seed %u, layer 2 (Karplus) isolated via mix levels\n", seed);
 
     /* Test: MAX attack time, hold the note, check the signal is still
      * clearly audible well after the envelope has risen -- this is
      * exactly the "with maximized Attack, you almost can't hear the
      * Karplus pluck" complaint. */
-    noiseboy_engine_init(&e, 48000.0, seed * 7919u);
+    noiseboy_engine_init(&e, 48000.0, seed);
+    e.recipe[0].mixLevel01 = 0.0;
+    e.recipe[1].mixLevel01 = 0.0;
+    e.recipe[2].mixLevel01 = 1.0;
     e.params.attackMs = 200.0; /* max per NoiseboyParams range */
     e.params.releaseMs = 80.0;
     noiseboy_note_on(&e, 48, 1.0);

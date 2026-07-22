@@ -10,8 +10,8 @@ int main(void) {
     noiseboy_engine_init(&e, 48000.0, 0xABCDu);
 
     /* Max out everything that could interact badly */
-    e.params.amDepth01 = 1.0;
-    e.params.amRateHz = 20.0;
+    e.params.loopIntensity01 = 1.0;
+    e.params.loopSpeedMul = 8.0; /* fast end of the real-time SPEED range */
     e.params.drive01 = 1.0;
 
     for (int i = 0; i < 4; i++) {
@@ -26,7 +26,7 @@ int main(void) {
         if (fabs(y) > peak) peak = fabs(y);
     }
 
-    printf("Max AM/drive/wavefold/tapesat stress test: finite_ok=%d peak=%.4f\n", finite_ok, peak);
+    printf("Max LOOP/drive/tapesat stress test: finite_ok=%d peak=%.4f\n", finite_ok, peak);
     if (!finite_ok) all_ok = 0;
     if (peak > 1.5) { printf("  WARN: unusually high peak\n"); }
 

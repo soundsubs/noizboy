@@ -74,23 +74,26 @@ int main(void) {
        not a static one -- verify by checking the L/R balance actually flips sign over time. */
     {
         NoiseboyEngine e;
-        unsigned int karplusSeed = 0;
-        for (unsigned int s = 1; s < 5000; s++) {
-            noiseboy_engine_init(&e, 48000.0, s * 7919u);
-            int allKarplus = 1;
-            for (int i = 0; i < e.numRecipeLayers; i++) {
-                if (e.recipe[i].type != LAYER_KARPLUS_STRONG) allKarplus = 0;
-            }
-            if (allKarplus) { karplusSeed = s; break; }
-        }
-        if (karplusSeed == 0) {
-            printf("Could not find an all-Karplus recipe for auto-pan test, skipping\n");
-        } else {
-            noiseboy_engine_init(&e, 48000.0, karplusSeed * 7919u);
-            e.params.detuneSpread01 = 1.0;
-            e.params.amRateHz = 4.0; /* a few Hz, easy to observe over 1 second */
-            noiseboy_note_on(&e, 60, 0.8);
+        /* Per the fixed 3-source mixer restructuring, layer 2 is
+         * always Karplus now -- no seed search needed, isolate via
+         * mix levels (mute the two noise sources) instead. */
+        unsigned int karplusSeed = 12345u;
+        noiseboy_engine_init(&e, 48000.0, karplusSeed);
+        e.recipe[0].mixLevel01 = 0.0;
+        e.recipe[1].mixLevel01 = 0.0;
+        e.recipe[2].mixLevel01 = 1.0;
+        e.params.detuneSpread01 = 1.0;
+        /* amPhase (which drives Karplus's auto-pan) is now derived
+         * from loopSpeedMul/loopLengthSeconds, not a dedicated AM Rate
+         * knob -- see amPhase's own header comment. 0.25s (the
+         * shortest possible loop length) with speed=1.0 gives a 4Hz
+         * phase rate, easy to observe over 1 second, matching this
+         * test's original intent. */
+        e.loopLengthSeconds = 0.25;
+        e.params.loopSpeedMul = 1.0;
+        noiseboy_note_on(&e, 60, 0.8);
 
+        {
             int wentPositive = 0, wentNegative = 0;
             int finite_ok = 1;
             for (int i = 0; i < 48000; i++) {
@@ -104,7 +107,7 @@ int main(void) {
             printf("Karplus auto-pan (seed %u): wentPositive=%d wentNegative=%d (both should be 1 -- pan oscillates)\n",
                    karplusSeed, wentPositive, wentNegative);
             if (!finite_ok) { printf("  FAILED: non-finite\n"); all_ok = 0; }
-            if (!wentPositive || !wentNegative) { printf("  FAILED: pan should swing both directions over 1 second at 4Hz AM rate\n"); all_ok = 0; }
+            if (!wentPositive || !wentNegative) { printf("  FAILED: pan should swing both directions over 1 second at 4Hz phase rate\n"); all_ok = 0; }
         }
     }
 

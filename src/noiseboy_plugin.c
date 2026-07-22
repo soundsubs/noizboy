@@ -13,13 +13,18 @@
  *     an audio_fx module would)
  *
  * Signal chain in render_block: NOISEBOY voice engine -> DBCELL
- * (always-on db-cell port, dbcell_dsp.c/h) -> noise gate. The gate's
- * placement AFTER db-cell specifically (not before it) is per direct
- * correction: db-cell's forced-always-present Noiz slot generates
- * sound regardless of NOISEBOY's own input, so gating only NOISEBOY's
- * raw output wouldn't catch db-cell's own residual noise -- the gate
- * has to be the LAST stage, keyed off actual NOISEBOY voice activity,
- * to guarantee true silence when nothing is being played.
+ * (always-on db-cell port, dbcell_dsp.c/h) -> TILT (analog-tape-style
+ * EQ, see TiltFilter's own comment). Per explicit request, db-cell now
+ * sits BEFORE TILT (was AFTER, with a dedicated noise gate after that
+ * -- both removed): "move the db-cell technology to before the TILT.
+ * This way, it must flow through tone shaping on its way out. This
+ * emulates failing electronics, but is manageable and controllable
+ * from TILT and therefore shouldn't have to be noise gated." TILT's
+ * own always-present bandwidth limiting (see TiltFilter's own
+ * comment) naturally tames db-cell's forced-always-present Noiz slot
+ * enough that a dedicated gate is no longer needed to keep an idle
+ * instrument from audibly hissing -- verified directly, not just
+ * assumed, see this project's own test suite.
  *
  * NOTE ON VERIFICATION: the v2 API's exact struct layout (host_api_v1_t
  * fields, plugin_api_v2_t member order) is taken directly from
@@ -39,34 +44,14 @@
 #include <stdio.h>
 #include <math.h>
 
-/* Noise gate applied AFTER db-cell, per explicit correction: db-cell's
- * forced-always-present Noiz slot generates sound regardless of
- * NOISEBOY's own input, so without this an "instrument" would still
- * be audibly hissing even with zero voices playing. Keyed off actual
- * NOISEBOY voice activity (noiseboy_any_voice_active), not off signal
- * level -- a level-based gate could still let db-cell's own noise
- * through during a genuinely quiet-but-still-playing moment, or fail
- * to fully silence a loud db-cell moment right as the last voice
- * releases. Fast attack (opens quickly when a note starts) and a
- * slower, smoothed release (avoids an abrupt click when the last
- * voice stops) -- one shared envelope drives both channels, since
- * "any voice active" is a single global condition, not a per-channel
- * one. */
-typedef struct {
-    double envelope;
-} NoiseboyOutputGate;
-
-static void noiseboy_output_gate_init(NoiseboyOutputGate *g) {
-    g->envelope = 0.0;
-}
-
-static double noiseboy_output_gate_process(NoiseboyOutputGate *g, double x, int voicesActive, double sampleRate) {
-    const double target = voicesActive ? 1.0 : 0.0;
-    const double timeMs = voicesActive ? 3.0 : 150.0;
-    const double coeff = exp(-1.0 / (0.001 * timeMs * sampleRate));
-    g->envelope = target + (g->envelope - target) * coeff;
-    return x * g->envelope;
-}
+/* TiltFilter itself (struct + tilt_filter_init/tilt_filter_process)
+ * lives in noiseboy_dsp.c/h now, not here -- it only depends on
+ * primitives already there (MoogLadder, Korg35HP), and keeping it
+ * there means it's testable standalone via this project's own C test
+ * suite, matching where every other piece of real DSP logic in this
+ * project lives. This file stays thin Schwung-specific glue. See
+ * TiltFilter's own header comment in noiseboy_dsp.h for the full
+ * design rationale. */
 
 typedef struct {
     NoiseboyEngine engine;
@@ -75,11 +60,15 @@ typedef struct {
      * like my own work"). See dbcell_dsp.h for the full port
      * rationale. Separate RNG seed from the main engine's, drawn from
      * the same /dev/urandom source below, so the two layers'
-     * randomizations are independent rather than correlated. */
+     * randomizations are independent rather than correlated. Now sits
+     * BEFORE TILT in the signal chain, not after -- see TiltFilter's
+     * own comment and render_block's own comment for the full
+     * rationale. */
     DbCellEngine dbcell;
-    /* Placed AFTER dbcell in the signal chain -- see NoiseboyOutputGate's own
-     * comment above for why. */
-    NoiseboyOutputGate outputGate;
+    /* TILT -- see TiltFilter's own comment. Replaces the old
+     * NoiseboyOutputGate (removed -- see this struct's own header
+     * comment for why a dedicated gate is no longer needed). */
+    TiltFilter tilt;
 } noiseboy_instance_t;
 
 static unsigned int read_random_seed(unsigned int fallback) {
@@ -113,12 +102,26 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
      * see the NOTE at the top of this file. */
     noiseboy_engine_init(&inst->engine, 48000.0, seed);
     dbcell_engine_init(&inst->dbcell, 48000.0, read_random_seed(0xDBCE11u));
-    noiseboy_output_gate_init(&inst->outputGate);
+    tilt_filter_init(&inst->tilt, 48000.0);
 
     return inst;
 }
 
 static void destroy_instance(void *instance) {
+    /* Loop buffers are separately heap-allocated (see
+     * postfilter_loop_alloc's own comment for why -- keeping
+     * NoiseboyEngine itself small enough to stack-declare safely
+     * elsewhere, like this project's own tests, while still
+     * supporting a full 3-second loop). free(instance) alone would
+     * free the outer calloc'd block but NOT these separately-
+     * allocated buffers -- a real leak on every instance destruction
+     * without this. */
+    noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
+    if (inst) {
+        for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
+            postfilter_loop_free(&inst->engine.voices[v].loop);
+        }
+    }
     free(instance);
 }
 
@@ -162,10 +165,24 @@ static void set_param(void *instance, const char *key, const char *val) {
         p->filterCutoffOffset01 = raw01;
     } else if (strcmp(key, "resonance") == 0) {
         p->filterResonance01 = raw01;
-    } else if (strcmp(key, "am_rate") == 0) {
-        p->amRateHz = 0.1 + raw01 * 19.9; /* 0.1-20 Hz */
-    } else if (strcmp(key, "am_depth") == 0) {
-        p->amDepth01 = raw01;
+    } else if (strcmp(key, "loop_length") == 0) {
+        /* SPEED knob, per explicit request -- real-time multiplier on
+         * playback rate through the fixed captured loop buffer (NOT
+         * the buffer's own length, which is loopLengthSeconds,
+         * randomized once at the recipe level -- see NoiseboyEngine's
+         * own field). Symmetric exponential range, knob centre =
+         * exactly 1.0x (normal/neutral speed) -- 0.125x at knob=0 (8x
+         * slower), 8.0x at knob=1 (8x faster). Chosen to put "no
+         * change" intuitively at centre, like a real tape-loop speed
+         * control, rather than an asymmetric range where centre would
+         * land on some arbitrary non-1.0 multiplier. */
+        p->loopSpeedMul = pow(2.0, (raw01 - 0.5) * 6.0);
+    } else if (strcmp(key, "loop_intensity") == 0) {
+        /* LOOP Intensity, per explicit request (formerly AM Depth) --
+         * blend between the dry, post-filter signal and the looped,
+         * decaying playback. See PostFilterLoop's own comment for the
+         * full design. */
+        p->loopIntensity01 = raw01;
     } else if (strcmp(key, "attack") == 0) {
         p->attackMs = 0.5 + raw01 * 199.5; /* 0.5-200 ms */
     } else if (strcmp(key, "release") == 0) {
@@ -190,8 +207,13 @@ static void set_param(void *instance, const char *key, const char *val) {
         p->releaseMs = 0.02 * pow(4000.0 / 0.02, raw01);
     } else if (strcmp(key, "detune_spread") == 0) {
         p->detuneSpread01 = raw01;
-    } else if (strcmp(key, "output_filter_freq") == 0) {
-        p->outputFilterFreq01 = raw01;
+    } else if (strcmp(key, "tilt") == 0) {
+        /* TILT, per explicit request (renamed from Output Filt/
+         * output_filter_freq, "since it loses the filter qualities").
+         * See TiltFilter's own comment for the full design -- this
+         * knob now controls a genuine tilt EQ within a fixed tape-
+         * bandwidth window, not a lowpass/highpass sweep-to-silence. */
+        p->tiltAmount01 = raw01;
     } else if (strcmp(key, "master_level") == 0) {
         p->masterLevel01 = raw01;
     } else if (strcmp(key, "drive") == 0) {
@@ -231,16 +253,16 @@ static const char *NOISEBOY_UI_HIERARCHY_JSON =
     "{\"levels\":{\"root\":{\"name\":\"NOIZBOY\",\"params\":["
     "{\"key\":\"filter_cutoff\",\"name\":\"Filter Offset\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"am_depth\",\"name\":\"AM Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"am_rate\",\"name\":\"AM Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"loop_intensity\",\"name\":\"LOOP Intensity\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"loop_length\",\"name\":\"Loop Length\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"detune_spread\",\"name\":\"Detune\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"output_filter_freq\",\"name\":\"Output Filt\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"tilt\",\"name\":\"TILT\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127}"
-    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"am_depth\",\"am_rate\",\"attack\",\"release\",\"detune_spread\",\"output_filter_freq\"]}}}";
+    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"loop_intensity\",\"loop_length\",\"attack\",\"release\",\"detune_spread\",\"tilt\"]}}}";
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
@@ -255,12 +277,12 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     double val01 = -1.0;
     if (strcmp(key, "filter_cutoff") == 0) val01 = p->filterCutoffOffset01;
     else if (strcmp(key, "resonance") == 0) val01 = p->filterResonance01;
-    else if (strcmp(key, "am_rate") == 0) val01 = (p->amRateHz - 0.1) / 19.9;
-    else if (strcmp(key, "am_depth") == 0) val01 = p->amDepth01;
+    else if (strcmp(key, "loop_length") == 0) val01 = log2(p->loopSpeedMul) / 6.0 + 0.5;
+    else if (strcmp(key, "loop_intensity") == 0) val01 = p->loopIntensity01;
     else if (strcmp(key, "attack") == 0) val01 = (p->attackMs - 0.5) / 199.5;
     else if (strcmp(key, "release") == 0) val01 = log(p->releaseMs / 0.02) / log(4000.0 / 0.02);
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;
-    else if (strcmp(key, "output_filter_freq") == 0) val01 = p->outputFilterFreq01;
+    else if (strcmp(key, "tilt") == 0) val01 = p->tiltAmount01;
     else if (strcmp(key, "master_level") == 0) val01 = p->masterLevel01;
     else if (strcmp(key, "drive") == 0) val01 = p->drive01;
     else if (strcmp(key, "randomize") == 0) {
@@ -292,14 +314,13 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         noiseboy_process_stereo(&inst->engine, &l, &r);
         dbcell_process(&inst->dbcell, &l, &r);
 
-        /* Noise gate AFTER dbcell, per explicit correction -- db-cell's
-         * forced-always-present Noiz slot would otherwise keep making
-         * sound even with zero NOISEBOY voices playing. Keyed off
-         * actual voice activity, not signal level -- see
-         * NoiseboyOutputGate's own comment for why. */
-        const int voicesActive = noiseboy_any_voice_active(&inst->engine);
-        l = noiseboy_output_gate_process(&inst->outputGate, l, voicesActive, inst->engine.sampleRate);
-        r = noiseboy_output_gate_process(&inst->outputGate, r, voicesActive, inst->engine.sampleRate);
+        /* TILT applied AFTER dbcell now, per explicit request -- see
+         * this file's own header comment and TiltFilter's own comment
+         * for the full rationale. db-cell's own forced-always-present
+         * Noiz slot now flows through TILT's always-present tape-
+         * bandwidth window on its way out, same as everything else --
+         * no separate gate needed to keep it from hissing when idle. */
+        tilt_filter_process(&inst->tilt, &l, &r, inst->engine.params.tiltAmount01, inst->engine.sampleRate);
 
         if (l > 1.0) l = 1.0;
         if (l < -1.0) l = -1.0;

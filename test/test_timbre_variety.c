@@ -48,18 +48,18 @@ int main(void) {
     }
     printf("timbreCharacterMul range across 500 seeds: %.4f to %.4f (expect close to 0.85-1.15)\n", minMul, maxMul);
 
-    /* Isolated comparison: same seed/recipe, only timbreCharacterMul differs. */
-    unsigned int seed = 0;
-    for (unsigned int i = 1; i < 1000; i++) {
-        NoiseboyEngine e;
-        noiseboy_engine_init(&e, 48000.0, i * 7919u);
-        if (e.numRecipeLayers == 1 && e.recipe[0].type == LAYER_FILTERED_NOISE) { seed = i; break; }
-    }
-    if (seed == 0) { printf("Could not find suitable seed\n"); return 1; }
+    /* Isolated comparison: same seed/recipe, only timbreCharacterMul
+     * differs. Per the fixed 3-source mixer restructuring,
+     * numRecipeLayers is always 3 now -- use a fixed seed directly
+     * rather than searching for a single-layer recipe that can no
+     * longer exist, isolating via mix levels (mute Karplus) instead. */
+    unsigned int seed = 12345u;
 
     NoiseboyEngine eLow, eHigh;
-    noiseboy_engine_init(&eLow, 48000.0, seed * 7919u);
-    noiseboy_engine_init(&eHigh, 48000.0, seed * 7919u);
+    noiseboy_engine_init(&eLow, 48000.0, seed);
+    noiseboy_engine_init(&eHigh, 48000.0, seed);
+    eLow.recipe[2].mixLevel01 = 0.0;
+    eHigh.recipe[2].mixLevel01 = 0.0;
     eLow.timbreCharacterMul = 0.85;
     eHigh.timbreCharacterMul = 1.15;
 

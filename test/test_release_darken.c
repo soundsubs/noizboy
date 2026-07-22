@@ -26,23 +26,22 @@ static int count_zero_crossings(NoiseboyEngine *e, int numSamples) {
 int main(void) {
     int all_ok = 1;
 
-    /* Find a seed with an all-filtered-noise recipe to isolate this feature */
+    /* Per the fixed 3-source mixer restructuring (layers 0/1 always
+     * filtered-noise, layer 2 always Karplus-Strong -- see
+     * LayerRecipe's own header comment), isolate the noise-only case
+     * directly via mix levels (mute the Karplus layer) rather than
+     * searching for a seed that produces an all-noise recipe, since
+     * none will anymore. */
     NoiseboyEngine e;
-    unsigned int seed = 0;
-    for (unsigned int i = 1; i < 2000; i++) {
-        noiseboy_engine_init(&e, 48000.0, i * 7919u);
-        int allNoise = 1;
-        for (int li = 0; li < e.numRecipeLayers; li++) {
-            if (e.recipe[li].type != LAYER_FILTERED_NOISE) allNoise = 0;
-        }
-        if (allNoise) { seed = i; break; }
-    }
-    if (seed == 0) { printf("Could not find all-filtered-noise recipe\n"); return 1; }
+    unsigned int seed = 12345u;
+    noiseboy_engine_init(&e, 48000.0, seed);
+    e.recipe[2].mixLevel01 = 0.0; /* mute Karplus, isolate the two noise sources */
 
     /* Test 1: darkening actually happens -- compare zero-crossing rate
      * (a rough brightness proxy) early in release vs. late in release. */
     {
-        noiseboy_engine_init(&e, 48000.0, seed * 7919u);
+        noiseboy_engine_init(&e, 48000.0, seed);
+        e.recipe[2].mixLevel01 = 0.0;
         e.params.releaseMs = 2000.0;
         e.params.attackMs = 4.0;
         noiseboy_note_on(&e, 60, 0.8);
@@ -83,7 +82,8 @@ int main(void) {
      * dominant period via zero-crossing spacing at the START of
      * release vs. deep into release, expecting them to match closely. */
     {
-        noiseboy_engine_init(&e, 48000.0, seed * 7919u);
+        noiseboy_engine_init(&e, 48000.0, seed);
+        e.recipe[2].mixLevel01 = 0.0;
         e.params.releaseMs = 2000.0;
         e.params.attackMs = 4.0;
         e.params.filterResonance01 = 0.95; /* high resonance -- strong, measurable tone to track */
