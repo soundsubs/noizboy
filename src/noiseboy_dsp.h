@@ -35,7 +35,7 @@
 #include <stddef.h>
 #include "distroy_dsp.h" /* SimpleNoise, NoiseGen, NoiseColour, MoogLadder, Korg35LP, Korg35HP now come from here -- consolidated to one shared source when DBCELL processing was added, rather than keeping NOISEBOY's own verbatim-copied duplicates alongside a second copy pulled in for DBCELL. Same structs/functions as before, just declared once instead of twice. */
 
-#define NOISEBOY_MAX_VOICES 8
+#define NOISEBOY_MAX_VOICES 4
 #define NOISEBOY_MAX_LAYERS 3
 #define NOISEBOY_KS_MAX_SAMPLES 2400 /* enough delay-line length for the lowest supported note (~A0, 27.5Hz) at up to 48kHz-ish sample rates, with headroom */
 

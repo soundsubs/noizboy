@@ -66,6 +66,25 @@ amounts and ultimately removed entirely, per direct feedback -- see
 
 ## Status
 
+**v0.13.1 -- DIAGNOSTIC BUILD, not a committed change.** Polyphony
+reduced from 8 to 4 voices, per direct request, to test whether
+"still glitching above Release of 7" (after v0.13.0's voice-stealing
+fix) is a real CPU ceiling on the Move rather than remaining DSP
+logic. Reasoning: v0.12.0's stereo panning doubled per-voice
+processing cost (vibrato, pitch-tracking filter, and output tilt
+filter all now run independently for L and R, where they used to run
+once) -- and longer release keeps more voices "active" simultaneously,
+compounding that cost. This project has never actually profiled real
+CPU usage on Move hardware; it's been a flagged unknown since the
+very first build. This is the fastest way to get a real answer: if
+the glitching goes away at 4 voices, that's strong evidence for a CPU
+ceiling; if it persists even here, that rules CPU out and points back
+at DSP logic still to be found.
+
+Purely a one-line constant change (`NOISEBOY_MAX_VOICES`, 8 -> 4) --
+nothing else touched. Full test suite re-run clean at this reduced
+count, including the 24,000-combination sweep.
+
 **v0.13.0** -- fixed clicking/glitching with longer release times, per
 direct report ("with release longer than 7, it starts to click and
 glitch... increasing release amount increases glitching... release of
