@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOIZBOY",
-    "version": "0.16.0",
+    "version": "0.16.1",
     "abbrev": "NOIZB",
-    "description": "Fixed 2-noise+1-Karplus mixer, post-filter LOOP (replaces AM), analog-tape TILT EQ, Mellotron-style tape wobble, reintroduced bitcrush/rate-reduce, and Karplus decay variety. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
+    "description": "Re-added the noise gate after TILT -- v0.16.0's gate removal left db-cell audibly hissing when idle in practice, not just quiet. Now: voice engine -> DBCELL -> TILT -> gate. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",

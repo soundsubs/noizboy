@@ -102,9 +102,10 @@ after all voices sum together):
    silence the signal. A fixed, always-present bandwidth window
    (gentle rolloff below ~100Hz, steeper rolloff above ~10kHz) that
    never goes away; the knob shifts the balance within that window
-   toward bass or treble emphasis. db-cell's own always-on noise now
-   flows through this on its way out too -- see "Status" for why that
-   means no dedicated noise gate is needed anymore.
+   toward bass or treble emphasis. db-cell's own always-on noise
+   flows through this on its way out too, same as everything else.
+8. Noise gate -- the final stage. See "Status" for why this is back
+   after v0.16.0 removed it.
 
 ## Controls (11 chain_params -- knobs 1-8, plus 3 more via the parameter menu)
 
@@ -123,6 +124,25 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.16.1** -- re-added the noise gate, per direct report ("I can hear
+db-cell at the end making sound"). v0.16.0 removed the dedicated gate
+on the theory that TILT's own always-present bandwidth limiting would
+keep an idle instrument quiet enough on its own -- measured at the
+time as roughly -55 to -58dB relative to a played note, and flagged
+explicitly that this was measured, not confirmed by ear. That
+measurement wasn't wrong, but "quiet" turned out not to be the same as
+"silent" in practice. Gate is back, positioned AFTER TILT this time
+(TILT sat where the gate now sits again) -- db-cell's output still
+flows through TILT's tone-shaping first, exactly as originally
+requested, with the gate as the genuinely final stage. Verified
+directly: idle RMS drops from 0.00156 (TILT alone) to 0.00000000 (with
+the gate) -- true silence, not just a smaller number. Also verified
+the gate itself opens promptly (<100ms to fully open) and releases
+smoothly (no click when the last voice stops). One new test
+(`test-gateremoval`, repurposed from its v0.16.0 role of confirming
+the gate *wasn't* needed to now confirming it *is*), part of the
+default `make test`. Full 23-suite run passes clean.
 
 **v0.16.0** -- a six-part architectural request, each part implemented
 and tested, several catching real bugs along the way. This was the

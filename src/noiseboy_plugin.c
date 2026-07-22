@@ -14,17 +14,20 @@
  *
  * Signal chain in render_block: NOISEBOY voice engine -> DBCELL
  * (always-on db-cell port, dbcell_dsp.c/h) -> TILT (analog-tape-style
- * EQ, see TiltFilter's own comment). Per explicit request, db-cell now
- * sits BEFORE TILT (was AFTER, with a dedicated noise gate after that
- * -- both removed): "move the db-cell technology to before the TILT.
- * This way, it must flow through tone shaping on its way out. This
- * emulates failing electronics, but is manageable and controllable
- * from TILT and therefore shouldn't have to be noise gated." TILT's
- * own always-present bandwidth limiting (see TiltFilter's own
- * comment) naturally tames db-cell's forced-always-present Noiz slot
- * enough that a dedicated gate is no longer needed to keep an idle
- * instrument from audibly hissing -- verified directly, not just
- * assumed, see this project's own test suite.
+ * EQ, see TiltFilter's own comment) -> noise gate. db-cell sits BEFORE
+ * TILT, per explicit request: "move the db-cell technology to before
+ * the TILT. This way, it must flow through tone shaping on its way
+ * out." A dedicated gate was removed at the same time on the theory
+ * that TILT's own always-present bandwidth limiting would keep an
+ * idle instrument quiet enough on its own -- measured at the time as
+ * roughly -55 to -58dB relative to a played note. That measurement
+ * wasn't wrong, but it turned out to still be audibly present in
+ * practice ("I can hear db-cell at the end making sound"), so the
+ * gate is back -- positioned AFTER TILT this time (TILT used to sit
+ * where the gate now sits again), so db-cell's output still flows
+ * through TILT's tone-shaping exactly as originally requested, with
+ * the gate as the final stage guaranteeing true silence rather than
+ * TILT trying to do double duty as both an EQ and a gate.
  *
  * NOTE ON VERIFICATION: the v2 API's exact struct layout (host_api_v1_t
  * fields, plugin_api_v2_t member order) is taken directly from
@@ -65,10 +68,11 @@ typedef struct {
      * own comment and render_block's own comment for the full
      * rationale. */
     DbCellEngine dbcell;
-    /* TILT -- see TiltFilter's own comment. Replaces the old
-     * NoiseboyOutputGate (removed -- see this struct's own header
-     * comment for why a dedicated gate is no longer needed). */
+    /* TILT -- see TiltFilter's own comment. */
     TiltFilter tilt;
+    /* Noise gate, RE-ADDED after TILT -- see NoiseboyOutputGate's own
+     * header comment in noiseboy_dsp.h for why. */
+    NoiseboyOutputGate outputGate;
 } noiseboy_instance_t;
 
 static unsigned int read_random_seed(unsigned int fallback) {
@@ -103,6 +107,7 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
     noiseboy_engine_init(&inst->engine, 48000.0, seed);
     dbcell_engine_init(&inst->dbcell, 48000.0, read_random_seed(0xDBCE11u));
     tilt_filter_init(&inst->tilt, 48000.0);
+    noiseboy_output_gate_init(&inst->outputGate);
 
     return inst;
 }
@@ -314,13 +319,18 @@ static void render_block(void *instance, int16_t *out_lr, int frames) {
         noiseboy_process_stereo(&inst->engine, &l, &r);
         dbcell_process(&inst->dbcell, &l, &r);
 
-        /* TILT applied AFTER dbcell now, per explicit request -- see
-         * this file's own header comment and TiltFilter's own comment
-         * for the full rationale. db-cell's own forced-always-present
-         * Noiz slot now flows through TILT's always-present tape-
-         * bandwidth window on its way out, same as everything else --
-         * no separate gate needed to keep it from hissing when idle. */
+        /* TILT applied AFTER dbcell, per explicit request -- see this
+         * file's own header comment and TiltFilter's own comment for
+         * the full rationale. */
         tilt_filter_process(&inst->tilt, &l, &r, inst->engine.params.tiltAmount01, inst->engine.sampleRate);
+
+        /* Noise gate, RE-ADDED, positioned AFTER TILT -- see this
+         * file's own header comment and NoiseboyOutputGate's own
+         * comment (noiseboy_dsp.h) for the full rationale. Keyed off
+         * actual voice activity, not signal level. */
+        const int voicesActive = noiseboy_any_voice_active(&inst->engine);
+        l = noiseboy_output_gate_process(&inst->outputGate, l, voicesActive, inst->engine.sampleRate);
+        r = noiseboy_output_gate_process(&inst->outputGate, r, voicesActive, inst->engine.sampleRate);
 
         if (l > 1.0) l = 1.0;
         if (l < -1.0) l = -1.0;

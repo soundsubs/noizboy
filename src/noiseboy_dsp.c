@@ -407,6 +407,18 @@ void tilt_filter_process(TiltFilter *t, double *l, double *r, double tiltTarget0
     *r = korg35hp_process(&t->highpassR, *r);
 }
 
+void noiseboy_output_gate_init(NoiseboyOutputGate *g) {
+    g->envelope = 0.0;
+}
+
+double noiseboy_output_gate_process(NoiseboyOutputGate *g, double x, int voicesActive, double sampleRate) {
+    const double target = voicesActive ? 1.0 : 0.0;
+    const double timeMs = voicesActive ? 3.0 : 150.0;
+    const double coeff = exp(-1.0 / (0.001 * timeMs * sampleRate));
+    g->envelope = target + (g->envelope - target) * coeff;
+    return x * g->envelope;
+}
+
 /* ---------------------------------------------------------------------
  * Engine: voice management, randomized recipe, MIDI, per-sample mix.
  * ------------------------------------------------------------------- */

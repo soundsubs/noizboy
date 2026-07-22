@@ -659,6 +659,35 @@ typedef struct {
 void tilt_filter_init(TiltFilter *t, double sampleRate);
 void tilt_filter_process(TiltFilter *t, double *l, double *r, double tiltTarget01, double sampleRate);
 
+/* Noise gate, RE-ADDED per direct report: after v0.16.0 removed the
+ * dedicated gate (on the theory that TILT's own always-present
+ * bandwidth limiting would keep db-cell's forced-always-present Noiz
+ * slot quiet enough when idle -- measured at the time as roughly -55
+ * to -58dB relative to a played note), it turned out to still be
+ * audible in practice. That measurement wasn't wrong, but "quiet"
+ * isn't the same as "silent", and a gate is what actually guarantees
+ * silence.
+ *
+ * Positioned AFTER TILT this time (TILT was applied where the OLD
+ * gate used to sit, before this fix) -- so db-cell's output still
+ * flows through TILT's tone-shaping on its way out, exactly as
+ * originally requested ("it must flow through tone shaping on its way
+ * out"), with the gate now the final stage after that, guaranteeing
+ * true silence rather than TILT trying to do double duty as both an
+ * EQ and a gate. Keyed off actual NOISEBOY voice activity
+ * (noiseboy_any_voice_active), not signal level -- a level-based gate
+ * could still let db-cell's own noise through during a genuinely
+ * quiet-but-still-playing moment, or fail to fully silence a loud
+ * db-cell moment right as the last voice releases. Fast attack (opens
+ * quickly when a note starts) and a slower, smoothed release (avoids
+ * an abrupt click when the last voice stops). */
+typedef struct {
+    double envelope;
+} NoiseboyOutputGate;
+
+void noiseboy_output_gate_init(NoiseboyOutputGate *g);
+double noiseboy_output_gate_process(NoiseboyOutputGate *g, double x, int voicesActive, double sampleRate);
+
 typedef struct {
     /* Set to NOISEBOY_ENGINE_INIT_MAGIC by noiseboy_engine_init, and
      * checked at the START of that same function, BEFORE the
