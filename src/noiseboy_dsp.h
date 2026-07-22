@@ -38,6 +38,7 @@
 #define NOISEBOY_MAX_VOICES 4
 #define NOISEBOY_MAX_LAYERS 3
 #define NOISEBOY_KS_MAX_SAMPLES 2400 /* enough delay-line length for the lowest supported note (~A0, 27.5Hz) at up to 48kHz-ish sample rates, with headroom */
+#define NOISEBOY_LOOP_BUFFER_SIZE 8000 /* per explicit spec: a fixed-size captured buffer, always this length regardless of note, with pitch transposition achieved by reading it back at a variable rate rather than by resizing the buffer itself -- see LoopSource's own comment */
 
 /* ---- New for NOISEBOY ---- */
 
@@ -142,7 +143,7 @@ void vibrato_init(VibratoDelay *v);
  * like vibrato rather than a dramatic pitch wobble. */
 double vibrato_process(VibratoDelay *v, double x, double phase01, double depthSamples);
 
-typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG } LayerType;
+typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG, LAYER_LOOP } LayerType;
 /* FILTER_KORG_HP is intentionally no longer selected by the
  * randomizer (see randomizeCell-equivalent logic in the .c file) --
  * per direct feedback/diagnosis, a highpass filter tuned to the played
@@ -155,22 +156,84 @@ typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG } LayerType;
  * superseded options around for a possible future revert. */
 typedef enum { FILTER_MOOG = 0, FILTER_KORG_LP, FILTER_KORG_HP } FilterKind;
 
+/* Third sound generation method, per explicit request: "a poorly
+ * looped sample" glitch character. A fixed-size buffer (always
+ * NOISEBOY_LOOP_BUFFER_SIZE samples, regardless of note) is captured
+ * ONCE at note-on, filled with raw noise -- then read back
+ * continuously in a loop for the note's duration, at a rate that
+ * transposes with the played note. This is deliberately the same
+ * "fixed buffer, variable read rate" technique a cheap/old sampler
+ * uses for pitch-shifting (nearest-neighbor, not interpolated --
+ * "every other sample would be duplicated" is exactly what this
+ * produces at half rate), which is WHY it sounds like "a poorly
+ * looped sample" rather than a clean pitch shift: nearest-neighbor
+ * resampling has real, audible artifacts, and that's the point here.
+ *
+ * At the reference note (middle C, ~261.63Hz), the buffer plays back
+ * at its natural rate -- one full loop = NOISEBOY_LOOP_BUFFER_SIZE
+ * samples exactly. One octave up, playbackRate=2.0, so the buffer is
+ * read through twice as fast (every other buffer sample skipped) --
+ * one loop = half the samples, i.e. transposes exactly like a sample
+ * player's octave-up would. One octave down, playbackRate=0.5, so the
+ * buffer advances at half speed -- each buffer sample gets read
+ * (duplicated) twice before advancing -- one loop = twice the
+ * samples. Same underlying 8000-sample buffer every time, regardless
+ * of note; only the READ rate through it changes, per the explicit
+ * spec ("the sample [buffer] 8000 samples every time"). */
+typedef struct {
+    double buffer[NOISEBOY_LOOP_BUFFER_SIZE];
+    double readPos;       /* fractional position within buffer, nearest-neighbor read (int truncation) each sample */
+    double playbackRate;  /* freqHz / referenceFreq, set once at note-on */
+} LoopSource;
+
+/* Captures the buffer once (raw noise), per LoopSource's own comment.
+ * Called once at note-on, analogous to karplus_pluck's one-time
+ * excitation. */
+void loop_capture(LoopSource *lp, unsigned int *rngState, NoiseColour colour, double freqHz, double referenceFreqHz);
+/* Reads back one sample per call at the rate set by loop_capture,
+ * nearest-neighbor (nothing interpolated -- the artifacts ARE the
+ * point, see LoopSource's own comment). */
+double loop_process(LoopSource *lp);
+
 typedef struct {
     LayerType type;
 
-    /* Filtered-noise layer state -- raw source generation only now.
-     * The per-layer filter (Moog/Korg35LP/Korg35HP switch,
-     * resonance-per-layer, the pre-filter PitchedHold stage) has been
-     * REMOVED per explicit restructuring request: source generation
-     * (noise/Karplus) -> bitcrush/rate-reduce -> a single VOICE-LEVEL
-     * pitch-tracking filter -> envelope -> output filter, not a filter
-     * per layer before mixing. See Voice's own pitchFilter* fields for
-     * where that single filter now lives. */
+    /* Filtered-noise layer state -- raw source generation only, plus
+     * (below) a small release-only darkening stage. The per-layer
+     * FILTER (Moog/Korg35LP/Korg35HP switch, resonance-per-layer, the
+     * pre-filter PitchedHold stage) was REMOVED per explicit
+     * restructuring request: source generation (noise/Karplus) ->
+     * bitcrush/rate-reduce -> a single VOICE-LEVEL pitch-tracking
+     * filter -> envelope -> output filter, not a filter per layer
+     * before mixing. See Voice's own pitchFilter* fields for where
+     * that single filter now lives. */
     NoiseGen noiseGen;
     NoiseColour colour;
 
+    /* Release-only darkening, per direct feedback: "Karplus sounds
+     * very plucked because of its nature [the string's own natural
+     * damping darkens it as it decays]... noise does not sound
+     * plucked on releases" -- filtered-noise layers have no equivalent
+     * mechanism, since their timbre never evolves, only their shared
+     * envelope's volume. This is a simple one-pole lowpass (same
+     * leaky-integrator technique NOISE_RED already uses elsewhere in
+     * this project) applied to the RAW noise source, progressively
+     * engaging only during release. Deliberately placed BEFORE the
+     * voice-level pitch-tracking filter (in signal flow, not in this
+     * struct), not instead of it or coupled to its cutoff -- darkening
+     * the SOURCE feeding a filter is not the same as modulating the
+     * filter's own cutoff, and doesn't move the pitch-defining
+     * resonant peak at all (unlike the earlier, reverted attempt to
+     * tie the pitch filter's own cutoff to envelope, which caused a
+     * real, reported pitch-decay bug). */
+    double releaseDarkenState;
+
     /* Karplus-Strong layer state. */
     KarplusString karplus;
+
+    /* Loop layer state (third sound generation method) -- see
+     * LoopSource's own comment. */
+    LoopSource loop;
 
     /* Small per-layer detune (in cents), still used for Karplus-type
      * layers' own pitch (each Karplus layer's delay length is tuned

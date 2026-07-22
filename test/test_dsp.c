@@ -47,7 +47,7 @@ int main(void) {
 
         printf("seed %u: %d layer(s), types:", seed, e.numRecipeLayers);
         for (int i = 0; i < e.numRecipeLayers; i++) {
-            printf(" %s", e.recipe[i].type == LAYER_FILTERED_NOISE ? "filt" : "karp");
+            printf(" %s", e.recipe[i].type == LAYER_FILTERED_NOISE ? "filt" : e.recipe[i].type == LAYER_KARPLUS_STRONG ? "karp" : "loop");
         }
         printf("\n");
 

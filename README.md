@@ -11,32 +11,51 @@ set, so sharing filter/noise character with it is deliberate.
 
 Every time the module is instantiated, it randomizes a "recipe" of
 1-3 layers (fixed for that load, not re-randomized per note). Each
-layer is independently either:
+layer is independently one of three sound generation methods:
 
-- **Filtered noise**: a noise generator (random colour: white/pink/
-  red).
-- **Karplus-Strong**: a noise-excited, damped delay line -- the
-  classic plucked-string algorithm -- whose delay length itself
+- **Filtered noise** (~60% chance per layer): a noise generator
+  (random colour: white/pink/red). During release, the raw source
+  itself darkens naturally (a gentle lowpass that engages only as the
+  note decays) -- the same kind of timbral evolution a real plucked
+  or struck source has, which a constant-timbre noise source
+  otherwise lacks.
+- **Karplus-Strong** (~25% chance): a noise-excited, damped delay line
+  -- the classic plucked-string algorithm -- whose delay length itself
   defines the pitch.
+- **Loop** (~15% chance): a third method, deliberately lo-fi -- "a
+  poorly looped sample which you can hear repeating." A fixed 8000-
+  sample buffer of raw noise is captured once at note-on and read back
+  continuously via nearest-neighbor resampling (not interpolated --
+  the artifacts are the point) at a rate that transposes with the
+  played note, the same way a cheap/old sampler pitch-shifts a fixed
+  sample. At middle C the loop repeats every 8000 samples; an octave
+  up, every 4000 (read twice as fast); an octave down, every 16000
+  (each buffer sample read twice in a row).
 
 Per voice, the layers mix together first (raw, unfiltered), then pass
-through a single, shared, voice-level pitch-tracking filter (randomly
-Moog Ladder or Korg35LP, high resonance, tuned to the played note),
-then the amplitude envelope, then a final output filter (velocity-
-brightened, knob-8-controlled, zero resonance). See "Signal chain"
-below for the exact order.
+through a single, shared, voice-level pitch-tracking filter (Moog
+Ladder, high resonance -- see "Status" for why this is no longer
+randomized against Korg35LP -- tuned to the played note, with
+frequency-dependent resonance compensation so it reads more evenly
+across the keyboard), then the amplitude envelope, then a final
+output filter (velocity-brightened, knob-8-controlled, zero
+resonance). See "Signal chain" below for the exact order.
 
-Playing is polyphonic (up to 8 voices), gated by key press -- a note
-produces sound only while held (with a short knob-controlled attack/
-release to avoid clicks, not a sustained pad envelope).
+Playing is polyphonic (currently 4 voices -- see "Status", a
+diagnostic reduction from the original 8 while a real Move CPU
+ceiling gets confirmed), gated by key press -- a note produces sound
+only while held (with a short knob-controlled attack/release to avoid
+clicks, not a sustained pad envelope).
 
 ## Signal chain
 
-1. Sources -- up to 3 noise/Karplus layers, mixed together (raw, no
-   per-layer filtering).
+1. Sources -- up to 3 noise/Karplus/Loop layers, mixed together (raw,
+   no per-layer filtering). Filtered-noise layers darken on their own
+   during release, at this stage, before anything else touches them.
 2. Voice-level pitch-tracking filter -- high resonance, tracks the
    played note directly (knobs 1-2), no envelope or velocity
-   influence.
+   influence, frequency-compensated for more even resonance across
+   the keyboard.
 3. Amplitude modulation (tremolo) + wavefolder, both knob 3/4
    controlled and linked to the same cycle.
 4. Amplitude envelope (attack/release, knobs 5-6).
@@ -66,6 +85,74 @@ amounts and ultimately removed entirely, per direct feedback -- see
 
 ## Status
 
+**v0.14.0** -- three substantial changes from one focused investigation
+session, each verified with a dedicated test, not just implemented and
+hoped for.
+
+**1. Resonance evenness ("some notes more resonant than notes around
+it").** Two distinct causes found and fixed:
+- The dominant one: filter type (Moog Ladder / Korg35LP) was
+  randomized fresh per note. Measured directly (impulse response):
+  Korg35LP's actual resonant peak was up to ~79x weaker than Moog's at
+  the same knob value -- adjacent notes landing on different filter
+  types produced wildly inconsistent resonance, exactly the reported
+  symptom. Investigated fixing Korg35LP's own calibration first, but a
+  coefficient sweep showed genuinely non-monotonic behaviour (higher
+  resonance sometimes producing LOWER peak gain) -- evidence the
+  compensation formula's whole shape, borrowed from Moog's 4-pole
+  derivation, may be wrong for a 2-pole loop, not something to
+  re-derive correctly under time pressure. Fixed by always using Moog
+  Ladder now, removing the inconsistency at its source.
+- The secondary one: even Moog alone varies substantially with cutoff
+  frequency for a fixed resonance knob (0.28 measured peak at the
+  bottom of the playable range vs. 0.94 at the top). Added a
+  frequency-dependent compensation boost for lower notes, capped at a
+  MEASURED, genuine physical ceiling -- resonance stops helping (and
+  very slightly reverses) past roughly 2x the knob value at the
+  lowest notes, a real property of this filter topology at low
+  cutoff-to-sample-rate ratios, not a made-up safety margin. Narrows
+  the measured spread from ~3.4x to ~2.1x -- real, verified
+  improvement, honestly not perfectly flat given that hard ceiling.
+
+**2. LOOP -- a third sound generation method**, per explicit spec: "a
+poorly looped sample which you can hear repeating." A fixed 8000-
+sample buffer of raw noise, captured once at note-on, read back via
+nearest-neighbor resampling (deliberately not interpolated -- the
+artifacts are the entire point) at a rate that transposes with the
+played note, exactly like a cheap/old sampler pitch-shifting a fixed
+sample. Verified directly against the explicit spec: loop period is
+exactly 8000 samples at middle C, 4000 at one octave up (buffer read
+twice as fast), 16000 at one octave down (each buffer sample read
+twice in a row -- confirmed 10 of 20 consecutive samples duplicated,
+matching "every other sample duplicated" precisely). Added at 15% in
+the recipe randomizer alongside the existing two methods (now ~60%
+filtered-noise / ~25% Karplus / ~15% Loop). Full pipeline tested
+across 500 seeds with zero silent voices.
+
+**3. Natural release character for noise layers**, per direct
+feedback that Karplus "sounds very plucked... because of its nature"
+while noise "does not sound plucked on releases." Verified first that
+the envelope math itself was already unconditionally exponential, no
+linear branch anywhere -- the real explanation: Karplus's own string
+damping darkens its TIMBRE as it decays, on top of the shared volume
+envelope, which noise layers have no equivalent of. Fixed by
+darkening the RAW noise source (a one-pole lowpass, the same leaky-
+integrator technique this project already uses for its red/brown
+noise colour) progressively during release only. Deliberately applied
+to the source, BEFORE the pitch-tracking filter, rather than by
+touching that filter's own cutoff -- specifically to avoid
+reintroducing the earlier, reverted "pitch tied to envelope" bug.
+Verified directly, not just reasoned about: pitch drift during release
+measured at only 0.8%, confirming the earlier bug's mechanism was not
+reintroduced, while the darkening direction was independently
+confirmed too.
+
+Six new permanent tests added this round (`make test-resonance`,
+`test-loop`, `test-darken`, plus the earlier `test-steal`/
+`test-staccato`/`test-tilt`/etc. from prior sessions), all part of the
+default `make test`. Full 13-suite run, including the 24,000-
+combination sweep, passes clean.
+
 **v0.13.1 -- DIAGNOSTIC BUILD, not a committed change.** Polyphony
 reduced from 8 to 4 voices, per direct request, to test whether
 "still glitching above Release of 7" (after v0.13.0's voice-stealing
@@ -83,7 +170,13 @@ at DSP logic still to be found.
 
 Purely a one-line constant change (`NOISEBOY_MAX_VOICES`, 8 -> 4) --
 nothing else touched. Full test suite re-run clean at this reduced
-count, including the 24,000-combination sweep.
+count, including the 24,000-combination sweep. CONFIRMED via direct
+testing on real hardware: reducing to 4 voices eliminated the
+glitching entirely -- this really was a CPU ceiling, not remaining
+DSP logic. Still running at 4 voices as of v0.14.0 while a genuine
+optimization pass (to reclaim more polyphony) remains a separate,
+future decision rather than something rushed alongside this round's
+three unrelated feature/bugfix requests.
 
 **v0.13.0** -- fixed clicking/glitching with longer release times, per
 direct report ("with release longer than 7, it starts to click and

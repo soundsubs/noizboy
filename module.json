@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOISEBOY",
-    "version": "0.13.1",
+    "version": "0.14.0",
     "abbrev": "NOIZB",
-    "description": "DIAGNOSTIC BUILD -- polyphony reduced 8 to 4 to test whether release-time glitching is a CPU limitation. Not a committed permanent change. Chromatically-pitched noise + filter / Karplus-Strong instrument.",
+    "description": "Chromatically-pitched noise + filter / Karplus-Strong + LOOP (a new 'poorly looped sample' sound generation method). Resonance now much more even across the keyboard. Noise layers darken naturally on release, like a real pluck. DIAGNOSTIC: polyphony still 4, testing a real Move CPU ceiling.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",

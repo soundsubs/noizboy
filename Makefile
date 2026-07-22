@@ -2,9 +2,9 @@ CC ?= cc
 CFLAGS = -O2 -Wall -Wextra -std=c11
 LDFLAGS = -lm
 
-.PHONY: test test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo test-steal test-staccato clean
+.PHONY: test test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo test-steal test-staccato test-resonance test-loop test-darken clean
 
-test: test_dsp test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo test-steal test-staccato
+test: test_dsp test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo test-steal test-staccato test-resonance test-loop test-darken
 	./test_dsp
 
 test-dbcell: test_dbcell
@@ -33,6 +33,15 @@ test-steal: test_voice_steal
 
 test-staccato: test_staccato_steal
 	./test_staccato_steal
+
+test-resonance: test_resonance_evenness
+	./test_resonance_evenness
+
+test-loop: test_loop_layer
+	./test_loop_layer
+
+test-darken: test_release_darken
+	./test_release_darken
 
 test_dsp: src/distroy_dsp.c src/noiseboy_dsp.c test/test_dsp.c
 	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_dsp.c -o test_dsp $(LDFLAGS)
@@ -64,5 +73,14 @@ test_voice_steal: src/distroy_dsp.c src/noiseboy_dsp.c test/test_voice_steal.c
 test_staccato_steal: src/distroy_dsp.c src/noiseboy_dsp.c test/test_staccato_steal.c
 	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_staccato_steal.c -o test_staccato_steal $(LDFLAGS)
 
+test_resonance_evenness: src/distroy_dsp.c src/noiseboy_dsp.c test/test_resonance_evenness.c
+	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_resonance_evenness.c -o test_resonance_evenness $(LDFLAGS)
+
+test_loop_layer: src/distroy_dsp.c src/noiseboy_dsp.c test/test_loop_layer.c
+	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_loop_layer.c -o test_loop_layer $(LDFLAGS)
+
+test_release_darken: src/distroy_dsp.c src/noiseboy_dsp.c test/test_release_darken.c
+	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_release_darken.c -o test_release_darken $(LDFLAGS)
+
 clean:
-	rm -f test_dsp test_dbcell test_new_stages test_karplus_sustain test_comprehensive_sweep test_tilt_filter test_zipper test_stereo_pan test_voice_steal test_staccato_steal *.o dsp.so
+	rm -f test_dsp test_dbcell test_new_stages test_karplus_sustain test_comprehensive_sweep test_tilt_filter test_zipper test_stereo_pan test_voice_steal test_staccato_steal test_resonance_evenness test_loop_layer test_release_darken *.o dsp.so

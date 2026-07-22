@@ -89,6 +89,33 @@ double karplus_process(KarplusString *k, double sustainFeedSample, double sustai
     return cur;
 }
 
+void loop_capture(LoopSource *lp, unsigned int *rngState, NoiseColour colour, double freqHz, double referenceFreqHz) {
+    NoiseGen ng;
+    noisegen_init(&ng, xorshift_next(rngState));
+    for (int i = 0; i < NOISEBOY_LOOP_BUFFER_SIZE; i++) {
+        lp->buffer[i] = noisegen_process(&ng, colour);
+    }
+    lp->readPos = 0.0;
+    lp->playbackRate = freqHz / referenceFreqHz;
+}
+
+double loop_process(LoopSource *lp) {
+    /* Nearest-neighbor read (plain int truncation, no interpolation)
+     * -- this is deliberate, see LoopSource's own comment on why the
+     * artifacts from this cheap technique ARE the intended "poorly
+     * looped sample" character, not a flaw to smooth over. */
+    int idx = (int)lp->readPos;
+    if (idx >= NOISEBOY_LOOP_BUFFER_SIZE) idx = idx % NOISEBOY_LOOP_BUFFER_SIZE;
+    double sample = lp->buffer[idx];
+
+    lp->readPos += lp->playbackRate;
+    if (lp->readPos >= (double)NOISEBOY_LOOP_BUFFER_SIZE) {
+        lp->readPos -= (double)NOISEBOY_LOOP_BUFFER_SIZE * floor(lp->readPos / (double)NOISEBOY_LOOP_BUFFER_SIZE);
+    }
+    return sample;
+}
+
+
 /* ---------------------------------------------------------------------
  * New for NOISEBOY: sample-and-hold pitched noise stage.
  * ------------------------------------------------------------------- */
@@ -291,8 +318,18 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
          * appearing compounds across layers (50% at 1 layer, 75% at 2,
          * 87.5% at 3 -- averaging ~71% overall, which matches the
          * complaint). 25% per-layer brings that average down to ~42%,
-         * a genuinely "sometimes" rate rather than "usually". */
-        r->type = (rand01(&e->rngState) < 0.25) ? LAYER_KARPLUS_STRONG : LAYER_FILTERED_NOISE;
+         * a genuinely "sometimes" rate rather than "usually".
+         *
+         * LAYER_LOOP added as a third method per explicit request,
+         * "randomly add" -- kept as a smaller slice (15%) than either
+         * existing type, since it's meant as an occasional glitch
+         * character rather than a dominant, expected-every-time one. */
+        {
+            const double typeRoll = rand01(&e->rngState);
+            if (typeRoll < 0.15) r->type = LAYER_LOOP;
+            else if (typeRoll < 0.15 + 0.25) r->type = LAYER_KARPLUS_STRONG;
+            else r->type = LAYER_FILTERED_NOISE;
+        }
 
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
@@ -347,13 +384,32 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     korg35hp_init(&v->outputHighpassL, e->sampleRate);
     korg35hp_init(&v->outputHighpassR, e->sampleRate);
 
-    /* Voice-level pitch-tracking filter -- randomized fresh per note
-     * (Moog/Korg35LP, 50/50; Korg35HP deliberately excluded, same
-     * reasoning as before: a highpass tuned to the played pitch works
-     * against sounding pitched, not for it), matching this project's
-     * established per-note variety pattern now that filter choice is
-     * no longer part of the fixed recipe. */
-    v->pitchFilterKind = (rand01(&e->rngState) < 0.5) ? FILTER_MOOG : FILTER_KORG_LP;
+    /* Voice-level pitch-tracking filter -- per direct investigation
+     * request, no longer randomized between Moog/Korg35LP. Measured
+     * directly (impulse response, matched cutoff/resonance settings):
+     * at the SAME resonance knob value, Korg35LP's actual resonant
+     * peak gain was up to ~79x weaker than Moog Ladder's (0.0094 vs.
+     * 0.7434 at middle C, resonance01=0.82) -- since filter type was
+     * randomized fresh per note, adjacent notes could land on either
+     * filter and produce wildly different, unpredictable resonance
+     * character, which is exactly the reported "some notes more
+     * resonant than notes around it" symptom. Investigated fixing
+     * Korg35LP's own resonance calibration directly (it's a 2-pole
+     * design borrowing a compensation formula shape derived for Moog's
+     * 4-pole topology, scaled by a smaller constant -- 2.6 vs 3.5) but
+     * a coefficient sweep showed genuinely counterintuitive, non-
+     * monotonic behaviour (higher coefficient often producing LOWER
+     * peak gain) suggesting the formula's whole SHAPE, not just its
+     * scale, may be wrong for a 2-pole loop -- correctly re-deriving
+     * that from scratch is real DSP-theory work, not something to
+     * rush under time pressure for a single knob's calibration.
+     * Simplest, most reliable fix: stop choosing between two filters
+     * with such different and unpredictable resonance response.
+     * Always Moog now -- still randomized nothing else about it, keeps
+     * the filter's own state (below) rather than removing the whole
+     * dual-filter mechanism, in case Korg35LP's calibration gets
+     * properly fixed later. */
+    v->pitchFilterKind = FILTER_MOOG;
     moog_ladder_init(&v->pitchFilterMoogL, e->sampleRate);
     moog_ladder_init(&v->pitchFilterMoogR, e->sampleRate);
     korg35lp_init(&v->pitchFilterKorgLpL, e->sampleRate);
@@ -375,6 +431,18 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
              * no per-layer PitchedHold. See Layer's own header comment
              * for the full restructuring rationale. */
             noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
+            layer->releaseDarkenState = 0.0; /* starts fully bright/unfiltered -- see releaseDarkenState's own comment */
+        } else if (layer->type == LAYER_LOOP) {
+            /* Third sound generation method -- see LoopSource's own
+             * comment. Reference frequency is middle C (MIDI 60), per
+             * explicit spec's own example ("if middle C was 8000
+             * samples..."). detuneMul intentionally NOT applied here --
+             * this layer's pitch transposition comes entirely from the
+             * loop's own playback rate mechanism, not the same
+             * cents-based detune the other layer types use, since that
+             * would double up two different transposition mechanisms
+             * on the same layer. */
+            loop_capture(&layer->loop, &e->rngState, layer->colour, v->freqHz, midi_note_to_freq(60));
         } else {
             karplus_init(&layer->karplus);
             layer->sustainAmountSmoothed = 0.0; /* starts at 0, smooths up toward the held target -- symmetric with how it smooths down at release */
@@ -496,7 +564,27 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
         return karplus_process(&layer->karplus, sustainFeed, layer->sustainAmountSmoothed);
     }
 
-    return noisegen_process(&layer->noiseGen, layer->colour);
+    if (layer->type == LAYER_LOOP) {
+        return loop_process(&layer->loop);
+    }
+
+    double raw = noisegen_process(&layer->noiseGen, layer->colour);
+
+    /* Release-only darkening -- see releaseDarkenState's own header
+     * comment. envNorm normalized the same way as elsewhere in this
+     * project (envLevel's own range is 0..velocity01, not 0..1).
+     * darkenAmount stays exactly 0 while held (gateOpen=1) -- this
+     * ONLY engages during release, per the explicit "does not sound
+     * plucked on RELEASES" framing -- and naturally starts near 0 at
+     * the instant release begins (envNorm is still close to 1 right
+     * then), growing toward full darkening as the note decays, so no
+     * separate smoothing is needed to avoid a jump at the release
+     * boundary. */
+    const double envNorm = (v->velocity01 > 0.001) ? clampd(v->envLevel / v->velocity01, 0.0, 1.0) : 0.0;
+    const double darkenAmount = (!v->gateOpen) ? (1.0 - envNorm) : 0.0;
+    const double leakCoeff = darkenAmount * 0.98; /* 0 = fully bright/unfiltered passthrough, 0.98 = same darkness NOISE_RED uses elsewhere in this project */
+    layer->releaseDarkenState = layer->releaseDarkenState * leakCoeff + raw * (1.0 - leakCoeff);
+    return layer->releaseDarkenState;
 }
 
 /* Equal-power pan law -- panPos in [-1,1] (-1=full left, 0=centre,
@@ -663,11 +751,34 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * (this project's own zero-crossing test ratio dropped from
          * ~3.5x to ~1.5x, further from the true 16x for a 4-octave
          * span), a confirmed regression for a speculative, unconfirmed
-         * benefit. Left at the original 0.2. */
+         * benefit. Left at the original 0.2.
+         *
+         * Resonance compensation added per direct investigation
+         * request ("some notes too resonant, more than notes around
+         * it"). Measured directly (impulse response, same resonance01
+         * across notes): at a fixed knob value, this filter's actual
+         * resonant peak varies from ~0.28 at the bottom of the
+         * playable range up to ~0.94 at the top -- a real, substantial
+         * unevenness even before the filter-type randomization issue
+         * (see pitchFilterKind's own comment, the larger contributor,
+         * already fixed above). Boosts resonance for notes below
+         * 1000Hz (0.5 per octave below that point, empirically chosen
+         * -- not a closed-form derivation), capped at 2.0x knob value.
+         * That cap is a measured, genuine physical ceiling, not an
+         * arbitrary safety margin: at the lowest notes, peak gain
+         * plateaus (and very slightly REVERSES) above roughly
+         * resonance01=2.0 regardless of how much further resonance is
+         * pushed -- a real limitation of this filter topology at very
+         * low cutoff-to-sample-rate ratios, not something a better
+         * compensation curve alone can fix. Narrows the measured
+         * unevenness from ~3.4x (0.28 to 0.94) down to ~2.1x (0.44 to
+         * 0.94) -- a real, substantial improvement, though not
+         * perfectly flat given that hard ceiling. */
         {
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
             const double pitchCutoff = clampd(v->freqHz * cutoffMul, 20.0, e->sampleRate * 0.45);
-            const double pitchResonance = e->params.filterResonance01;
+            const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
+            const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul, 2.0);
             if (v->pitchFilterKind == FILTER_MOOG) {
                 moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
                 moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);
