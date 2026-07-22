@@ -1,5 +1,5 @@
 /*
- * NOISEBOY Shadow UI -- single-press Randomize.
+ * NOIZBOY Shadow UI -- single-press Randomize.
  *
  * REWRITTEN from a v0.4.0 draft that never actually loaded. That
  * draft guessed relative import paths ('../../shared/menu_items.mjs')
@@ -44,7 +44,7 @@ function doRandomize() {
 
 function drawUI() {
     clear_screen();
-    print(2, 2, "NOISEBOY", 1);
+    print(2, 2, "NOIZBOY", 1);
     fill_rect(0, 12, SCREEN_WIDTH, 1, 1);
 
     print(2, 24, "Jog click:", 1);

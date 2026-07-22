@@ -29,29 +29,45 @@ int main(void) {
     }
     printf("Pending steal for note 72 found: %d, pendingNoteReleased flag set: %d\n", foundPending, pendingReleasedSet);
 
-    /* Process forward until the deferred steal actually completes, then
-       confirm the voice enters release (gateOpen=0) right away instead
-       of sustaining, and eventually goes fully silent within a
-       reasonable time -- not stuck sustaining forever. */
-    int becameActive72 = 0, wasGateOpenWhenStarted = -1;
-    for (int i = 0; i < 8000; i++) {
+    /* Process forward until the deferred steal actually completes.
+     * Per a real bug found and fixed here: the ORIGINAL fix for the
+     * staccato case set gateOpen=0 immediately when the voice started,
+     * in the SAME sample voice_start ran -- before the envelope had
+     * computed even once with gateOpen=1. Since gateOpen IS the
+     * envelope's attack target, envLevel never rose above 0 at all;
+     * the note was completely, silently dropped, not just released
+     * early -- exactly what a fast, short pad tap under voice-stealing
+     * load would trigger every time. The fix gives the voice a brief,
+     * fixed minimum hold (~5ms) so its attack genuinely gets a chance
+     * to rise and be audible first. This test now verifies the
+     * property that actually matters -- the note becomes genuinely
+     * audible (envLevel rises meaningfully above 0) -- rather than
+     * asserting on gateOpen's exact value at the instant voice_start
+     * ran, which was the source of the original bug. */
+    int becameActive72 = 0;
+    double peakEnvLevel = 0.0;
+    int eventuallyReleased = 0;
+    for (int i = 0; i < 12000; i++) {
         double l, r;
         noiseboy_process_stereo(&e, &l, &r);
         if (isnan(l) || isnan(r)) { printf("FAILED: non-finite\n"); return 1; }
         for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-            if (e.voices[v].active && e.voices[v].midiNote == 72 && !becameActive72) {
+            if (e.voices[v].active && e.voices[v].midiNote == 72) {
                 becameActive72 = 1;
-                wasGateOpenWhenStarted = e.voices[v].gateOpen;
-                printf("Note 72 started at sample %d, gateOpen=%d (should be 0 -- already released)\n", i, wasGateOpenWhenStarted);
+                if (e.voices[v].envLevel > peakEnvLevel) peakEnvLevel = e.voices[v].envLevel;
+                if (!e.voices[v].gateOpen) eventuallyReleased = 1;
             }
         }
     }
+    printf("Note 72: became active=%d, peak envLevel=%.4f, eventually released=%d\n",
+           becameActive72, peakEnvLevel, eventuallyReleased);
 
     int all_ok = 1;
     if (!foundPending) { printf("FAILED: pending steal not found\n"); all_ok = 0; }
     if (!pendingReleasedSet) { printf("FAILED: pendingNoteReleased was not set after early note-off\n"); all_ok = 0; }
     if (!becameActive72) { printf("FAILED: note 72 never started within test window\n"); all_ok = 0; }
-    if (wasGateOpenWhenStarted != 0) { printf("FAILED: note 72 should have started already in release (gateOpen=0), not sustained\n"); all_ok = 0; }
+    if (peakEnvLevel < 0.1) { printf("FAILED: note should have been genuinely audible (envLevel should rise meaningfully), not silently skipped\n"); all_ok = 0; }
+    if (!eventuallyReleased) { printf("FAILED: note should still transition to release eventually, not sustain forever\n"); all_ok = 0; }
 
     printf(all_ok ? "\nALL STACCATO-STEAL CHECKS PASSED\n" : "\nSOME STACCATO-STEAL CHECKS FAILED\n");
     return all_ok ? 0 : 1;

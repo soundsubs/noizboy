@@ -306,8 +306,22 @@ typedef struct {
      * pending note would sustain in full once it eventually starts,
      * even though the player had already released it. Checked once
      * voice_start actually runs for the pending note -- if set, it
-     * immediately goes into release instead of sustain. */
+     * immediately goes into release instead of sustain.
+     *
+     * REAL BUG FIXED HERE, found while investigating a related report
+     * ("fast playing... only triggers every other note"): the ORIGINAL
+     * fix for this immediately set gateOpen=0 in the very same sample
+     * voice_start ran, before the envelope had computed even once with
+     * gateOpen=1. Since the attack target IS gateOpen's value, envLevel
+     * never rose above 0 at all -- the note was completely, silently
+     * dropped, not just released early. This is exactly what a fast,
+     * short pad tap under voice-stealing load would trigger every
+     * time. minHoldSamplesRemaining fixes this: keeps the voice
+     * genuinely held for a brief, fixed window so its attack envelope
+     * gets a real chance to rise (and be audible) before release is
+     * actually applied, rather than skipping the attack entirely. */
     int pendingNoteReleased;
+    int minHoldSamplesRemaining;
 
     /* Per-voice amplitude modulation phase -- each voice runs its own
      * AM phase (not perfectly in sync with other voices), which reads
@@ -439,6 +453,39 @@ typedef struct {
      * LayerRecipe's comment. */
     LayerRecipe recipe[NOISEBOY_MAX_LAYERS];
     int numRecipeLayers;
+
+    /* Recipe-level timbre character, per direct report ("much less
+     * randomness to the Randomize" after last session's resonance-
+     * evenness fix). That fix removed real variety from two places:
+     * filter type is no longer randomized (always Moog now, was 50/50
+     * against Korg35LP, whose own resonance formula measured up to
+     * 79x weaker at the same knob value -- too broken and risky to
+     * re-calibrate quickly, see the pitch-tracking filter's own
+     * comment), and the new frequency compensation curve actively
+     * narrows how different notes' resonance peaks can be from each
+     * other. This restores SOME of that lost distinctiveness.
+     *
+     * Applied to the pitch-tracking filter's CUTOFF, not resonance --
+     * an earlier version of this fix varied resonance instead, which
+     * seemed reasonable but turned out not to work reliably: measured
+     * directly, resonance at this stage in the chain typically already
+     * sits on the FLAT TOP of this filter's own peak-gain curve (an
+     * initial +-20% multiplier there moved measured output by under
+     * 1%), and worse, that curve was measured with impulse excitation,
+     * while the real signal chain feeds this filter continuous noise
+     * -- under continuous excitation the resonance-vs-output
+     * relationship behaves differently again, and a careful isolated
+     * comparison (same seed/recipe, only the multiplier different)
+     * confirmed under 1% actual difference in practice. Cutoff, by
+     * contrast, measured a clean, reliable, monotonic ~21% RMS range
+     * under the SAME continuous-noise-excitation test -- a far more
+     * dependable lever. Bounded to +-15% (narrower than the range
+     * actually tested) specifically because cutoff is this filter's
+     * PITCH-tracking parameter -- wide enough to read as a genuine
+     * brightness difference between "instruments", conservative enough
+     * to not noticeably detune the instrument the way a wider swing
+     * risked doing. */
+    double timbreCharacterMul;
 
     /* Tracks the previous value of the "randomize" trigger param so
      * set_param can detect a rising edge (0 -> nonzero) and re-roll

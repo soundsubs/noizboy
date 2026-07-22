@@ -1,4 +1,4 @@
-# NOISEBOY
+# NOIZBOY
 
 A chromatically-pitched noise + filter / Karplus-Strong instrument for
 Schwung on Ableton Move. Strips DISTROY down to just its noise
@@ -76,7 +76,7 @@ amounts and ultimately removed entirely, per direct feedback -- see
 | 3 | AM Depth | amplitude modulation depth, 0 = off (default) |
 | 4 | AM Rate | amplitude modulation rate, 0.1-20 Hz |
 | 5 | Attack | envelope attack time, 0.5-200 ms |
-| 6 | Release | envelope release time, 5-2000 ms |
+| 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain |
 | 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise layers pan to fixed positions (reusing each layer's own pitch-spread randomization); Karplus layers auto-pan back and forth at the AM rate instead |
 | 8 | Output Filt | TILT filter, the last stage before output. Centre (64) = fully bypassed. Turn left: lowpass sweeps down (20kHz to 20Hz), silencing from the top. Turn right: highpass sweeps up (20Hz to 20kHz), silencing from the bottom. Makes the sound disappear in either direction |
 | 9 | Drive | single shared drive/saturation stage on the final mix -- beyond the 8 physical knobs, reachable via the module's parameter menu |
@@ -84,6 +84,95 @@ amounts and ultimately removed entirely, per direct feedback -- see
 | 11 | Level | master output level -- moved off knob 8 to make room for Output Filt; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.15.0** -- naming fix plus three substantial investigations, each
+with a real bug found and fixed, not just guessed at.
+
+**Naming**: fixed the display name shown on the Move (was "NOISEBOY",
+should always have been "NOIZBOY" -- the repo, folder, and even this
+module's own `abbrev` field ("NOIZB") already used this naming; only
+the main display string never matched). Fixed in `module.json`'s
+`name` field, the on-screen text in `ui.js`, and a fallback menu title
+embedded in the plugin's own JSON.
+
+**1. Karplus latency / "only triggers every other note" when playing
+fast.** Two distinct, compounding bugs found and fixed:
+- The voice-stealing selection logic never excluded voices that
+  already had a deferred steal queued (from the previous session's
+  click fix). A voice waiting to play a queued note has rapidly-
+  decaying `envLevel` from its forced fast release, which made it
+  look like the BEST candidate to the very next note-on -- getting
+  picked again and silently overwriting the note already waiting.
+  Confirmed directly: notes could be dropped entirely, survivors
+  showed 100+ms latency.
+- A second, worse bug found while fixing the first: the existing
+  handling for "note released before its deferred steal even
+  completed" set `gateOpen=0` in the SAME sample the voice started --
+  before the envelope had computed even once with `gateOpen=1`. Since
+  gateOpen IS the attack target, envLevel never rose above 0 at all --
+  completely, silently dropped, not just cut short. Exactly what fast
+  pad-tapping under voice-stealing load would trigger constantly.
+  Fixed with a brief (~5ms) guaranteed minimum hold so the attack
+  genuinely gets a chance to be audible.
+
+Also sped up deferred-steal resolution itself from ~114ms to ~13ms
+(the original time constant needed far more time to reach its
+threshold than intended), re-verified still click-free via the
+existing baseline-relative test. Stress-tested at 25ms note spacing,
+10ms hold times: zero drops, ~12.5ms max latency (down from notes
+being lost entirely).
+
+**2. Reduced Randomize variety.** Traced to the previous session's own
+resonance-evenness fix (removing filter-type randomization, adding a
+resonance compensation curve) -- both real, deliberate trade-offs at
+the time, but with a real side effect on variety. This one took real
+investigation to actually fix, not just implement: an initial attempt
+(varying resonance +-20%) measured under 1% actual difference, because
+that parameter sits on the flat top of this filter's own response
+curve at typical operating points -- and worse, the FIRST verification
+of that attempt was itself misleading (used impulse excitation, not
+the continuous noise the real engine feeds this filter). Pivoted to
+varying cutoff instead, which tested far more reliably in isolation
+(~21% RMS range) -- but wiring it into the real engine, the measured
+difference STILL dropped to under 1%. Root cause: the always-on tape
+saturation stage runs a compressor on the entire final mix, which
+normalizes overall loudness by design and specifically defeats any
+amplitude-based variation, no matter where upstream it originates.
+The fix wasn't the parameter -- it was recognizing that loudness
+itself is the wrong thing to vary here. Cutoff shifts SPECTRAL
+character (brightness), which survives that compression completely
+intact even though overall RMS gets normalized away. Verified with
+zero-crossing rate (a frequency-content proxy, not an amplitude one):
+35.1% measured difference between the low and high ends of the new
+`timbreCharacterMul` range (+-15%, bounded well short of the original
+79x Moog/Korg35LP inconsistency this is deliberately not trying to
+recreate).
+
+**3. Release envelope "not plucky enough" on noise, only 128 knob
+values.** The envelope's own decay curve was already unconditionally
+exponential (verified directly, no linear branch anywhere) -- the
+actual issue was the KNOB-TO-MILLISECONDS mapping being linear across
+a huge range (5-2000ms) with only 128 discrete MIDI steps to cover it.
+Most of those steps were spent on the long, pad-like end, leaving very
+few, coarse steps for the short "plucky" end where fine control
+matters most. Remapped to exponential/log-scale, per explicit spec:
+knob=0 now maps to ~0.02ms (one sample at 48kHz, literally "a single
+sample" as requested), knob=1 to 4000ms (up from 2000ms, for genuine
+room to be "almost hard to hear" at the top). Also had to lower the
+envelope's own hard clamp floor (was 0.5ms, now 0.02ms) -- without
+that, the new mapping's short end would have been silently clamped
+away regardless of how the knob itself was reshaped. Verified: at
+knob=0.02 (just 2-3 raw MIDI steps off minimum), the OLD linear
+mapping was already at 45ms (nowhere near "plucky"); the new mapping
+is still at 0.025ms there -- a concrete demonstration of how much more
+of the knob's range is now usable for short, percussive times.
+
+Five new permanent tests added this round (`make test-fastplay`,
+`test-timbre`, `test-release`, plus updates to the existing staccato
+and darkening tests whose own assertions needed correcting once the
+underlying bugs were actually fixed), all part of the default
+`make test`. Full 18-suite run, including the 24,000-combination
+sweep, passes clean.
 
 **v0.14.0** -- three substantial changes from one focused investigation
 session, each verified with a dedicated test, not just implemented and

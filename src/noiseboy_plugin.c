@@ -169,7 +169,25 @@ static void set_param(void *instance, const char *key, const char *val) {
     } else if (strcmp(key, "attack") == 0) {
         p->attackMs = 0.5 + raw01 * 199.5; /* 0.5-200 ms */
     } else if (strcmp(key, "release") == 0) {
-        p->releaseMs = 5.0 + raw01 * 1995.0; /* 5-2000 ms */
+        /* Exponential (log-scale) mapping, per explicit request:
+         * "the release should be a single sample at [knob] 0, and at
+         * 1 should be pluckier but almost hard to hear... a decaying
+         * exponential curve". The envelope's own decay was ALREADY
+         * exponential (verified directly, no linear branch anywhere
+         * in that code) -- the actual issue was this KNOB-TO-MS
+         * mapping being linear across a huge range (5-2000ms) with
+         * only 128 discrete MIDI steps to cover it. Linear meant most
+         * of those 128 steps were spent on the long, pad-like end of
+         * the range, leaving very few, coarse steps for the short,
+         * "plucky" end where fine control actually matters most.
+         * min lowered to 0.02ms (~1 sample at 48kHz, matching "a
+         * single sample" literally -- see the envelope's own clamp
+         * floor, lowered to match) from the previous 5ms/0.5ms floor.
+         * max raised to 4000ms (up from 2000ms) to give genuine room
+         * for "almost hard to hear" at the top of the knob -- a long
+         * enough exponential tail that most of its energy decays
+         * quickly even though the time constant itself is long. */
+        p->releaseMs = 0.02 * pow(4000.0 / 0.02, raw01);
     } else if (strcmp(key, "detune_spread") == 0) {
         p->detuneSpread01 = raw01;
     } else if (strcmp(key, "output_filter_freq") == 0) {
@@ -210,7 +228,7 @@ static void set_param(void *instance, const char *key, const char *val) {
  * rest of this file applies -- built from that documentation's own
  * example, not confirmed against a real working module. */
 static const char *NOISEBOY_UI_HIERARCHY_JSON =
-    "{\"levels\":{\"root\":{\"name\":\"NOISEBOY\",\"params\":["
+    "{\"levels\":{\"root\":{\"name\":\"NOIZBOY\",\"params\":["
     "{\"key\":\"filter_cutoff\",\"name\":\"Filter Offset\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"am_depth\",\"name\":\"AM Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
@@ -240,7 +258,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     else if (strcmp(key, "am_rate") == 0) val01 = (p->amRateHz - 0.1) / 19.9;
     else if (strcmp(key, "am_depth") == 0) val01 = p->amDepth01;
     else if (strcmp(key, "attack") == 0) val01 = (p->attackMs - 0.5) / 199.5;
-    else if (strcmp(key, "release") == 0) val01 = (p->releaseMs - 5.0) / 1995.0;
+    else if (strcmp(key, "release") == 0) val01 = log(p->releaseMs / 0.02) / log(4000.0 / 0.02);
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;
     else if (strcmp(key, "output_filter_freq") == 0) val01 = p->outputFilterFreq01;
     else if (strcmp(key, "master_level") == 0) val01 = p->masterLevel01;

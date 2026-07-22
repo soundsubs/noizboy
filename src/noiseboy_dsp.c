@@ -306,6 +306,13 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
     e->numRecipeLayers = 1 + (int)(rand01(&e->rngState) * 3.0);
     if (e->numRecipeLayers > NOISEBOY_MAX_LAYERS) e->numRecipeLayers = NOISEBOY_MAX_LAYERS;
 
+    /* Recipe-level timbre character -- see this field's own header
+     * comment for the full investigation (resonance tried first,
+     * abandoned when direct measurement showed it barely moved actual
+     * output; cutoff measured a clean, reliable ~21% range instead).
+     * +-15%, i.e. 0.85x-1.15x. */
+    e->timbreCharacterMul = 0.85 + rand01(&e->rngState) * 0.3;
+
     for (int i = 0; i < e->numRecipeLayers; i++) {
         LayerRecipe *r = &e->recipe[i];
         /* Per explicit clarification: filtered-noise layers always
@@ -366,6 +373,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->envLevel = 0.0;
     v->gateOpen = 1;
     v->pendingSteal = 0;
+    v->minHoldSamplesRemaining = 0;
     v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't AM in lockstep */
 
     /* Bitcrush and pitch-following sample-rate reduction REMOVED
@@ -470,7 +478,25 @@ void noiseboy_note_on(NoiseboyEngine *e, int midiNote, double velocity01) {
     /* Prefer a free voice; if none, steal the quietest currently
      * releasing voice, or failing that just voice 0 -- simple and
      * predictable rather than a full LRU/oldest-note-tracking scheme,
-     * which wasn't asked for. */
+     * which wasn't asked for.
+     *
+     * REAL BUG FIXED HERE, per direct report ("noticeable latency...
+     * if I play the pads fast enough, it only triggers every other
+     * note"): the "quietest releasing voice" search below did NOT
+     * exclude voices that already have a pending deferred steal (see
+     * pendingSteal's own comment). A voice with a pending steal has
+     * its envelope forced into a fast decay toward 0 -- which makes it
+     * look like the BEST candidate ("quietest") to the very next
+     * note-on, getting it picked again and its pendingMidiNote
+     * silently OVERWRITTEN before the first queued note ever got to
+     * play. Confirmed directly with a rapid-playing test: notes could
+     * be dropped entirely (never became audible at all within the
+     * test window), and surviving notes showed over 100ms of onset
+     * latency -- worse with fewer voices (this project is currently
+     * running at 4, reduced from 8 for an unrelated CPU diagnostic),
+     * since stealing becomes the common case rather than an
+     * occasional one at lower polyphony. Fix: exclude
+     * already-pending voices from this selection entirely. */
     int chosen = -1;
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         if (!e->voices[v].active) { chosen = v; break; }
@@ -480,9 +506,25 @@ void noiseboy_note_on(NoiseboyEngine *e, int midiNote, double velocity01) {
         isSteal = 1;
         double lowestLevel = 2.0;
         for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-            if (!e->voices[v].gateOpen && e->voices[v].envLevel < lowestLevel) {
+            if (!e->voices[v].gateOpen && !e->voices[v].pendingSteal && e->voices[v].envLevel < lowestLevel) {
                 lowestLevel = e->voices[v].envLevel;
                 chosen = v;
+            }
+        }
+        /* Fallback for the rare, genuine overload case: every voice is
+         * EITHER still fully held OR already has a pending steal
+         * queued -- there is truly nothing free to offer this note.
+         * Silently dropping the note entirely (the original bug) is
+         * worse than overwriting the OLDEST already-pending note here
+         * -- a note that still plays late is better than one that
+         * never plays at all. This means, in this specific overload
+         * situation only, the oldest-queued pending note can still be
+         * displaced by a newer one -- an intentional, documented
+         * tradeoff for this edge case, not the everyday behaviour
+         * (which the fix above already handles correctly). */
+        if (chosen < 0) {
+            for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
+                if (e->voices[v].pendingSteal) { chosen = v; break; }
             }
         }
         if (chosen < 0) chosen = 0;
@@ -622,19 +664,65 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
         Voice *v = &e->voices[vi];
         if (!v->active) continue;
 
-        /* Deferred steal in progress -- force a fast release (15ms,
-         * NOT the user's own Release knob) regardless of gateOpen's
-         * normal meaning, so the old sound dies down quickly and
-         * predictably rather than potentially taking seconds if
-         * Release is set long. See pendingSteal's own header comment
-         * for the full rationale. */
+        /* Minimum-hold countdown -- see minHoldSamplesRemaining's own
+         * header comment. While counting down, gateOpen is forced to 1
+         * regardless of what note_off/pendingNoteReleased handling
+         * elsewhere wants, guaranteeing the attack envelope gets at
+         * least this long to genuinely rise before release is allowed
+         * to take over. */
+        if (v->minHoldSamplesRemaining > 0) {
+            v->minHoldSamplesRemaining--;
+            v->gateOpen = 1;
+            if (v->minHoldSamplesRemaining == 0) {
+                v->gateOpen = 0; /* minimum hold just expired -- now actually release */
+            }
+        }
+
+        /* Deferred steal in progress -- force a fast release (NOT the
+         * user's own Release knob) regardless of gateOpen's normal
+         * meaning, so the old sound dies down quickly and predictably
+         * rather than potentially taking seconds if Release is set
+         * long. See pendingSteal's own header comment for the full
+         * rationale.
+         *
+         * REAL BUG FIXED HERE, per direct report ("noticeable latency
+         * ... only triggers every other note" when playing fast): the
+         * original 15ms time constant combined with the strict 0.0005
+         * deactivation threshold meant full resolution actually took
+         * ~7.6 time constants -- about 114ms, not 15ms -- to reach
+         * that threshold from a typical velocity. That's slow enough
+         * that playing faster than roughly one note per ~30ms per
+         * voice could outrun the deferred-steal mechanism entirely,
+         * queuing new steals faster than old ones could resolve.
+         * Combined with a related bug in the voice-selection logic
+         * itself (see noiseboy_note_on's own comment, fixed
+         * separately), this caused real, confirmed note drops.
+         * Speeding up resolution is the other half of the fix: 3ms
+         * time constant with a looser-but-still-measured 0.01
+         * threshold (used ONLY for steal resolution, not the stricter
+         * 0.0005 still used for normal full voice deactivation below)
+         * resolves in ~13ms instead of ~114ms -- verified via this
+         * project's own baseline-relative click test that this is
+         * still click-free (transition jump stays within normal
+         * range of the signal's own variation, not a spike). */
         const double target = (v->gateOpen && !v->pendingSteal) ? v->velocity01 : 0.0;
-        double timeMs = v->pendingSteal ? 15.0 : (v->gateOpen ? e->params.attackMs : e->params.releaseMs);
-        timeMs = clampd(timeMs, 0.5, 4000.0);
+        double timeMs = v->pendingSteal ? 3.0 : (v->gateOpen ? e->params.attackMs : e->params.releaseMs);
+        /* Floor lowered from 0.5ms to 0.02ms (roughly one sample at
+         * 48kHz) per explicit request: "the release should be a
+         * single sample at [knob] 0". The old 0.5ms floor would have
+         * silently clamped away any attempt at a genuinely
+         * near-instant release regardless of how the knob mapping
+         * itself was reshaped -- see releaseMs's own mapping comment
+         * in noiseboy_plugin.c for the other half of this fix. Safe
+         * for attackMs too (unaffected in practice -- its own linear
+         * mapping's minimum, 0.5ms, already sits above this new,
+         * lower floor). */
+        timeMs = clampd(timeMs, 0.02, 4000.0);
         const double coeff = exp(-1.0 / (0.001 * timeMs * e->sampleRate));
         v->envLevel = target + (v->envLevel - target) * coeff;
 
-        if (v->envLevel < 0.0005 && (v->pendingSteal || !v->gateOpen)) {
+        const double steadyThreshold = v->pendingSteal ? 0.01 : 0.0005;
+        if (v->envLevel < steadyThreshold && (v->pendingSteal || !v->gateOpen)) {
             if (v->pendingSteal) {
                 /* Old sound has decayed to near-silence -- safe to
                  * reset this voice's state now, since there's nothing
@@ -645,10 +733,21 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
                 if (wasReleased) {
                     /* The player already let go of this note before
                      * its deferred steal even completed -- see
-                     * pendingNoteReleased's own header comment. Drop
-                     * straight into release instead of sustaining a
-                     * note the player isn't holding anymore. */
-                    v->gateOpen = 0;
+                     * pendingNoteReleased's own header comment. Give
+                     * it a brief, fixed minimum hold (see
+                     * minHoldSamplesRemaining's own comment for why
+                     * this can't just set gateOpen=0 directly here)
+                     * so its attack envelope actually gets a chance to
+                     * rise and be audible, rather than being skipped
+                     * entirely -- a real bug this caught: setting
+                     * gateOpen=0 in this same sample meant the
+                     * envelope's target was already 0 the very first
+                     * time it computed for this voice, so envLevel
+                     * never rose above 0 at all. ~5ms is enough to be
+                     * clearly audible as a quick "tap" without being
+                     * so long it reads as a held note the player
+                     * didn't actually hold. */
+                    v->minHoldSamplesRemaining = (int)(0.005 * e->sampleRate);
                 }
             } else {
                 v->active = 0;
@@ -776,7 +875,7 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * perfectly flat given that hard ceiling. */
         {
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
-            const double pitchCutoff = clampd(v->freqHz * cutoffMul, 20.0, e->sampleRate * 0.45);
+            const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
             const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul, 2.0);
             if (v->pitchFilterKind == FILTER_MOOG) {
