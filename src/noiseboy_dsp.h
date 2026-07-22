@@ -207,6 +207,45 @@ typedef struct {
     double envLevel;
     int gateOpen;
 
+    /* Deferred voice stealing -- avoids the audible click from voice
+     * stealing. When a still-sounding voice is repurposed for a new
+     * note (which happens more often with longer release times, since
+     * voices stay "active" -- and therefore ineligible to be picked as
+     * a free voice -- for longer), immediately resetting ALL of that
+     * voice's state (Karplus re-plucked, filters re-initialized to
+     * zero, envelope reset to 0) is a real, measured discontinuity
+     * (confirmed via a dedicated test: up to a 0.17 single-sample
+     * jump, when anything under ~0.01 is inaudible) -- a genuine,
+     * reported click/pop, worse with longer release simply because
+     * longer release means more frequent stealing.
+     *
+     * A first attempt just faded the NEW note's output in from 0
+     * instead of resetting instantly -- this only masks half the
+     * problem, since the OLD voice's contribution to the mix still
+     * vanishes the instant its state is overwritten, regardless of how
+     * gently the new one fades in. The actual fix: when a steal is
+     * needed, don't reset the voice immediately at all. Instead, force
+     * it into a fast release (overriding the user's own Release knob
+     * just for this transition) and PARK the new note's info here.
+     * Once the old sound has genuinely decayed to near-silence, THEN
+     * perform the real reset -- the discontinuity still happens, but
+     * only once the audible level is already near-zero, where it's
+     * inaudible. Adds a few milliseconds of latency to a stolen note's
+     * onset, not perceptible in practice. */
+    int pendingSteal;
+    int pendingMidiNote;
+    double pendingVelocity01;
+    /* Set if the pending note gets released (note-off) before its
+     * deferred steal even completes -- a quick staccato note that
+     * happens to land on a steal. Without this, noiseboy_note_off has
+     * no voice to find yet (this one hasn't been assigned via
+     * voice_start), so the note-off would be silently lost and the
+     * pending note would sustain in full once it eventually starts,
+     * even though the player had already released it. Checked once
+     * voice_start actually runs for the pending note -- if set, it
+     * immediately goes into release instead of sustain. */
+    int pendingNoteReleased;
+
     /* Per-voice amplitude modulation phase -- each voice runs its own
      * AM phase (not perfectly in sync with other voices), which reads
      * more like an ensemble of slightly-differently-wobbling noise

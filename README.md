@@ -66,6 +66,58 @@ amounts and ultimately removed entirely, per direct feedback -- see
 
 ## Status
 
+**v0.13.0** -- fixed clicking/glitching with longer release times, per
+direct report ("with release longer than 7, it starts to click and
+glitch... increasing release amount increases glitching... release of
+8" on several random patches).
+
+**Root cause**: longer release times mean voices stay "active" (and
+therefore ineligible to be picked as a free voice) for longer, so the
+8-voice pool runs out more often, forcing voice-stealing. The old
+stealing logic immediately reset a still-sounding voice's ENTIRE state
+(envelope, Karplus pluck, filters) in one step -- confirmed directly
+via a dedicated test: up to a 0.17 single-sample jump right at the
+moment of a steal, against a baseline of ~0.01 for the same signal's
+own normal variation.
+
+**Important methodology note, since a naive test almost gave a false
+result here**: a simple "max jump over a window" check is NOT valid
+for this signal -- this project's default filter resonance (0.82,
+near self-oscillation) legitimately produces large sample-to-sample
+jumps on its own. A no-stealing-involved baseline measurement showed a
+0.226 max jump with nothing wrong at all, actually larger than an
+early (correctly click-reduced) measurement taken WITH stealing --
+which would have looked like the fix made things worse if judged by
+that metric alone. The valid test compares the jump specifically AT a
+voice reset against the signal's own baseline jump magnitude, not an
+absolute threshold.
+
+**The fix**: voice stealing is now deferred. When a steal is needed,
+the old voice is forced into a fast, fixed 15ms release (NOT the
+user's own Release knob -- this transition happens quickly regardless
+of how long Release is set) and the new note's info is parked. Only
+once the old sound has genuinely decayed to near-silence does the
+actual state reset happen -- adds a few milliseconds of latency to a
+stolen note's onset, not perceptible in practice, but eliminates the
+click since there's nothing audible left for the reset to click
+against by the time it happens. Verified: jump at the actual
+transition is now ~2.9x the signal's own baseline variation (previously
+this same measurement point was undefined -- the old code reset
+immediately, so there was no "transition" to separately measure at
+all), well within normal range, not a spike.
+
+**Related edge case, also fixed**: a very quick staccato note that
+happens to land on a steal could previously "stick" and sustain even
+after being released, since it hadn't been assigned to a voice yet
+when the note-off arrived (nothing for `noiseboy_note_off` to find).
+Now tracked explicitly -- if the pending note gets released before its
+deferred steal completes, it starts already in release instead of
+sustaining. Verified with a dedicated test.
+
+Two new permanent tests added (`make test-steal`, `make test-staccato`,
+both part of default `make test`), plus the existing full suite
+(including the 24,000-combination sweep) re-run clean.
+
 **v0.12.0** -- Detune (knob 7) now spreads the stereo image, not just
 pitch, per explicit request. This required making the whole voice
 processing chain stereo-aware for the first time (NOISEBOY was mono

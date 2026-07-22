@@ -2,9 +2,9 @@ CC ?= cc
 CFLAGS = -O2 -Wall -Wextra -std=c11
 LDFLAGS = -lm
 
-.PHONY: test test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo clean
+.PHONY: test test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo test-steal test-staccato clean
 
-test: test_dsp test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo
+test: test_dsp test-dbcell test-new-stages test-karplus-sustain test-sweep test-tilt test-zipper test-stereo test-steal test-staccato
 	./test_dsp
 
 test-dbcell: test_dbcell
@@ -27,6 +27,12 @@ test-zipper: test_zipper
 
 test-stereo: test_stereo_pan
 	./test_stereo_pan
+
+test-steal: test_voice_steal
+	./test_voice_steal
+
+test-staccato: test_staccato_steal
+	./test_staccato_steal
 
 test_dsp: src/distroy_dsp.c src/noiseboy_dsp.c test/test_dsp.c
 	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_dsp.c -o test_dsp $(LDFLAGS)
@@ -52,5 +58,11 @@ test_zipper: src/distroy_dsp.c src/noiseboy_dsp.c test/test_zipper.c
 test_stereo_pan: src/distroy_dsp.c src/noiseboy_dsp.c test/test_stereo_pan.c
 	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_stereo_pan.c -o test_stereo_pan $(LDFLAGS)
 
+test_voice_steal: src/distroy_dsp.c src/noiseboy_dsp.c test/test_voice_steal.c
+	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_voice_steal.c -o test_voice_steal $(LDFLAGS)
+
+test_staccato_steal: src/distroy_dsp.c src/noiseboy_dsp.c test/test_staccato_steal.c
+	$(CC) $(CFLAGS) -Isrc src/distroy_dsp.c src/noiseboy_dsp.c test/test_staccato_steal.c -o test_staccato_steal $(LDFLAGS)
+
 clean:
-	rm -f test_dsp test_dbcell test_new_stages test_karplus_sustain test_comprehensive_sweep test_tilt_filter test_zipper test_stereo_pan *.o dsp.so
+	rm -f test_dsp test_dbcell test_new_stages test_karplus_sustain test_comprehensive_sweep test_tilt_filter test_zipper test_stereo_pan test_voice_steal test_staccato_steal *.o dsp.so

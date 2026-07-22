@@ -316,12 +316,19 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
  * starts from clean state (no leftover filter ringing or Karplus
  * buffer content from whatever a stolen voice was doing before). */
 static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double velocity01) {
+    /* Called only once a voice is either genuinely free, or (for a
+     * steal) has already decayed to near-silence via the deferred-
+     * steal mechanism in noiseboy_note_on/noiseboy_process_stereo --
+     * see pendingSteal's own header comment. By the time this runs,
+     * there's no still-sounding old state to worry about clicking
+     * against, so this can just do a normal, clean reset. */
     v->active = 1;
     v->midiNote = midiNote;
     v->velocity01 = velocity01;
     v->freqHz = midi_note_to_freq(midiNote);
     v->envLevel = 0.0;
     v->gateOpen = 1;
+    v->pendingSteal = 0;
     v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't AM in lockstep */
 
     /* Bitcrush and pitch-following sample-rate reduction REMOVED
@@ -400,7 +407,9 @@ void noiseboy_note_on(NoiseboyEngine *e, int midiNote, double velocity01) {
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         if (!e->voices[v].active) { chosen = v; break; }
     }
+    int isSteal = 0;
     if (chosen < 0) {
+        isSteal = 1;
         double lowestLevel = 2.0;
         for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
             if (!e->voices[v].gateOpen && e->voices[v].envLevel < lowestLevel) {
@@ -410,13 +419,37 @@ void noiseboy_note_on(NoiseboyEngine *e, int midiNote, double velocity01) {
         }
         if (chosen < 0) chosen = 0;
     }
-    voice_start(e, &e->voices[chosen], midiNote, velocity01);
+
+    if (isSteal) {
+        /* Deferred steal, per explicit correction -- see pendingSteal's
+         * own header comment for the full rationale. Force the voice
+         * into release (even if it was still held) so it starts
+         * decaying immediately regardless of what it was doing before,
+         * and park the new note's info; noiseboy_process_stereo's own
+         * envelope handling picks this up once the old sound has
+         * genuinely faded, forcing a fast release time for exactly
+         * this transition rather than waiting out the user's own
+         * (possibly very long) Release knob setting. */
+        Voice *v = &e->voices[chosen];
+        v->gateOpen = 0;
+        v->pendingSteal = 1;
+        v->pendingMidiNote = midiNote;
+        v->pendingVelocity01 = velocity01;
+        v->pendingNoteReleased = 0;
+    } else {
+        voice_start(e, &e->voices[chosen], midiNote, velocity01);
+    }
 }
 
 void noiseboy_note_off(NoiseboyEngine *e, int midiNote) {
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         if (e->voices[v].active && e->voices[v].midiNote == midiNote && e->voices[v].gateOpen) {
             e->voices[v].gateOpen = 0;
+        }
+        /* Also check pending steals -- see pendingNoteReleased's own
+         * header comment for why this is needed at all. */
+        if (e->voices[v].pendingSteal && e->voices[v].pendingMidiNote == midiNote) {
+            e->voices[v].pendingNoteReleased = 1;
         }
     }
 }
@@ -501,15 +534,38 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
         Voice *v = &e->voices[vi];
         if (!v->active) continue;
 
-        double target = v->gateOpen ? v->velocity01 : 0.0;
-        double timeMs = v->gateOpen ? e->params.attackMs : e->params.releaseMs;
+        /* Deferred steal in progress -- force a fast release (15ms,
+         * NOT the user's own Release knob) regardless of gateOpen's
+         * normal meaning, so the old sound dies down quickly and
+         * predictably rather than potentially taking seconds if
+         * Release is set long. See pendingSteal's own header comment
+         * for the full rationale. */
+        const double target = (v->gateOpen && !v->pendingSteal) ? v->velocity01 : 0.0;
+        double timeMs = v->pendingSteal ? 15.0 : (v->gateOpen ? e->params.attackMs : e->params.releaseMs);
         timeMs = clampd(timeMs, 0.5, 4000.0);
-        double coeff = exp(-1.0 / (0.001 * timeMs * e->sampleRate));
+        const double coeff = exp(-1.0 / (0.001 * timeMs * e->sampleRate));
         v->envLevel = target + (v->envLevel - target) * coeff;
 
-        if (!v->gateOpen && v->envLevel < 0.0005) {
-            v->active = 0;
-            continue;
+        if (v->envLevel < 0.0005 && (v->pendingSteal || !v->gateOpen)) {
+            if (v->pendingSteal) {
+                /* Old sound has decayed to near-silence -- safe to
+                 * reset this voice's state now, since there's nothing
+                 * audible left for the reset to click against. Starts
+                 * the new note within this same sample, no gap. */
+                const int wasReleased = v->pendingNoteReleased;
+                voice_start(e, v, v->pendingMidiNote, v->pendingVelocity01);
+                if (wasReleased) {
+                    /* The player already let go of this note before
+                     * its deferred steal even completed -- see
+                     * pendingNoteReleased's own header comment. Drop
+                     * straight into release instead of sustaining a
+                     * note the player isn't holding anymore. */
+                    v->gateOpen = 0;
+                }
+            } else {
+                v->active = 0;
+                continue;
+            }
         }
 
         /* AM phase updated here, before layer mixing, since Karplus
