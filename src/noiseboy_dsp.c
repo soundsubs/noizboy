@@ -557,25 +557,20 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
      * other per-note randomization) -- see TapeWobble's own comment. */
     tape_wobble_init(&v->wobble, xorshift_next(&e->rngState));
 
-    /* Bitcrush and pitch-following sample-rate reduction
-     * REINTRODUCED per explicit request -- see this state's own
-     * header comment in Voice for the full position/tradeoff
-     * rationale (post-mixer, pre-filter -- the same spot v0.10.0
-     * measured as harmful to pitch-tracking accuracy, reintroduced
-     * here as an informed, explicit choice rather than an oversight).
-     * Randomized fresh per note (not recipe-level), matching this
-     * feature's own prior design before removal. Ranges chosen from
-     * this project's own tuning history, not guessed fresh: bitDepth
-     * 12-15 was the last, lightest setting reached before full
-     * removal (after two earlier reductions from an original 1-15,
-     * each time per direct feedback that it was too aggressive) --
-     * starting back at that same, already-most-conservative point
-     * rather than re-walking the same tuning journey from scratch.
-     * rateReducerMultiplier 1.0-2.0 keeps the hold rate close to the
-     * fundamental (musically related, per pitchedhold_process's own
-     * comment) while still giving some per-note variety. */
-    v->bitDepth = 12 + (int)(rand01(&e->rngState) * 4.0); /* 12-15 */
-    v->rateReducerMultiplier = 1.0 + rand01(&e->rngState) * 1.0; /* 1.0-2.0 */
+    /* Bitcrush and pitch-following sample-rate reduction --
+     * REDESIGNED per explicit request, replacing per-note
+     * randomization entirely: "I think its being bit crushed too much
+     * without any control to it. So lets do this; as DRIVE knob 3 is
+     * increased (clockwise) lets reduce sample rate and bitrate in a
+     * non-linear fashion. Otherwise it defaults to 16 bit and
+     * 44.1khz." bitDepth/rateReducerMultiplier are no longer set here
+     * at all -- the effective amount is now computed LIVE, every
+     * sample, directly from the current Drive knob value (see
+     * noiseboy_process_stereo's own comment at the bitcrush/rate-
+     * reduce call site), the same way filter cutoff/resonance/TILT are
+     * all live-controllable rather than fixed at note-on. The old
+     * per-voice fields are left declared but unused (this project's
+     * own convention for superseded state) rather than removed. */
     pitchedhold_init(&v->rateReducerL);
     pitchedhold_init(&v->rateReducerR);
     vibrato_init(&v->vibratoL);
@@ -1077,25 +1072,47 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             voiceSumR /= (double)v->numLayers;
         }
 
-        /* Bitcrush + pitch-following sample-rate reduction,
-         * REINTRODUCED per explicit request -- see this state's own
-         * header comment in Voice (bitDepth/rateReducerMultiplier)
-         * for the full position/tradeoff rationale. Rate-reduction
-         * (via PitchedHold's sample-and-hold) applied first, then
-         * bitcrush on the held result -- matches this project's own
-         * prior ordering from before v0.10.0's removal. Independent
-         * L/R instances (same convention as vibrato/the pitch filter
-         * below) so this doesn't collapse the stereo image back to
-         * mono. "Sample rate follows key number" per explicit request
-         * -- PitchedHold's hold rate is freqHz*rateReducerMultiplier,
-         * directly proportional to the played note's own frequency,
-         * so lower notes get a proportionally lower effective sample
-         * rate and higher notes a proportionally higher one, not a
-         * fixed rate applied uniformly across the keyboard. */
-        voiceSumL = pitchedhold_process(&v->rateReducerL, voiceSumL, v->freqHz, e->sampleRate, v->rateReducerMultiplier);
-        voiceSumR = pitchedhold_process(&v->rateReducerR, voiceSumR, v->freqHz, e->sampleRate, v->rateReducerMultiplier);
-        voiceSumL = bitcrush_process(voiceSumL, v->bitDepth);
-        voiceSumR = bitcrush_process(voiceSumR, v->bitDepth);
+        /* Bitcrush + pitch-following sample-rate reduction --
+         * REDESIGNED per explicit request, now controlled by DRIVE
+         * (knob 3) rather than randomized per note: "as DRIVE knob 3
+         * is increased (clockwise) lets reduce sample rate and bitrate
+         * in a non-linear fashion. Otherwise it defaults to 16 bit and
+         * 44.1khz." Computed LIVE every sample from the current Drive
+         * value, same as filter cutoff/resonance/TILT -- not fixed at
+         * note-on -- so turning Drive has an immediate, audible effect
+         * on a held note, not just future notes.
+         *
+         * Non-linear: crushAmount = drive01^2 (quadratic, not linear)
+         * -- most of the knob's low range stays close to clean, with
+         * degradation accelerating toward the top, matching how a
+         * "drive" control conventionally feels (subtle at first,
+         * aggressive near the top) rather than a flat ramp.
+         *
+         * bitDepth: 16 (drive=0, effectively transparent -- bitcrush_
+         * process's own comment notes 15 is "close to imperceptible";
+         * 16 is finer still) down to 4 (drive=1, a real, heavy crush).
+         *
+         * Sample-rate reduction: interpolates the PitchedHold stage's
+         * effective hold rate from the engine's own native sample rate
+         * (drive=0 -- computed as a per-note holdMultiplier that always
+         * resolves to sampleRate regardless of the played note, i.e.
+         * genuinely no reduction, not just a high-but-still-audible
+         * rate) down to 1.5x the played note's own fundamental
+         * (drive=1 -- keeps "sample rate follows key number" from this
+         * project's own prior design, just now only engaged by Drive
+         * rather than always-on). Independent L/R instances (same
+         * convention as vibrato/the pitch filter below) so this
+         * doesn't collapse the stereo image back to mono. */
+        const double crushAmount = e->params.drive01 * e->params.drive01;
+        const int liveBitDepth = (int)(16.0 - crushAmount * 12.0 + 0.5); /* 16 down to 4 */
+        const double cleanRateHz = e->sampleRate;
+        const double crushedRateHz = v->freqHz * 1.5;
+        const double effectiveRateHz = cleanRateHz + (crushedRateHz - cleanRateHz) * crushAmount;
+        const double liveHoldMultiplier = effectiveRateHz / (v->freqHz > 0.01 ? v->freqHz : 0.01);
+        voiceSumL = pitchedhold_process(&v->rateReducerL, voiceSumL, v->freqHz, e->sampleRate, liveHoldMultiplier);
+        voiceSumR = pitchedhold_process(&v->rateReducerR, voiceSumR, v->freqHz, e->sampleRate, liveHoldMultiplier);
+        voiceSumL = bitcrush_process(voiceSumL, liveBitDepth);
+        voiceSumR = bitcrush_process(voiceSumR, liveBitDepth);
 
         /* Vibrato, per explicit request -- introduces gentle pitch
          * modulation "in the noise and Karplus" (both already present
@@ -1186,131 +1203,43 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * 0.94) -- a real, substantial improvement, though not
          * perfectly flat given that hard ceiling. */
         {
-            /* REAL, SEVERE BUG FOUND AND FIXED HERE, while investigating
-             * a report that Karplus had become essentially inaudible:
-             * this filter was genuinely, persistently self-oscillating
-             * at resonance settings this engine has always used by
-             * default. Verified directly and unambiguously: excite the
-             * filter with a single impulse, then feed it ZERO input
-             * for 10+ seconds -- it never decayed at all, still
-             * ringing at a steady, bounded amplitude the whole time
-             * (this is a genuine limit-cycle, not just "a long decay
-             * time" -- a linear decay factor added to the feedback
-             * path, tested directly, did essentially nothing to fix
-             * it, which is the signature of a NONLINEAR oscillator:
-             * the existing cubic soft-clip on the resonant node,
-             * combined with feedback gain above the true self-
-             * oscillation threshold, forms a stable limit cycle the
-             * same way a Van der Pol oscillator does -- the amplitude
-             * gets bounded, not damped toward zero). Once a filter
-             * locks into this state, it dominates the output
-             * regardless of what's actually feeding it -- explaining
-             * why Karplus (or anything else) can become inaudible
-             * even at a healthy mix level.
+            /* REVERTED per explicit request: "let's decouple resonance
+             * from envelope... put resonance back to the way it was
+             * last before we squashed it." The release-tracking
+             * "ping" (starts at the knob's raw value on release, decays
+             * to a safe ceiling) read as "a zap or laser beam" on every
+             * keypress rather than the intended subtle effect -- gone
+             * entirely now, resonance is constant while a note plays
+             * and does not depend on gateOpen/envelope state at all,
+             * matching how it worked before that whole feature existed.
              *
-             * Empirically found the TRUE stable ceiling for this
-             * filter's own resonance01 input (a direct sweep,
-             * checking genuine long-term decay, not just short-window
-             * peak gain like earlier resonance-evenness testing did --
-             * that's specifically why this was missed before): only
-             * ~0.15, consistent across the whole practical cutoff
-             * range (32Hz-2kHz tested). This is far below the 0.82
-             * default knob value, let alone the up-to-2.0 ceiling the
-             * resonance-evenness compensation could reach -- meaning
-             * this instability predates that fix and has likely been
-             * present since whenever the default resonance was set
-             * this high, not a new regression.
-             *
-             * Fix: the Resonance knob's full 0-100% feel is remapped
-             * onto this filter's ACTUAL safe range (capped at 0.14,
-             * a small margin below the measured 0.15 threshold) --
-             * not just clamped, which would leave much of the knob's
-             * upper range feeling dead/unresponsive. This is a real,
-             * audible character change to the instrument's resonant
-             * tone, not a subtle tweak -- flagging that directly, this
-             * is exactly the trade-off of fixing a genuine, long-
-             * standing instability rather than a cosmetic issue. */
-            const double safeResonanceCeiling = 0.14;
-
-            /* Tape wobble, per explicit request -- see TapeWobble's
-             * own header comment. One shared wobble value per voice
-             * per sample, applied to cutoff, resonance, and (further
-             * down, post-envelope) output level together. 1.0Hz rate
-             * -- slow, wow/flutter-like drift, not audio-rate texture
-             * (see TapeWobble's own comment for why that distinction
-             * matters). Depth (mellotronDepth01, 1%-5%) is recipe-
-             * level, not re-rolled here. */
+             * This also reverts the SEPARATE, earlier stability fix
+             * (v0.17.0) that capped resonance at a small, verified-safe
+             * ceiling (~0.14) after finding the filter was genuinely,
+             * persistently self-oscillating at higher settings (a
+             * single impulse, then zero input, never decayed even after
+             * 10+ seconds -- a real, measured instability, not a
+             * cosmetic one). That fix is explicitly what's being
+             * undone here, at direct request, back to this project's
+             * OWN prior formula: resonance = knob value (boosted for
+             * low notes, same evenness compensation as always), capped
+             * only at the 2.0x physical ceiling this filter topology
+             * itself imposes (see the resonance-evenness comment
+             * above) -- no additional safety margin. Restoring this
+             * does very predictably bring back what that stability fix
+             * was originally investigating: Karplus (and other sources)
+             * can get crowded out by the filter's own resonant ringing
+             * again, and different randomizations can sound more alike
+             * than they otherwise would, since those were direct
+             * symptoms of this same self-oscillation, not a separate,
+             * already-resolved issue. */
             const double wobble = tape_wobble_process(&v->wobble, 1.0, e->sampleRate);
             voiceWobbleMul = 1.0 + wobble * e->mellotronDepth01;
 
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
             const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
-            const double baseResonance = e->params.filterResonance01 * safeResonanceCeiling;
-            const double heldResonance = fmin(baseResonance * resonanceBoostMul * voiceWobbleMul, safeResonanceCeiling);
-
-            /* Release resonance decay, per explicit request: "it just
-             * decays from knob value" -- during release, resonance
-             * starts at the RAW knob value (filterResonance01,
-             * boosted the same way as the held/capped value, but NOT
-             * capped at safeResonanceCeiling) and decays down to that
-             * same safe ceiling as the release progresses, tracking
-             * envNorm (1.0 right as release begins -> 0.0 once fully
-             * released) the same way releaseDarkenState does. This is
-             * NOT a boost on top of the held value -- during Attack/
-             * Sustain (gateOpen=1) resonance stays exactly at
-             * heldResonance, unchanged from the held-note fix above.
-             * Confirmed safe via direct testing across the worst-case
-             * combination (lowest note, highest possible target,
-             * longest release): the filter always ends up back at the
-             * verified-stable safeResonanceCeiling by the time release
-             * completes, and genuinely decays to silence from there
-             * (within 1-3 seconds), never getting stuck ringing --
-             * because resonance is continuously DECREASING throughout
-             * release, it never sits at an elevated value long enough
-             * to settle into a persistent, non-decaying limit cycle
-             * the way a FIXED elevated resonance would (see this
-             * filter's own stability-fix comment above). Short/plucky
-             * releases still touch the same elevated starting
-             * resonance, but decay away too quickly to be audible --
-             * self-limiting by note duration, not a special case. */
-            double pitchResonance = heldResonance;
-            if (!v->gateOpen) {
-                const double envNorm = (v->velocity01 > 0.001) ? clampd(v->envLevel / v->velocity01, 0.0, 1.0) : 0.0;
-                const double rawResonanceTarget = e->params.filterResonance01 * resonanceBoostMul * voiceWobbleMul;
-                /* REAL BUG FOUND AND FIXED HERE, twice: a straight
-                 * linear envNorm interpolation (and later, cubing it)
-                 * both kept resonance elevated for FAR too long,
-                 * because envLevel's own decay is exponential (a
-                 * one-pole smoother, releaseMs as its time constant),
-                 * not linear -- it never truly reaches zero, just
-                 * asymptotically approaches it, with a very long,
-                 * quiet tail. Measured directly at releaseMs=4000ms,
-                 * resonance01=1.0 (near-worst-case): even cubing
-                 * envNorm still left the filter audibly ringing for
-                 * 30-60+ SECONDS after note-off -- unacceptable for a
-                 * musical instrument (ties up a voice slot and is
-                 * audibly wrong regardless of technical "eventual"
-                 * stability).
-                 *
-                 * Fixed with a threshold-gated ramp instead of tracking
-                 * envNorm's full range: elevated resonance only applies
-                 * while envNorm is still in its top 20% (1.0 down to
-                 * 0.8, i.e. right at the very start of release), then
-                 * snaps to the safe ceiling below that -- giving a
-                 * short, clearly audible resonant "ping" right as a
-                 * note lets go, decaying back to safe well within a
-                 * second even at the longest release setting,
-                 * regardless of how long the overall AMPLITUDE
-                 * envelope continues decaying afterward. This still
-                 * genuinely "follows" and starts from release, per the
-                 * original request, just doesn't track the envelope's
-                 * own very long asymptotic tail, which would make the
-                 * knob's raw resonance value audible for far too long
-                 * to be practical. */
-                const double rampNorm = clampd((envNorm - 0.8) / 0.2, 0.0, 1.0);
-                pitchResonance = safeResonanceCeiling + (rawResonanceTarget - safeResonanceCeiling) * rampNorm;
-            }
+            const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul * voiceWobbleMul, 2.0);
             if (v->pitchFilterKind == FILTER_MOOG) {
                 moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
                 moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);

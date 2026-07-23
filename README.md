@@ -111,8 +111,8 @@ after all voices sum together):
 | Knob | Parameter | Range |
 |---|---|---|
 | 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
-| 2 | Resonance | resonance of the voice-level pitch-tracking filter while a note is HELD (safe, stable range -- see "Status" for the stability fix that established this ceiling); also blends into Karplus-Strong pluck damping (plucky-mode notes only). On RELEASE, resonance starts at this knob's raw (uncapped) value and decays back to the safe ceiling over roughly the first fifth of the release -- a short, audible resonant "ping" as a note lets go, higher knob settings giving a sharper, more pronounced ping. Short/plucky releases barely show it, by nature of being brief |
-| 3 | Drive | single shared drive/saturation stage on the final mix -- moved here from the parameter menu now that LOOP no longer needs this knob for a wet/dry blend (it's a 4th mixed source now, see "What it does") |
+| 2 | Resonance | resonance of the voice-level pitch-tracking filter -- constant while a note plays, no envelope or release dependency of any kind. Full range, no safety cap; higher settings ARE genuinely self-oscillating (a deliberate choice, reverted at direct request -- see "Status") |
+| 3 | Drive | dual role: (1) single shared drive/saturation stage on the final mix, unchanged from before; (2) also now controls bitcrush + pitch-following sample-rate reduction, non-linearly -- centre-left/off (0) = effectively clean (16-bit, full native sample rate); turning clockwise degrades both bit depth and effective sample rate together, accelerating toward the top of the range. Live-controllable, not fixed per note |
 | 4 | Loop Length | sets Loop's own captured-buffer length (XX), read fresh at the START of every note (not adjustable live mid-note). Start (0) = 100% = 3.0 seconds, the longest; turning clockwise reduces it down to 1% (0.03s) at full right. The played note's own pitch is what controls playback SPEED through that buffer (see "What it does") -- this knob only sets how long the buffer itself is |
 | 5 | Attack | envelope attack time, 0.5-200 ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
 | 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain. Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
@@ -123,6 +123,51 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.19.0** -- two changes, both direct reversals/redesigns following
+listening feedback on v0.18.0.
+
+**1. Resonance fully decoupled from envelope, reverted to its
+pre-stability-fix behavior.** The release-tracking "ping" from v0.18.0
+read as "a zap or laser beam" on every keypress rather than the
+intended subtle effect. Removed entirely -- resonance is now a simple,
+constant function of the knob and played note again, with zero
+dependence on gateOpen/envelope state (verified directly by code
+inspection: no such reference exists anywhere in the computation).
+This also reverts the SEPARATE v0.17.0 stability fix that capped
+resonance at a small, verified-safe ceiling after finding the filter
+was genuinely, persistently self-oscillating at higher settings -- per
+direct request to go back to "the way it was last before we squashed
+it." Being direct about the predictable consequence: this does bring
+back what that stability fix was originally investigating in the first
+place -- Karplus (and other sources) can get crowded out by the
+filter's own resonant ringing again, and different randomizations can
+sound more alike than they otherwise would, since those were direct
+symptoms of this same self-oscillation, not a separately-fixed issue.
+
+**2. Bitcrush/rate-reduce redesigned to be Drive-controlled, per
+direct report:** "I think its being bit crushed too much without any
+control to it." Previously randomized per note (bitDepth 12-15,
+rate-reduce multiplier 1.0-2.0) with no user control at all. Now fully
+deterministic and live-controlled by DRIVE (knob 3, sharing the knob
+with its existing saturation role): at Drive=0, both effects are
+computed to be effectively transparent (16-bit, and a sample-rate-
+reduction hold rate that resolves to the engine's own native rate for
+any played note, i.e. genuinely no reduction, not just "high but still
+audible"). Turning Drive up degrades both together, non-linearly
+(quadratic in the knob position -- most of the low range stays close
+to clean, with degradation accelerating near the top, matching how a
+drive/distortion control conventionally feels). "Sample rate follows
+key number" (this project's own established rate-reduce behavior) is
+preserved at any given Drive setting -- verified directly, still
+exactly proportional to the played note. Computed fresh every sample
+from the live knob value, not fixed at note-on, so turning Drive has
+an immediate effect on already-held notes.
+
+`test-releaseresonance` repurposed to verify the new decoupled
+behavior directly (previously tested the now-removed release-ping
+feature). `test-bitcrush` fully rewritten for the new Drive-controlled
+design. Full 24-suite run passes clean.
 
 **v0.18.0** -- three targeted fixes following direct feedback on
 v0.17.0's filter stability fix, each verified independently.

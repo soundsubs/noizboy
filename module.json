@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOIZBOY",
-    "version": "0.18.0",
+    "version": "0.19.0",
     "abbrev": "NOIZB",
-    "description": "Resonance now tracks Amp Release (starts at knob's raw value, decays to the safe ceiling as a note lets go). Karplus boosted further to hold its own in the mix. Loop Length knob direction/range corrected. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
+    "description": "Resonance reverted to constant/envelope-decoupled (no more release ping). Bitcrush/rate-reduce now Drive-controlled and non-linear, clean at Drive=0. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",
