@@ -284,6 +284,14 @@ void global_delay_line_free(GlobalDelayLine *dl);
  * is the ONLY place the buffer's content changes -- voices only ever
  * read from it. */
 void global_delay_line_write(GlobalDelayLine *dl, double mixL, double mixR);
+/* Clears the buffer to silence and resets the write head to 0 -- per
+ * explicit request, "LOOP should always start sampling at 'new note
+ * on', not constantly listening." Called at the moment playing resumes
+ * after a gap (see noiseboy_process_stereo's own comment for the full
+ * gating logic), so a fresh capture always starts from genuine
+ * silence rather than replaying stale content left over from whatever
+ * was playing before the gap. */
+void global_delay_line_reset(GlobalDelayLine *dl);
 
 typedef struct {
     double readPos;             /* fractional read position INTO THE SHARED GlobalDelayLine, nearest-neighbor read */
@@ -399,6 +407,18 @@ typedef struct {
      * smoothing it removes that specific discontinuity regardless of
      * whether it's the full explanation. */
     double sustainAmountSmoothed;
+    /* Set once at voice_start (mirroring the random plucky/string
+     * selection made there), read every sample in process_layer to
+     * decide the sustain feed's own TARGET amount -- see that read
+     * site's own comment for why this needed adding: "Karplus no
+     * longer ever plucky, but it is like a string" -- investigated
+     * directly and confirmed the sustain feed's constant re-injection
+     * of energy while held was masking the plucky/string damping
+     * distinction entirely (both modes measured as similarly
+     * sustained, RMS not decaying at all, while a note was held --
+     * the difference only ever showed up AFTER release, when the
+     * sustain feed already drops to 0 regardless of mode). */
+    int karplusStringModeThisNote;
 } Layer;
 
 typedef struct {
@@ -833,10 +853,17 @@ typedef struct {
 
     /* LOOP's shared delay line -- see GlobalDelayLine's own comment
      * for the full design. ONE per engine (not one per voice), heap-
-     * allocated at engine init, continuously written every sample from
-     * the engine's own summed mix, read by every active voice at its
-     * own transposed position. */
+     * allocated at engine init. WRITING is gated by voice activity, per
+     * explicit request: "LOOP should always start sampling at 'new
+     * note on', not constantly listening... there's no reason to
+     * sample if no sound is playing." Only written while at least one
+     * voice is active; resets to a fresh, silent start the moment
+     * playing resumes after a gap (see noiseboy_process_stereo's own
+     * comment for the full gating logic) -- delayLineWasActive tracks
+     * the PREVIOUS sample's own activity state so that transition can
+     * be detected. */
     GlobalDelayLine delayLine;
+    int delayLineWasActive;
 } NoiseboyEngine;
 
 void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int seed);

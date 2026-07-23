@@ -256,6 +256,63 @@ int main(void) {
         else printf("PASSED\n");
     }
 
+    /* Test 12: write-gating and fresh-start-on-resume, per explicit
+       request: "LOOP should always start sampling at 'new note on',
+       not constantly listening... there's no reason to sample if no
+       sound is playing." */
+    {
+        NoiseboyEngine e;
+        noiseboy_engine_init(&e, 48000.0, 42u);
+        e.recipe[2].mixLevel01 = 1.0; /* Karplus for a distinctive sound */
+        e.recipe[0].mixLevel01 = 0.0; e.recipe[1].mixLevel01 = 0.0; e.recipe[3].mixLevel01 = 0.0;
+
+        /* Play a note, let it fully release and become silent */
+        noiseboy_note_on(&e, 60, 0.9);
+        for (int i = 0; i < 4800; i++) { double l, r; noiseboy_process_stereo(&e, &l, &r); }
+        noiseboy_note_off(&e, 60);
+        for (int i = 0; i < 48000 * 3; i++) { double l, r; noiseboy_process_stereo(&e, &l, &r); } /* let it fully decay to silence */
+
+        int writePosAfterFirstNote = e.delayLine.writePos;
+
+        /* While genuinely silent (no voices active), the write head
+           should NOT be advancing at all -- writing is paused. */
+        int voiceStillActive = noiseboy_any_voice_active(&e);
+        for (int i = 0; i < 1000; i++) { double l, r; noiseboy_process_stereo(&e, &l, &r); }
+        int writePosStillSilent = e.delayLine.writePos;
+        printf("\nDuring silence (voice active=%d): writePos before=%d, after 1000 more samples=%d (expect unchanged if genuinely silent)\n",
+               voiceStillActive, writePosAfterFirstNote, writePosStillSilent);
+        if (!voiceStillActive && writePosAfterFirstNote != writePosStillSilent) {
+            printf("FAILED: write head should not advance while no voice is active\n");
+            all_ok = 0;
+        } else printf("PASSED\n");
+
+        /* Starting a NEW note after that silence should reset the
+           delay line to a fresh start (writePos back to 0, buffer
+           cleared) -- confirmed via noiseboy_note_on itself (which
+           calls noiseboy_process_stereo internally? No -- note_on
+           doesn't process audio. The reset happens on the FIRST
+           process_stereo call after note_on while a voice is active). */
+        noiseboy_note_on(&e, 64, 0.9);
+        double l, r;
+        noiseboy_process_stereo(&e, &l, &r); /* this is the sample that should trigger the reset+fresh write */
+        printf("\nwritePos right after resuming play: %d (expect 1 -- reset to 0, then one fresh sample written)\n", e.delayLine.writePos);
+        if (e.delayLine.writePos != 1) {
+            printf("FAILED: expected the delay line to reset to a fresh start when playing resumes\n");
+            all_ok = 0;
+        } else printf("PASSED\n");
+
+        /* Confirm the buffer's OLD content (from the first note, well
+           before the reset point) is genuinely gone -- silence, not
+           stale leftover audio. */
+        double staleSumSq = 0;
+        for (int i = 100; i < NOISEBOY_LOOP_FIXED_SAMPLES; i += 500) {
+            staleSumSq += e.delayLine.bufferL[i] * e.delayLine.bufferL[i];
+        }
+        printf("Sum of squares across untouched (still-silent) buffer region: %.8f (expect exactly 0 -- old content cleared)\n", staleSumSq);
+        if (staleSumSq > 1e-12) { printf("FAILED: expected old content to be cleared on reset, not just overwritten gradually\n"); all_ok = 0; }
+        else printf("PASSED\n");
+    }
+
     printf(all_ok ? "\nALL LOOP CHECKS PASSED\n" : "\nSOME LOOP CHECKS FAILED\n");
     return all_ok ? 0 : 1;
 }

@@ -135,6 +135,66 @@ after all voices sum together):
 
 ## Status
 
+**v0.27.0** -- four fixes, per direct follow-up feedback.
+
+**1. LOOP now only samples while a note is actually playing.** Per
+direct request: "LOOP should always start sampling at 'new note on',
+not constantly listening... there's no reason to sample if no sound is
+playing." Writing to the shared delay line is now gated: skipped
+entirely while no voice is active, and the buffer resets to genuine
+silence with the write head restarting at 0 the moment playing resumes
+after a gap -- so a fresh capture always begins from real silence,
+never replaying stale leftover audio. Deliberately does NOT reset on
+every individual note-on within an already-playing passage (e.g.
+mid-chord) -- only on the specific transition from nothing-playing to
+something-playing-again.
+
+**2. Karplus's plucky/string distinction investigated and partially
+fixed -- with an important caveat.** Per direct report: "Karplus no
+longer ever plucky, but it is like a string." Investigated directly:
+confirmed the sustain feed (added earlier to keep Karplus audible
+while held) was applying its FULL target regardless of which mode was
+selected at note-on -- measured directly that both modes' RMS stayed
+essentially constant/sustained while held, since continuous
+re-injection of energy overrides `damping`'s own decay character
+entirely; the plucky/string difference only ever showed up AFTER
+release, when the sustain feed already drops to 0 regardless of mode.
+Fixed by tying the sustain TARGET itself to the mode: plucky now gets
+a small target (0.05, some ongoing body/presence) so it genuinely
+decays even while held, string keeps the full 0.556 target.
+**Important finding along the way:** at typical/default filter
+resonance settings, the filter's OWN resonant self-oscillation (kept
+deliberately unstable/characterful per an earlier explicit request
+this session) can independently sustain energy regardless of what
+feeds it -- verified directly that disabling resonance made the
+plucky/string distinction clearly measurable, while at default
+resonance the difference was still audible but less pronounced than
+with resonance off. This wasn't touched, since the self-oscillating
+character was a deliberate choice.
+
+**3. Karplus-vs-noise level balance investigated -- suggested
+solution, not yet implemented.** Per direct report: "Karplus levels
+almost always too low against the noise." Measured directly: Karplus
+and noise have nearly identical RMS when isolated (ratio ~1.0), and
+each source's own delta-contribution to a combined mix measured as
+close to zero for BOTH sources -- consistent with the same root cause
+as item 2, the filter's own resonant behavior dominating the output
+somewhat independently of input balance. Suggested next step: boost
+Karplus's own sustain target and/or initial excitation level further,
+which should help it compete better within the mix regardless of the
+underlying mechanism -- not yet implemented, pending confirmation this
+is the direction to take given its interaction with the filter
+question above.
+
+**4. Bitcrush floor raised from 4-bit to 6-bit.** Per direct request:
+"on Drive amount, lets only bitcrush to 6 bit, not all the way to 1
+because its not musical."
+
+New tests added: `test_loop_layer.c`'s 12th check (write-gating and
+fresh-start-on-resume) and `test_karplus_decay_variety.c`'s 4th check
+(sustain-tied-to-mode, verifying plucky mode's RMS genuinely decreases
+while held). Full 25-suite run passes clean.
+
 **v0.26.0** -- LOOP fundamentally redesigned, per direct request:
 "capture from 'whole final mix' and replay it, transposing according
 to pad number... This is how a digital delay works, I think." A real

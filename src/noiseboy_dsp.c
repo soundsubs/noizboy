@@ -124,6 +124,12 @@ void global_delay_line_write(GlobalDelayLine *dl, double mixL, double mixR) {
     if (dl->writePos >= NOISEBOY_LOOP_FIXED_SAMPLES) dl->writePos = 0;
 }
 
+void global_delay_line_reset(GlobalDelayLine *dl) {
+    if (!dl->bufferL || !dl->bufferR) return; /* allocation failure fallback */
+    for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) { dl->bufferL[i] = 0.0; dl->bufferR[i] = 0.0; }
+    dl->writePos = 0;
+}
+
 void loop_voice_start(LoopSource *lp, unsigned int *rngState, const GlobalDelayLine *dl, double freqHz, double referenceFreqHz) {
     /* Start from the OLDEST available sample in the shared buffer --
      * in circular-buffer terms, that's the position immediately AHEAD
@@ -759,6 +765,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
              * random spread within the mode for "varying" character,
              * not a fixed formula every time. */
             const int karplusStringMode = rand01(&e->rngState) < 0.34;
+            layer->karplusStringModeThisNote = karplusStringMode;
             double dampingAmount;
             if (karplusStringMode) {
                 /* REAL BUG FOUND AND FIXED HERE while verifying this
@@ -943,7 +950,30 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
          * everything uniformly would have driven that transient well
          * past clipping; only the ongoing SUSTAIN feed (which affects
          * the held portion, not the initial excitation) is boosted. */
-        double sustainTarget = v->gateOpen ? 0.556 : 0.0;
+        /* ROUND 3, per direct follow-up report: "Karplus no longer
+         * ever plucky, but it is like a string." Investigated directly
+         * -- confirmed the FULL sustain target (0.556) was being
+         * applied identically regardless of the plucky/string mode
+         * selected at note-on, and measured this directly masking the
+         * distinction entirely: with the sustain feed active (held),
+         * BOTH modes' RMS stayed essentially constant/sustained over
+         * time (plucky: 0.49-0.58, string: 0.69-0.93, neither
+         * decaying), since the continuous re-injection of energy
+         * overrides damping's own decay character while it's active.
+         * The plucky/string difference only ever showed up AFTER
+         * release, when the sustain feed already drops to 0 regardless
+         * of mode -- meaning a held plucky note never actually sounded
+         * plucky, only a released one did. Fixed by tying the sustain
+         * TARGET itself to the same mode already chosen at note-on:
+         * plucky mode gets a small target (0.05, enough for a little
+         * ongoing body/presence, matching how a real plucked
+         * instrument still has some sympathetic resonance as it dies
+         * away) so it genuinely decays even while held, matching a
+         * real plucked string's own character regardless of how long
+         * the key is held down. String mode keeps the full 0.556
+         * target, continuing to ring for as long as held -- unchanged
+         * from before. */
+        double sustainTarget = v->gateOpen ? (layer->karplusStringModeThisNote ? 0.556 : 0.05) : 0.0;
         const double smoothCoeff = 0.999; /* ~10ms-ish at typical sample rates, gentle enough to remove the discontinuity without noticeably delaying the release character */
         layer->sustainAmountSmoothed = sustainTarget + (layer->sustainAmountSmoothed - sustainTarget) * smoothCoeff;
         return karplus_process(&layer->karplus, sustainFeed, layer->sustainAmountSmoothed);
@@ -1172,7 +1202,10 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          *
          * bitDepth: 16 (drive=0, effectively transparent -- bitcrush_
          * process's own comment notes 15 is "close to imperceptible";
-         * 16 is finer still) down to 4 (drive=1, a real, heavy crush).
+         * 16 is finer still) down to 6 (drive=1, a real, heavy crush --
+         * raised from an earlier floor of 4, per direct request: "on
+         * Drive amount, lets only bitcrush to 6 bit, not all the way
+         * to 1 because its not musical").
          *
          * Sample-rate reduction: interpolates the PitchedHold stage's
          * effective hold rate from the engine's own native sample rate
@@ -1186,7 +1219,7 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * convention as vibrato/the pitch filter below) so this
          * doesn't collapse the stereo image back to mono. */
         const double crushAmount = e->params.drive01 * e->params.drive01;
-        const int liveBitDepth = (int)(16.0 - crushAmount * 12.0 + 0.5); /* 16 down to 4 */
+        const int liveBitDepth = (int)(16.0 - crushAmount * 10.0 + 0.5); /* 16 down to 6 */
         const double cleanRateHz = e->sampleRate;
         const double crushedRateHz = v->freqHz * 1.5;
         const double effectiveRateHz = cleanRateHz + (crushedRateHz - cleanRateHz) * crushAmount;
@@ -1501,8 +1534,36 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
      * their own LOOP playback contributions) have already been summed
      * into mixL/mixR above -- so a voice reading from this buffer THIS
      * sample only ever sees what was written on a PAST sample, never
-     * the current one, avoiding any circular dependency. */
-    global_delay_line_write(&e->delayLine, mixL, mixR);
+     * the current one, avoiding any circular dependency.
+     *
+     * GATED by voice activity, per explicit follow-up request: "LOOP
+     * should always start sampling at 'new note on', not constantly
+     * listening. This makes it sound like an actual looped sample of
+     * whatever was played. Conversely, there's no reason to sample if
+     * no sound is playing." Two parts: (1) writing is SKIPPED entirely
+     * while no voice is active -- a genuinely continuous delay line
+     * (the previous design) would otherwise keep recording silence,
+     * or whatever faint tail was still decaying, forever, wasting the
+     * buffer's own limited length on nothing worth looping. (2) the
+     * moment playing RESUMES after a gap (detected via
+     * delayLineWasActive, tracking the PREVIOUS sample's own state),
+     * the buffer is reset to genuine silence and the write head
+     * restarts at 0 -- so a fresh capture always begins from actual
+     * silence, never replaying stale leftover audio from whatever was
+     * playing before the gap. This deliberately does NOT reset on
+     * every individual note-on within an already-playing passage
+     * (e.g. mid-chord, or overlapping notes) -- only on the specific
+     * transition from "nothing playing" to "something playing again"
+     * -- since resetting on every single note would otherwise erase
+     * earlier notes' own contribution to an in-progress capture. */
+    const int voicesActiveNow = noiseboy_any_voice_active(e);
+    if (voicesActiveNow && !e->delayLineWasActive) {
+        global_delay_line_reset(&e->delayLine);
+    }
+    if (voicesActiveNow) {
+        global_delay_line_write(&e->delayLine, mixL, mixR);
+    }
+    e->delayLineWasActive = voicesActiveNow;
 
     *outL = mixL * e->params.masterLevel01;
     *outR = mixR * e->params.masterLevel01;
