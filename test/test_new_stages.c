@@ -10,8 +10,7 @@ int main(void) {
     noiseboy_engine_init(&e, 48000.0, 0xABCDu);
 
     /* Max out everything that could interact badly */
-    e.params.loopIntensity01 = 1.0;
-    e.params.loopSpeedMul = 8.0; /* fast end of the real-time SPEED range */
+    e.params.loopLengthKnob01 = 1.0; /* max Loop Length (XX = 3.0s) */
     e.params.drive01 = 1.0;
 
     for (int i = 0; i < 4; i++) {

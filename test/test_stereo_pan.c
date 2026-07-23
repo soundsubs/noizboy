@@ -83,20 +83,19 @@ int main(void) {
         e.recipe[1].mixLevel01 = 0.0;
         e.recipe[2].mixLevel01 = 1.0;
         e.params.detuneSpread01 = 1.0;
-        /* amPhase (which drives Karplus's auto-pan) is now derived
-         * from loopSpeedMul/loopLengthSeconds, not a dedicated AM Rate
-         * knob -- see amPhase's own header comment. 0.25s (the
-         * shortest possible loop length) with speed=1.0 gives a 4Hz
-         * phase rate, easy to observe over 1 second, matching this
-         * test's original intent. */
-        e.loopLengthSeconds = 0.25;
-        e.params.loopSpeedMul = 1.0;
+        /* amPhase (which drives Karplus's auto-pan) is now a fixed,
+         * modest internal rate (0.5Hz, a 2-second full cycle) -- see
+         * amPhase's own header comment for the full history of what
+         * used to drive it. Window extended to 3 seconds (comfortably
+         * more than one full cycle) so both positive and negative
+         * excursions are reliably observed regardless of amPhase's
+         * randomized starting point. */
         noiseboy_note_on(&e, 60, 0.8);
 
         {
             int wentPositive = 0, wentNegative = 0;
             int finite_ok = 1;
-            for (int i = 0; i < 48000; i++) {
+            for (int i = 0; i < 144000; i++) {
                 double l, r;
                 noiseboy_process_stereo(&e, &l, &r);
                 if (isnan(l) || isnan(r) || isinf(l) || isinf(r)) finite_ok = 0;
@@ -107,7 +106,7 @@ int main(void) {
             printf("Karplus auto-pan (seed %u): wentPositive=%d wentNegative=%d (both should be 1 -- pan oscillates)\n",
                    karplusSeed, wentPositive, wentNegative);
             if (!finite_ok) { printf("  FAILED: non-finite\n"); all_ok = 0; }
-            if (!wentPositive || !wentNegative) { printf("  FAILED: pan should swing both directions over 1 second at 4Hz phase rate\n"); all_ok = 0; }
+            if (!wentPositive || !wentNegative) { printf("  FAILED: pan should swing both directions over 3 seconds at the fixed 0.5Hz phase rate\n"); all_ok = 0; }
         }
     }
 

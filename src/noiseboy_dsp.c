@@ -90,98 +90,69 @@ double karplus_process(KarplusString *k, double sustainFeedSample, double sustai
     return cur;
 }
 
-int postfilter_loop_alloc(PostFilterLoop *lp) {
-    lp->bufferL = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_MAX_SAMPLES);
-    lp->bufferR = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_MAX_SAMPLES);
-    if (!lp->bufferL || !lp->bufferR) {
-        free(lp->bufferL);
-        free(lp->bufferR);
-        lp->bufferL = NULL;
-        lp->bufferR = NULL;
-        return 0;
-    }
+int loop_source_alloc(LoopSource *lp) {
+    lp->buffer = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_MAX_SAMPLES);
+    if (!lp->buffer) return 0;
     return 1;
 }
 
-void postfilter_loop_free(PostFilterLoop *lp) {
-    free(lp->bufferL);
-    free(lp->bufferR);
-    lp->bufferL = NULL;
-    lp->bufferR = NULL;
+void loop_source_free(LoopSource *lp) {
+    free(lp->buffer);
+    lp->buffer = NULL;
 }
 
-void postfilter_loop_reset(PostFilterLoop *lp, int captureLengthSamples) {
+void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz, int captureLengthSamples) {
     if (captureLengthSamples < 2) captureLengthSamples = 2;
     if (captureLengthSamples > NOISEBOY_LOOP_MAX_SAMPLES) captureLengthSamples = NOISEBOY_LOOP_MAX_SAMPLES;
     lp->captureLengthSamples = captureLengthSamples;
-    lp->writePos = 0;
-    lp->filled = 0;
     lp->readPos = 0.0;
+    lp->playbackRate = freqHz / referenceFreqHz;
+
+    if (!lp->buffer) return; /* allocation failure fallback -- see loop_source_alloc's own comment; loop_process handles a NULL buffer safely too */
+
+    /* Instant fill, per explicit revert -- unlike the intervening
+     * post-filter design (which recorded the voice's own signal in
+     * real time), this captures raw noise all at once in a tight
+     * loop, exactly like the original pre-filter design and like
+     * karplus_pluck's own one-time excitation burst. This is WHY the
+     * full, already-pitch-transposed content is available from the
+     * very first sample of the note -- there's no waiting for
+     * real-time capture to complete. */
+    NoiseGen ng;
+    noisegen_init(&ng, xorshift_next(rngState));
+    for (int i = 0; i < captureLengthSamples; i++) {
+        lp->buffer[i] = noisegen_process(&ng, NOISE_WHITE);
+    }
 }
 
-void postfilter_loop_process(PostFilterLoop *lp, double drySampleL, double drySampleR, double readRateMul, double *outL, double *outR) {
-    if (!lp->bufferL || !lp->bufferR) {
-        /* Allocation failure fallback -- see postfilter_loop_alloc's
-         * own comment. No buffer to capture into or read from, so
-         * just pass the dry signal through unaffected rather than
-         * crashing on a NULL dereference. */
-        *outL = drySampleL;
-        *outR = drySampleR;
-        return;
-    }
-    if (!lp->filled) {
-        /* Still capturing -- record this sample.
-         *
-         * REAL BUG FOUND AND FIXED HERE: this used to output silence
-         * (0.0) here, on the theory that "the caller blends this
-         * against the dry signal by LOOP INTENSITY, so silence means
-         * no loop character yet". That reasoning was wrong -- the
-         * caller's blend is `dry*(1-intensity) + loopOut*intensity`,
-         * and with loopOut=0 that becomes `dry*(1-intensity)`, which
-         * at intensity=1 evaluates to fully SILENT, not "fully dry".
-         * Confirmed directly: comparing intensity=0 vs intensity=1
-         * during capture showed a large, real difference where there
-         * should have been none. Fix: output the dry sample itself
-         * here instead of silence -- then `dry*(1-i) + dry*i = dry`
-         * holds for every intensity value, which is what "no loop
-         * character yet, sounds untouched" actually requires. */
-        if (lp->writePos < lp->captureLengthSamples) {
-            lp->bufferL[lp->writePos] = drySampleL;
-            lp->bufferR[lp->writePos] = drySampleR;
-            lp->writePos++;
-            if (lp->writePos >= lp->captureLengthSamples) lp->filled = 1;
-        }
-        *outL = drySampleL;
-        *outR = drySampleR;
-        return;
-    }
+double loop_process(LoopSource *lp) {
+    if (!lp->buffer) return 0.0; /* allocation failure fallback */
 
     /* Nearest-neighbor read (plain int truncation, no interpolation)
      * -- matches this project's established "the artifacts are the
-     * point" philosophy for lo-fi sample-style rate shifting, same
-     * reasoning as the original pre-filter LOOP design. */
+     * point" philosophy for lo-fi sample-style pitch/rate shifting. */
     int idx = (int)lp->readPos;
     if (idx >= lp->captureLengthSamples) idx = idx % lp->captureLengthSamples;
 
-    /* Decay to near-silence by 97% through the loop, per explicit
-     * spec -- a PROPORTION of the captured length, not an absolute
-     * time, so this holds regardless of loop length or live SPEED
-     * adjustment (frac is always 0..1 relative to the buffer itself).
-     * Exponential (matching this project's established preference for
-     * natural-sounding decays elsewhere), tuned so decayGain reaches
-     * 0.001 (-60dB, a reasonable "near-silence" floor) at frac=0.97:
-     * exp(-k*0.97)=0.001 -> k = -ln(0.001)/0.97 ~= 7.12. */
+    /* Decay to near-silence by 98% through the loop, per explicit
+     * spec (raised from 97% in the intervening post-filter design --
+     * "It should not decay until 98% of the way through the loop.
+     * This mimics a real tape loop") -- a PROPORTION of the captured
+     * length, not an absolute time, so this holds regardless of loop
+     * length. Exponential, tuned so decayGain reaches 0.001 (-60dB, a
+     * reasonable "near-silence" floor) at frac=0.98:
+     * exp(-k*0.98)=0.001 -> k = -ln(0.001)/0.98 ~= 7.05. */
     const double frac = lp->readPos / (double)lp->captureLengthSamples;
-    const double decayGain = exp(-7.12 * frac);
-    *outL = lp->bufferL[idx] * decayGain;
-    *outR = lp->bufferR[idx] * decayGain;
+    const double decayGain = exp(-7.05 * frac);
+    const double out = lp->buffer[idx] * decayGain;
 
-    double rate = readRateMul;
-    if (rate < 0.01) rate = 0.01; /* defensive floor -- avoids a near-stuck or reversed read position from a pathological knob value */
+    double rate = lp->playbackRate;
+    if (rate < 0.01) rate = 0.01; /* defensive floor -- avoids a near-stuck or reversed read position from a pathological pitch */
     lp->readPos += rate;
     if (lp->readPos >= (double)lp->captureLengthSamples) {
         lp->readPos -= (double)lp->captureLengthSamples * floor(lp->readPos / (double)lp->captureLengthSamples);
     }
+    return out;
 }
 
 
@@ -432,7 +403,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
      * and can't just be a NULL-check on the buffer pointers. */
     if (e->initMagic == NOISEBOY_ENGINE_INIT_MAGIC) {
         for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-            postfilter_loop_free(&e->voices[v].loop);
+            loop_source_free(&e->voices[v].layers[3].loop);
         }
     }
 
@@ -443,13 +414,16 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
 
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         e->voices[v].active = 0;
-        if (!postfilter_loop_alloc(&e->voices[v].loop)) {
-            /* Allocation failure -- leave this voice's loop buffers
-             * NULL. postfilter_loop_process guards against NULL
-             * buffers (see its own comment) by falling back to
-             * passing the dry signal through unaffected, so a failed
-             * allocation degrades to "LOOP has no effect on this
-             * voice" rather than crashing. */
+        /* Loop lives at the fixed layer index 3 (the always-Loop slot
+         * -- see noiseboy_randomize_recipe's own comment) for every
+         * voice -- only that one slot ever needs this allocation, not
+         * all NOISEBOY_MAX_LAYERS of them. */
+        if (!loop_source_alloc(&e->voices[v].layers[3].loop)) {
+            /* Allocation failure -- leave this slot's buffer NULL.
+             * loop_process guards against a NULL buffer (see its own
+             * comment) by returning silence, so a failed allocation
+             * degrades to "this voice's Loop source is silent" rather
+             * than crashing. */
         }
     }
 
@@ -466,8 +440,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
      * noise via resonant filter" depends on. */
     e->params.filterCutoffOffset01 = 0.5;  /* neutral: filter tracks exactly at the played pitch */
     e->params.filterResonance01 = 0.82;
-    e->params.loopSpeedMul = 1.0;          /* neutral -- plays the captured buffer at its natural rate */
-    e->params.loopIntensity01 = 0.0;       /* off by default -- LOOP is a deliberate extra character, not a default-on effect (matches this project's established philosophy for AM/wavefold before it) */
+    e->params.loopLengthKnob01 = 0.0;      /* minimum (0.25s, the shortest XX) by default -- a reasonable, safe starting point */
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
@@ -506,8 +479,6 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
      * exponential/log-scale mappings which exist specifically to give
      * a KNOB more control resolution at one end; a one-time random
      * pick doesn't have that concern. */
-    e->loopLengthSeconds = NOISEBOY_LOOP_MIN_SECONDS + rand01(&e->rngState) * (NOISEBOY_LOOP_MAX_SECONDS - NOISEBOY_LOOP_MIN_SECONDS);
-
     /* Tape wobble depth -- see this field's own header comment. 1%-5%
      * (0.01-0.05), per explicit spec. */
     e->mellotronDepth01 = 0.01 + rand01(&e->rngState) * 0.04;
@@ -516,9 +487,13 @@ void noiseboy_randomize_recipe(NoiseboyEngine *e) {
         LayerRecipe *r = &e->recipe[i];
 
         /* Fixed type by index now, not randomized -- layers 0 and 1
-         * are always filtered-noise, layer 2 is always Karplus-Strong.
-         * See LayerRecipe's own comment for the full rationale. */
-        r->type = (i < 2) ? LAYER_FILTERED_NOISE : LAYER_KARPLUS_STRONG;
+         * are always filtered-noise, layer 2 is always Karplus-Strong,
+         * layer 3 is always Loop (restored per explicit revert
+         * request -- see LoopSource's own comment). See LayerRecipe's
+         * own comment for the full rationale. */
+        if (i < 2) r->type = LAYER_FILTERED_NOISE;
+        else if (i == 2) r->type = LAYER_KARPLUS_STRONG;
+        else r->type = LAYER_LOOP;
 
         double colourRoll = rand01(&e->rngState);
         r->colour = (colourRoll < 0.34) ? NOISE_WHITE : (colourRoll < 0.67) ? NOISE_PINK : NOISE_RED;
@@ -567,18 +542,15 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->gateOpen = 1;
     v->pendingSteal = 0;
     v->minHoldSamplesRemaining = 0;
-    v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't cycle in lockstep (vibrato/auto-pan/loop-sync all read this) */
+    v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't cycle in lockstep (vibrato/auto-pan all read this) */
 
-    /* Fresh loop capture every note, per PostFilterLoop's own comment
-     * -- explicit reset here (not just the lazy length-mismatch guard
-     * in noiseboy_process_stereo) matters specifically for a REUSED
-     * (stolen) voice: since loopLengthSeconds is recipe-level and
-     * fixed for the whole session, a new note landing on a voice whose
-     * PREVIOUS note used the same length would otherwise silently
-     * inherit that old note's already-captured (or partially-
-     * captured) buffer content instead of starting its own fresh
-     * capture. */
-    postfilter_loop_reset(&v->loop, (int)(e->loopLengthSeconds * e->sampleRate));
+    /* Fresh loop capture every note -- see LoopSource's own comment.
+     * This happens naturally in the per-layer loop below (loop_capture
+     * is called fresh every voice_start, same as karplus_pluck's own
+     * one-time excitation), so no separate reset call is needed here
+     * -- a stolen voice's previous note's buffer content is simply
+     * overwritten by the fresh capture, same as every other per-layer
+     * state below. */
 
     /* Fresh wobble seed per note, per-voice-distinct (not shared with
      * the engine's own rngState directly, to avoid correlating with
@@ -658,7 +630,7 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
              * for the full restructuring rationale. */
             noisegen_init(&layer->noiseGen, xorshift_next(&e->rngState));
             layer->releaseDarkenState = 0.0; /* starts fully bright/unfiltered -- see releaseDarkenState's own comment */
-        } else {
+        } else if (layer->type == LAYER_KARPLUS_STRONG) {
             karplus_init(&layer->karplus);
             layer->sustainAmountSmoothed = 0.0; /* starts at 0, smooths up toward the held target -- symmetric with how it smooths down at release */
             /* noiseGen initialized here too (previously only used for
@@ -730,6 +702,22 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             }
             dampingAmount = clampd(dampingAmount, 0.0, 1.0);
             karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, dampingAmount);
+        } else {
+            /* LAYER_LOOP -- restored per explicit revert request, see
+             * LoopSource's own comment for the full design. XX (the
+             * captured buffer's length) comes from the Loop Length
+             * knob's CURRENT value at this exact moment -- fixed for
+             * this note's whole duration once captured, not
+             * re-evaluated live mid-note. Exponential mapping (more
+             * knob resolution at the shorter, more commonly useful
+             * end), matching this project's established convention
+             * for duration-like parameters. Reference frequency is
+             * middle C, per the original design's own spec ("if
+             * middle C was 8000 samples..." -- same reference point,
+             * just no longer a fixed 8000-sample buffer). */
+            const double xxSeconds = NOISEBOY_LOOP_MIN_SECONDS * pow(NOISEBOY_LOOP_MAX_SECONDS / NOISEBOY_LOOP_MIN_SECONDS, e->params.loopLengthKnob01);
+            const int captureLengthSamples = (int)(xxSeconds * e->sampleRate);
+            loop_capture(&layer->loop, &e->rngState, layerFreq, midi_note_to_freq(60), captureLengthSamples);
         }
     }
 }
@@ -860,10 +848,36 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
          * than snapped instantly at the release boundary -- see
          * sustainAmountSmoothed's own comment for why. */
         double sustainFeed = noisegen_process(&layer->noiseGen, layer->colour);
-        double sustainTarget = v->gateOpen ? 0.02 : 0.0;
+        /* REAL BUG FOUND AND FIXED HERE, per direct report ("I'm still
+         * not hearing Karplus at all... seems to have gone when I
+         * requested a change to the envelope"): this was fixed at
+         * 0.02, far too quiet to be audible once the initial pluck's
+         * own energy decays -- especially now that 66% of notes are
+         * "plucky" (a fast, tight decay, added in the same batch of
+         * changes the report's own timing points to). Measured
+         * directly: a held plucky-mode note's SUSTAINED contribution
+         * (1+ second in, after the initial transient has died down)
+         * was only ~4% of a comparable noise generator's own level --
+         * meanwhile the two noise sources it's mixed with keep playing
+         * continuously at full level the whole time, so Karplus simply
+         * vanished under them for anything but a brief instant right
+         * at note-on. Raised to 0.2 (~10x), measured to land around
+         * 35% of a comparable noise generator's level -- clearly
+         * audible without letting the sustain feed's own noise
+         * injection overwhelm Karplus's actual plucked-string
+         * character, which is still it's own initial excitation +
+         * damping, not this ongoing top-up alone. */
+        double sustainTarget = v->gateOpen ? 0.2 : 0.0;
         const double smoothCoeff = 0.999; /* ~10ms-ish at typical sample rates, gentle enough to remove the discontinuity without noticeably delaying the release character */
         layer->sustainAmountSmoothed = sustainTarget + (layer->sustainAmountSmoothed - sustainTarget) * smoothCoeff;
         return karplus_process(&layer->karplus, sustainFeed, layer->sustainAmountSmoothed);
+    }
+
+    if (layer->type == LAYER_LOOP) {
+        /* Captured once at note-on (loop_capture, in voice_start) --
+         * see LoopSource's own comment for the full design. Just reads
+         * back here, one sample per call. */
+        return loop_process(&layer->loop);
     }
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
@@ -1004,18 +1018,18 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * a one-sample-early read makes no audible difference for a
          * continuously-incrementing phase accumulator.
          *
-         * REDESIGNED: this phase used to be driven directly by the AM
-         * Rate knob (one cycle per AM period). AM/wavefold are gone
-         * now (see PostFilterLoop's own comment for what replaced
-         * them), but Karplus's own auto-pan (below) still needs SOME
-         * rate to cycle at -- rather than introduce a separate,
-         * unrelated rate, this now derives from the loop's own
-         * effective repeat rate (loopSpeedMul / loopLengthSeconds --
-         * one full phase cycle per loop repetition), so a Karplus
-         * layer's stereo pan and the loop's own repeat cycle stay
-         * visibly/audibly tied together instead of drifting
-         * independently. */
-        v->amPhase += (e->params.loopSpeedMul / e->loopLengthSeconds) * dt;
+         * REDESIGNED, twice now: originally driven directly by the AM
+         * Rate knob (one cycle per AM period, before AM/wavefold were
+         * removed). Then, briefly, synced to the post-filter LOOP
+         * redesign's own live playback rate. Neither applies anymore
+         * -- AM/wavefold stayed gone even after LOOP reverted back to
+         * a pre-filter source, and the reverted LOOP has no live-rate
+         * concept to sync to (each note's own Loop Length is fixed at
+         * capture time, not a live multiplier). Karplus's own
+         * auto-pan (below) still needs SOME rate to cycle at, so this
+         * is now just a fixed, modest internal rate -- no knob
+         * controls it. */
+        v->amPhase += 0.5 * dt; /* 0.5Hz -- a slow, gentle auto-pan cycle */
         if (v->amPhase > 1.0) v->amPhase -= floor(v->amPhase);
 
         /* Stereo spreading, per explicit request: Detune (knob 7) now
@@ -1161,6 +1175,52 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * 0.94) -- a real, substantial improvement, though not
          * perfectly flat given that hard ceiling. */
         {
+            /* REAL, SEVERE BUG FOUND AND FIXED HERE, while investigating
+             * a report that Karplus had become essentially inaudible:
+             * this filter was genuinely, persistently self-oscillating
+             * at resonance settings this engine has always used by
+             * default. Verified directly and unambiguously: excite the
+             * filter with a single impulse, then feed it ZERO input
+             * for 10+ seconds -- it never decayed at all, still
+             * ringing at a steady, bounded amplitude the whole time
+             * (this is a genuine limit-cycle, not just "a long decay
+             * time" -- a linear decay factor added to the feedback
+             * path, tested directly, did essentially nothing to fix
+             * it, which is the signature of a NONLINEAR oscillator:
+             * the existing cubic soft-clip on the resonant node,
+             * combined with feedback gain above the true self-
+             * oscillation threshold, forms a stable limit cycle the
+             * same way a Van der Pol oscillator does -- the amplitude
+             * gets bounded, not damped toward zero). Once a filter
+             * locks into this state, it dominates the output
+             * regardless of what's actually feeding it -- explaining
+             * why Karplus (or anything else) can become inaudible
+             * even at a healthy mix level.
+             *
+             * Empirically found the TRUE stable ceiling for this
+             * filter's own resonance01 input (a direct sweep,
+             * checking genuine long-term decay, not just short-window
+             * peak gain like earlier resonance-evenness testing did --
+             * that's specifically why this was missed before): only
+             * ~0.15, consistent across the whole practical cutoff
+             * range (32Hz-2kHz tested). This is far below the 0.82
+             * default knob value, let alone the up-to-2.0 ceiling the
+             * resonance-evenness compensation could reach -- meaning
+             * this instability predates that fix and has likely been
+             * present since whenever the default resonance was set
+             * this high, not a new regression.
+             *
+             * Fix: the Resonance knob's full 0-100% feel is remapped
+             * onto this filter's ACTUAL safe range (capped at 0.14,
+             * a small margin below the measured 0.15 threshold) --
+             * not just clamped, which would leave much of the knob's
+             * upper range feeling dead/unresponsive. This is a real,
+             * audible character change to the instrument's resonant
+             * tone, not a subtle tweak -- flagging that directly, this
+             * is exactly the trade-off of fixing a genuine, long-
+             * standing instability rather than a cosmetic issue. */
+            const double safeResonanceCeiling = 0.14;
+
             /* Tape wobble, per explicit request -- see TapeWobble's
              * own header comment. One shared wobble value per voice
              * per sample, applied to cutoff, resonance, and (further
@@ -1175,7 +1235,8 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
             const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
-            const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul * voiceWobbleMul, 2.0);
+            const double baseResonance = e->params.filterResonance01 * safeResonanceCeiling;
+            const double pitchResonance = fmin(baseResonance * resonanceBoostMul * voiceWobbleMul, safeResonanceCeiling);
             if (v->pitchFilterKind == FILTER_MOOG) {
                 moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
                 moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);
@@ -1189,25 +1250,12 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             }
         }
 
-        /* Post-filter LOOP, per explicit request -- replaces the old
-         * AM/wavefold stage entirely. See PostFilterLoop's own comment
-         * for the full design. Capture length is fixed once at
-         * note-on (from the recipe-level loopLengthSeconds), not
-         * recomputed here every sample -- the guard below only
-         * protects against the rare case of a global re-randomize
-         * changing loopLengthSeconds while this voice is still
-         * mid-capture from an earlier setting, resetting cleanly
-         * rather than reading mismatched buffer state. */
-        {
-            const int captureLengthSamples = (int)(e->loopLengthSeconds * e->sampleRate);
-            if (v->loop.captureLengthSamples != captureLengthSamples) {
-                postfilter_loop_reset(&v->loop, captureLengthSamples);
-            }
-            double loopOutL, loopOutR;
-            postfilter_loop_process(&v->loop, voiceSumL, voiceSumR, e->params.loopSpeedMul, &loopOutL, &loopOutR);
-            voiceSumL = voiceSumL * (1.0 - e->params.loopIntensity01) + loopOutL * e->params.loopIntensity01;
-            voiceSumR = voiceSumR * (1.0 - e->params.loopIntensity01) + loopOutR * e->params.loopIntensity01;
-        }
+        /* Post-filter LOOP application REMOVED -- per explicit revert,
+         * LOOP is a pre-filter source again now (see process_layer's
+         * own LAYER_LOOP dispatch and LoopSource's own comment for the
+         * full history), mixed in with the other layers back in STEP
+         * 1 (source mixing) above, not applied here as a separate
+         * post-filter effect. */
 
         /* STEP 4: amplitude envelope, with tape wobble also applied to
          * output level -- see TapeWobble's own header comment. Same

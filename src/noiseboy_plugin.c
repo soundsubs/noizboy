@@ -114,17 +114,19 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
 
 static void destroy_instance(void *instance) {
     /* Loop buffers are separately heap-allocated (see
-     * postfilter_loop_alloc's own comment for why -- keeping
-     * NoiseboyEngine itself small enough to stack-declare safely
-     * elsewhere, like this project's own tests, while still
-     * supporting a full 3-second loop). free(instance) alone would
-     * free the outer calloc'd block but NOT these separately-
-     * allocated buffers -- a real leak on every instance destruction
-     * without this. */
+     * loop_source_alloc's own comment for why -- keeping NoiseboyEngine
+     * itself small enough to stack-declare safely elsewhere, like this
+     * project's own tests, while still supporting a full 3-second
+     * loop). free(instance) alone would free the outer calloc'd block
+     * but NOT these separately-allocated buffers -- a real leak on
+     * every instance destruction without this. Lives at the fixed
+     * layer index 3 (the always-Loop slot) now, per-layer rather than
+     * per-voice -- see LoopSource's own comment for the full LOOP
+     * revert/redesign history. */
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
     if (inst) {
         for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-            postfilter_loop_free(&inst->engine.voices[v].loop);
+            loop_source_free(&inst->engine.voices[v].layers[3].loop);
         }
     }
     free(instance);
@@ -171,23 +173,13 @@ static void set_param(void *instance, const char *key, const char *val) {
     } else if (strcmp(key, "resonance") == 0) {
         p->filterResonance01 = raw01;
     } else if (strcmp(key, "loop_length") == 0) {
-        /* SPEED knob, per explicit request -- real-time multiplier on
-         * playback rate through the fixed captured loop buffer (NOT
-         * the buffer's own length, which is loopLengthSeconds,
-         * randomized once at the recipe level -- see NoiseboyEngine's
-         * own field). Symmetric exponential range, knob centre =
-         * exactly 1.0x (normal/neutral speed) -- 0.125x at knob=0 (8x
-         * slower), 8.0x at knob=1 (8x faster). Chosen to put "no
-         * change" intuitively at centre, like a real tape-loop speed
-         * control, rather than an asymmetric range where centre would
-         * land on some arbitrary non-1.0 multiplier. */
-        p->loopSpeedMul = pow(2.0, (raw01 - 0.5) * 6.0);
-    } else if (strcmp(key, "loop_intensity") == 0) {
-        /* LOOP Intensity, per explicit request (formerly AM Depth) --
-         * blend between the dry, post-filter signal and the looped,
-         * decaying playback. See PostFilterLoop's own comment for the
-         * full design. */
-        p->loopIntensity01 = raw01;
+        /* LOOP Length (XX), per explicit revert/refinement request --
+         * see LoopSource's own comment for the full design history.
+         * Sets the master captured-buffer length directly across its
+         * full range, read fresh at each note's own start -- no
+         * longer a live real-time multiplier on an already-captured
+         * buffer ("SPEED goes away", per explicit confirmation). */
+        p->loopLengthKnob01 = raw01;
     } else if (strcmp(key, "attack") == 0) {
         p->attackMs = 0.5 + raw01 * 199.5; /* 0.5-200 ms */
     } else if (strcmp(key, "release") == 0) {
@@ -258,16 +250,15 @@ static const char *NOISEBOY_UI_HIERARCHY_JSON =
     "{\"levels\":{\"root\":{\"name\":\"NOIZBOY\",\"params\":["
     "{\"key\":\"filter_cutoff\",\"name\":\"Filter Offset\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"loop_intensity\",\"name\":\"LOOP Intensity\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"loop_length\",\"name\":\"Loop Length\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"detune_spread\",\"name\":\"Detune\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"tilt\",\"name\":\"TILT\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127}"
-    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"loop_intensity\",\"loop_length\",\"attack\",\"release\",\"detune_spread\",\"tilt\"]}}}";
+    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"drive\",\"loop_length\",\"attack\",\"release\",\"detune_spread\",\"tilt\"]}}}";
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
@@ -282,8 +273,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     double val01 = -1.0;
     if (strcmp(key, "filter_cutoff") == 0) val01 = p->filterCutoffOffset01;
     else if (strcmp(key, "resonance") == 0) val01 = p->filterResonance01;
-    else if (strcmp(key, "loop_length") == 0) val01 = log2(p->loopSpeedMul) / 6.0 + 0.5;
-    else if (strcmp(key, "loop_intensity") == 0) val01 = p->loopIntensity01;
+    else if (strcmp(key, "loop_length") == 0) val01 = p->loopLengthKnob01;
     else if (strcmp(key, "attack") == 0) val01 = (p->attackMs - 0.5) / 199.5;
     else if (strcmp(key, "release") == 0) val01 = log(p->releaseMs / 0.02) / log(4000.0 / 0.02);
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;

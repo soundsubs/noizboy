@@ -10,14 +10,14 @@ set, so sharing filter/noise character with it is deliberate.
 ## What it does
 
 Every time the module is instantiated (or the user hits Randomize),
-it randomizes a fixed "recipe": always exactly 3 sources -- two
-filtered-noise generators and one Karplus-Strong plucked-string --
-whose relative MIX LEVELS (0-100% each) are what's actually
-randomized, not their type or count. A source can randomize down to
-silent (e.g. "just the two noise sources this time"), a legitimate
-outcome, not an accident.
+it randomizes a fixed "recipe": always exactly 4 sources -- two
+filtered-noise generators, one Karplus-Strong plucked-string, and one
+Loop (a captured, pitch-transposed noise sample) -- whose relative MIX
+LEVELS (0-100% each) are what's actually randomized, not their type or
+count. A source can randomize down to silent (e.g. "just the two noise
+sources this time"), a legitimate outcome, not an accident.
 
-- **Filtered noise** (always 2 of the 3 sources): a noise generator
+- **Filtered noise** (always 2 of the 4 sources): a noise generator
   each (random colour: white/pink/red). During release, the raw
   source itself darkens naturally (a gentle lowpass that engages only
   as the note decays) -- the same kind of timbral evolution a real
@@ -29,41 +29,39 @@ outcome, not an accident.
   knob); 34% are "string mode" (a much longer, more variable ring-out,
   tied to the Release knob so the string's own natural decay and the
   amplitude envelope's release stay roughly in step).
+- **Loop** (always the 4th source): a captured buffer of raw noise,
+  instantly filled at each note's own start (not built up in real
+  time), read back on repeat and pitch-transposed by the played note
+  -- exactly like a cheap sampler pitching a fixed recording by
+  playback speed. The buffer's own length (XX, 0.25-3.0s) is set
+  directly by Loop Length (knob 4), read fresh at the start of every
+  note. Decays to near-silence by 98% of the way through each pass
+  before jumping back to full volume at the next repeat -- a
+  deliberate, audible "seam", mimicking a real tape loop rather than a
+  seamless drone.
 
-Per voice, the 3 sources mix together (raw, unfiltered) and
+Per voice, the 4 sources mix together (raw, unfiltered) and
 immediately pass through reintroduced bitcrush + pitch-following
 sample-rate reduction (the reduction rate is directly proportional to
 the played note's own frequency -- "sample rate follows key number"),
-then a single, shared, voice-level pitch-tracking filter (Moog
-Ladder, high resonance, tuned to the played note, with frequency-
-dependent resonance compensation so it reads more evenly across the
-keyboard). A slow, smoothly-wandering noise source (Mellotron-style
-"tape wobble", 1-5%, randomized once per recipe) subtly modulates that
-filter's cutoff and resonance, and the output level, together --
-mimicking the coherent instability of real tape speed fluctuation
-rather than three unrelated random textures.
-
-After the filter, a captured loop of the actual filtered/pitched
-signal (not raw pre-filter noise) can blend back in -- LOOP,
-replacing the old AM/wavefold stage. A fixed-length buffer (0.25-3.0s,
-randomized once per recipe) records the voice's own signal for exactly
-one loop length; until that capture completes, the voice sounds
-completely normal. Once captured, it plays back on repeat, decaying to
-near-silence by 97% of the way through each pass before jumping back
-to full volume at the next repeat -- an audible "seam", deliberately,
-the same "poorly looped sample" character this project has always
-gone for, just applied to real musical content now instead of raw
-noise. LOOP Intensity (knob 3) blends it in; Loop Length/SPEED (knob
-4) is a live, real-time multiplier on playback rate through that fixed
-buffer.
+then a single, shared, voice-level pitch-tracking filter (Moog Ladder,
+tuned to the played note, with frequency-dependent resonance
+compensation so it reads more evenly across the keyboard -- see
+"Status" for a real, previously-unknown stability issue found and
+fixed here, which meaningfully tamed this filter's resonance range).
+A slow, smoothly-wandering noise source (Mellotron-style "tape
+wobble", randomized once per recipe) subtly modulates that filter's
+cutoff and resonance, and the output level, together -- mimicking the
+coherent instability of real tape speed fluctuation rather than three
+unrelated random textures.
 
 Then the amplitude envelope (Attack/Release, knobs 5-6, an exponential/
 log-scale mapping so most of the knobs' range covers short, percussive
 times rather than wasting resolution on the long end).
 
-See "Signal chain" below for what happens after that (db-cell, then
-TILT) -- those live outside the per-voice engine, applied once on the
-final mix.
+See "Signal chain" below for what happens after that (db-cell, TILT,
+then a noise gate) -- those live outside the per-voice engine, applied
+once on the final mix.
 
 Playing is polyphonic (currently 4 voices -- see "Status", a
 diagnostic reduction from the original 8, CONFIRMED via direct testing
@@ -75,55 +73,132 @@ avoid clicks, not a sustained pad envelope).
 
 **Per-voice engine** (`noiseboy_process_stereo`):
 
-1. Sources -- always exactly 3 (2 filtered-noise, 1 Karplus-Strong),
-   mixed together by their randomized mix levels (raw, no per-layer
-   filtering). Filtered-noise sources darken on their own during
-   release, at this stage, before anything else touches them.
+1. Sources -- always exactly 4 (2 filtered-noise, 1 Karplus-Strong, 1
+   Loop), mixed together by their randomized mix levels (raw, no
+   per-layer filtering). Filtered-noise sources darken on their own
+   during release, at this stage, before anything else touches them.
+   Loop is captured instantly at each note's own start (see "What it
+   does").
 2. Bitcrush + pitch-following sample-rate reduction (reintroduced --
    see "Status"), applied to the mixed signal, before the filter.
-3. Voice-level pitch-tracking filter -- high resonance, tracks the
-   played note directly (knobs 1-2), frequency-compensated for more
-   even resonance across the keyboard. Cutoff and resonance both get a
-   subtle (1-5%) tape-wobble modulation here.
-4. LOOP -- a captured, decaying loop of this filter's own output,
-   blended in by LOOP Intensity (knob 3); playback rate through the
-   captured buffer is live-adjustable via Loop Length/SPEED (knob 4).
-   Replaces the old AM/wavefold stage entirely.
-5. Amplitude envelope (Attack/Release, knobs 5-6, exponential
+3. Voice-level pitch-tracking filter -- tracks the played note
+   directly (knobs 1-2), frequency-compensated for more even resonance
+   across the keyboard. Cutoff and resonance both get a subtle
+   tape-wobble modulation here. See "Status" for a real stability
+   issue found and fixed in this filter -- its usable resonance range
+   is meaningfully gentler now than earlier versions of this project.
+4. Amplitude envelope (Attack/Release, knobs 5-6, exponential
    mapping), with the same tape-wobble modulation from step 3 also
    applied to output level here.
 
 **Plugin wrapper** (`render_block`, applied once on the final mix,
 after all voices sum together):
 
-6. DBCELL -- the always-on ported pedal chain (see "Chaining into
+5. DBCELL -- the always-on ported pedal chain (see "Chaining into
    DISTROY" below).
-7. TILT (knob 8) -- an analog-tape-style EQ, not a filter that can
+6. TILT (knob 8) -- an analog-tape-style EQ, not a filter that can
    silence the signal. A fixed, always-present bandwidth window
    (gentle rolloff below ~100Hz, steeper rolloff above ~10kHz) that
    never goes away; the knob shifts the balance within that window
    toward bass or treble emphasis. db-cell's own always-on noise
    flows through this on its way out too, same as everything else.
-8. Noise gate -- the final stage. See "Status" for why this is back
-   after v0.16.0 removed it.
+7. Noise gate -- the final stage, guaranteeing genuine silence when
+   idle. See "Status" for why this is back after an earlier version
+   removed it.
 
 ## Controls (11 chain_params -- knobs 1-8, plus 3 more via the parameter menu)
 
 | Knob | Parameter | Range |
 |---|---|---|
 | 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
-| 2 | Resonance | resonance of the voice-level pitch-tracking filter; also blends into Karplus-Strong pluck damping (plucky-mode notes only -- string-mode notes use Release instead, see "What it does") |
-| 3 | LOOP Intensity | blend between the dry, post-filter signal and LOOP's captured/decaying playback, 0 = fully dry (default), 1 = fully looped |
-| 4 | Loop Length / SPEED | real-time multiplier on LOOP's playback rate through its fixed captured buffer -- NOT the buffer's own length (that's randomized once per recipe, 0.25-3.0s). Centre (64) = 1.0x/neutral; left down to 0.125x (8x slower); right up to 8.0x (8x faster) |
+| 2 | Resonance | resonance of the voice-level pitch-tracking filter; also blends into Karplus-Strong pluck damping (plucky-mode notes only -- string-mode notes use Release instead, see "What it does"). See "Status" for a real stability fix that meaningfully narrowed this knob's usable range from earlier versions |
+| 3 | Drive | single shared drive/saturation stage on the final mix -- moved here from the parameter menu now that LOOP no longer needs this knob for a wet/dry blend (it's a 4th mixed source now, see "What it does") |
+| 4 | Loop Length | sets Loop's own captured-buffer length (XX) directly across its full range (0.25-3.0s, exponential mapping) -- read fresh at the START of every note, not adjustable live mid-note. The played note's own pitch is what controls playback SPEED through that buffer (see "What it does") -- this knob only sets how long the buffer itself is |
 | 5 | Attack | envelope attack time, 0.5-200 ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
 | 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain. Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
-| 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise sources pan to fixed positions (reusing each source's own pitch-spread randomization); the Karplus source auto-pans back and forth once per LOOP repetition instead |
-| 8 | TILT | analog-tape-style EQ, the last stage before output (applied after DBCELL now, not before -- see "Signal chain"). NOT a filter that can silence the signal -- a fixed tape-bandwidth window (gentle rolloff below ~100Hz, steeper above ~10kHz) is always present. Centre (64) = neutral, no bass/treble emphasis. Left: bass emphasis (treble rolls off further). Right: treble emphasis (bass rolls off further) |
-| 9 | Drive | single shared drive/saturation stage on the final mix -- beyond the 8 physical knobs, reachable via the module's parameter menu |
-| 10 | Randomize | re-rolls the recipe (source mix levels, timbre/loop/wobble character) on demand, without reinstantiating the module -- rising-edge trigger (any 0->nonzero move fires it once); also reachable as a single jog-wheel-click action in the module's own menu screen |
+| 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise and Loop sources pan to fixed positions (reusing each source's own pitch-spread randomization); the Karplus source auto-pans back and forth at a fixed internal rate instead |
+| 8 | TILT | analog-tape-style EQ, applied after DBCELL, before the final noise gate (see "Signal chain"). NOT a filter that can silence the signal -- a fixed tape-bandwidth window (gentle rolloff below ~100Hz, steeper above ~10kHz) is always present. Centre (64) = neutral, no bass/treble emphasis. Left: bass emphasis (treble rolls off further). Right: treble emphasis (bass rolls off further) |
+| 9 | (menu only) | reserved -- Drive moved to knob 3; nothing currently occupies this menu-only slot |
+| 10 | Randomize | re-rolls the recipe (source mix levels, timbre/wobble character) on demand, without reinstantiating the module -- rising-edge trigger (any 0->nonzero move fires it once); also reachable as a single jog-wheel-click action in the module's own menu screen |
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.17.0** -- two major pieces of work, both stemming from direct
+reports that this project's own recent changes had made real things
+worse, not better. Being direct about the scale here rather than
+downplaying it.
+
+**1. Fixed a genuine, severe, long-standing pitch-filter instability.**
+While investigating a report that Karplus-Strong had become
+essentially inaudible, found something much bigger: the voice-level
+pitch-tracking filter was genuinely, persistently self-oscillating at
+every resonance setting this engine has ever used by default.
+Verified directly and unambiguously -- excite the filter with a single
+impulse, then feed it ZERO input for 10+ seconds, and it never decayed
+at all, still ringing at a steady, bounded amplitude the whole time.
+This is a genuine limit-cycle (the existing cubic soft-clip on the
+resonant node, combined with feedback gain above the true self-
+oscillation threshold, forms a stable limit cycle the same way a Van
+der Pol oscillator does), not just "a long decay time" -- confirmed by
+testing a linear decay factor on the feedback path, which did nothing
+to fix it (the signature of a nonlinear, not linear, stability
+problem). Empirically found the TRUE stable ceiling for this filter's
+own resonance input: only ~0.15, consistent across the whole practical
+cutoff range -- far below the 0.82 default knob value this project has
+used since early on, meaning this instability likely predates this
+whole session, not a new regression. Fixed by remapping the Resonance
+knob's full 0-100% feel onto the filter's actual, verified-stable
+range, rather than clamping (which would leave much of the knob's
+upper range feeling dead). This is a REAL, AUDIBLE change to the
+instrument's resonant tone, not a subtle tweak -- flagging that
+directly. Verified the fix actually solves the original complaint:
+Karplus's contribution to a held note, which previously vanished to
+0.0% of the mix within 500ms, now stays in the 2.8%-21.9% range
+throughout. Also found and fixed a smaller, real bug along the way:
+Karplus's own sustain-feed amount (keeps a held note ringing) was
+fixed at 0.02, measured at only ~4% of a comparable noise generator's
+level -- raised to 0.2 (~35%).
+
+**2. LOOP fully reverted to a per-layer, pre-filter source,** per
+direct feedback that the intervening post-filter redesign "isn't
+working like I envisioned... The old one worked and sounded better."
+Now a 4th fixed source (2 filtered-noise + 1 Karplus + 1 Loop, was 3),
+restored close to its original design (a captured noise buffer,
+pitch-transposed by the played note's own frequency, exactly like a
+sample player's pitch-via-playback-speed) with two refinements: the
+captured buffer's length (XX) is now knob-controlled (Loop Length,
+knob 4) across its full range, not a fixed 8000 samples, and every new
+note captures fresh at whatever XX the knob is set to at that exact
+moment -- captured INSTANTLY (like the original design), not recorded
+in real time the way the intervening version was, so the full,
+already-pitch-transposed content is available from a note's very
+first sample. Decay point raised from 97% to 98% through each loop
+pass, per explicit spec, to better mimic a real tape loop. Knob 3
+(formerly LOOP Intensity, now meaningless since LOOP is a mixed source
+again, not a live effect blend) is now DRIVE, moved here from its old
+menu-only position. Also fixed a real, separate, previously-
+undiscovered bug while reviewing this: `module.json`'s knob-8 entry
+still referenced the pre-TILT-rename key (`output_filter_freq`)
+instead of `tilt`, meaning that knob likely never actually worked on
+real hardware -- the plugin code has only recognized `"tilt"` since
+that rename, so a host sending `output_filter_freq` would have been
+silently ignored.
+
+Several tests rewritten for the new LOOP design (`test-loop`,
+`test-mixer`, `test-stereo`) and the resonance fix (`test-darken`'s
+zero-crossing proxy replaced with a direct measurement of the
+darkening mechanism's own state, after the indirect version proved too
+sensitive to unrelated filter changes across two separate sessions
+now). Full 23-suite run passes clean.
+
+**Known, deliberately unresolved trade-off carried into this
+version:** reintroduced bitcrush/rate-reduce (an earlier explicit
+request) measurably degrades pitch-tracking clarity at low notes now
+that the filter's resonance is properly stable and much gentler (it
+used to mask this artifact by dominating the spectrum). Not resolved
+here -- needs a decision on how to balance two explicit feature
+requests against each other, not a unilateral fix.
 
 **v0.16.1** -- re-added the noise gate, per direct report ("I can hear
 db-cell at the end making sound"). v0.16.0 removed the dedicated gate
