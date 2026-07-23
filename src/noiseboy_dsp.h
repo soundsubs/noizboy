@@ -280,6 +280,18 @@ void loop_source_free(LoopSource *lp);
  * NOISEBOY_LOOP_FIXED_SAMPLES now -- no knob or other input decides
  * it anymore. */
 void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz);
+/* Read-only: computes the SAME envelope gain loop_process is about to
+ * apply, WITHOUT advancing readPos or touching any state -- lets a
+ * caller apply this loop's envelope shape somewhere ELSE too (see
+ * noiseboy_process_stereo's own comment for why: LOOP's own mix level
+ * is independently randomized like any other source, so if it happens
+ * to land low/near-silent, DEPTH's own dip has nothing audible left to
+ * shape -- "the LOOP won't do anything," per direct report). Calling
+ * this does not replace calling loop_process -- loop_process still
+ * needs to run once per sample to actually advance the loop and
+ * produce LOOP's own source audio; this is an ADDITIONAL read of the
+ * same envelope value for a second purpose. */
+double loop_envelope_gain(const LoopSource *lp, double depth01);
 /* Reads back one sample per call, nearest-neighbor, with the
  * sustained-then-decay envelope applied (97% flat, final 3% dips
  * toward silence, dip amount set by depth01) -- see this struct's own

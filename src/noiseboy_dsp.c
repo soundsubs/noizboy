@@ -122,6 +122,22 @@ void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double 
     }
 }
 
+double loop_envelope_gain(const LoopSource *lp, double depth01) {
+    /* Sustained-then-decay envelope: flat (full level) for the first
+     * 97% of each pass; over the final 3%, linearly ramps down toward
+     * a target level set by DEPTH -- 0 = no dip at all (stays flat the
+     * whole way, no audible loop seam), 1 = dips all the way to true
+     * silence by the very end of the pass, before jumping back to full
+     * level at the next pass's start. See LoopSource's own comment for
+     * the full design and why this is exposed as its own read-only
+     * function (letting a caller apply the same shape to more than
+     * just this source's own audio). */
+    const double frac = lp->readPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+    if (frac < 0.97) return 1.0;
+    const double decayProgress = (frac - 0.97) / 0.03; /* 0..1 across the final 3% */
+    return 1.0 - depth01 * decayProgress;
+}
+
 double loop_process(LoopSource *lp, double depth01) {
     if (!lp->buffer) return 0.0; /* allocation failure fallback */
 
@@ -131,25 +147,7 @@ double loop_process(LoopSource *lp, double depth01) {
     int idx = (int)lp->readPos;
     if (idx >= NOISEBOY_LOOP_FIXED_SAMPLES) idx = idx % NOISEBOY_LOOP_FIXED_SAMPLES;
 
-    /* Sustained-then-decay envelope, REDESIGNED per explicit request:
-     * "lets make it follow a sustained path for 97% of its time, then
-     * it decays to 0" -- inverted from the previous design's
-     * continuous decay-throughout shape. Flat (full level) for the
-     * first 97% of each pass; over the final 3%, linearly ramps down
-     * toward a target level set by DEPTH (knob 4) -- 0 = no dip at all
-     * (target = 1.0, i.e. stays flat the whole way, no audible loop
-     * seam), 1 = dips all the way to true silence (target = 0.0) by
-     * the very end of the pass, before jumping back to full level at
-     * the next pass's start. Depth is the loop's own equivalent of how
-     * AM Depth used to work -- 0=off/1=full-swing -- just shaping this
-     * loop's own repeating envelope instead of an external tremolo
-     * oscillator. */
-    const double frac = lp->readPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
-    double envelopeGain = 1.0;
-    if (frac >= 0.97) {
-        const double decayProgress = (frac - 0.97) / 0.03; /* 0..1 across the final 3% */
-        envelopeGain = 1.0 - depth01 * decayProgress;
-    }
+    const double envelopeGain = loop_envelope_gain(lp, depth01);
     const double out = lp->buffer[idx] * envelopeGain;
 
     double rate = lp->playbackRate;
@@ -1043,6 +1041,15 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * exactly. */
         double voiceSumL = 0.0, voiceSumR = 0.0;
         double voiceWobbleMul = 1.0; /* set inside the pitch filter block below, per-sample tape wobble -- see TapeWobble's own comment; reused later for output level so all three modulation targets share the same underlying wobble value */
+        /* Captured HERE, before the layer-mixing loop below advances
+         * layer 3 (LOOP)'s own readPos, so this reflects the exact
+         * same envelope position LOOP's own source audio uses this
+         * sample -- see loop_envelope_gain's own comment and this
+         * project's own STEP 4 comment further down for why this gets
+         * applied to the WHOLE voice, not just LOOP's own signal.
+         * Layer 3 is always LOOP (the fixed 4-source recipe), so no
+         * type check needed here. */
+        const double loopWholeVoiceGain = loop_envelope_gain(&v->layers[3].loop, e->params.loopDepth01);
         for (int li = 0; li < v->numLayers; li++) {
             const double layerOut = process_layer(e, v, &v->layers[li]) * v->layers[li].mixLevel01;
             double panPos;
@@ -1269,9 +1276,24 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * output level -- see TapeWobble's own header comment. Same
          * per-sample wobble value that modulated the filter above,
          * reused here (not a fresh call) so all three targets ride
-         * the same underlying "tape speed" fluctuation coherently. */
-        voiceSumL = voiceSumL * v->envLevel * voiceWobbleMul;
-        voiceSumR = voiceSumR * v->envLevel * voiceWobbleMul;
+         * the same underlying "tape speed" fluctuation coherently.
+         * LOOP's own envelope gain also applied HERE, to the WHOLE
+         * voice, per direct request: "if LOOP = 127 (therefore ON) but
+         * the loop alg isnt feeding the mixer (or is inaudible) the
+         * LOOP won't do anything. Lets make the LOOP always impact
+         * amplitude by the curve we set earlier." LOOP's own mix level
+         * is independently randomized like any other source (see
+         * LayerRecipe's own comment) -- if it happens to land low or
+         * near-silent, DEPTH's dip would previously have nothing
+         * audible left to shape, since it only multiplied LOOP's own
+         * per-layer signal. Applying the SAME envelope value (captured
+         * before the layer-mixing loop above, so it matches exactly
+         * what LOOP's own source used this sample) to the whole voice
+         * too means the sustained-then-decay "chop" character is
+         * always audible at DEPTH > 0, regardless of how loud LOOP's
+         * own captured-noise timbre happens to be in the mix. */
+        voiceSumL = voiceSumL * v->envLevel * voiceWobbleMul * loopWholeVoiceGain;
+        voiceSumR = voiceSumR * v->envLevel * voiceWobbleMul * loopWholeVoiceGain;
 
         /* Output Filt / TILT REMOVED from here, per explicit request:
          * "lets move the db-cell technology to before the TILT... this

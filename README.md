@@ -117,7 +117,7 @@ after all voices sum together):
 | 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
 | 2 | Resonance | resonance of the voice-level pitch-tracking filter -- constant while a note plays, no envelope or release dependency of any kind. Full range, no safety cap; higher settings ARE genuinely self-oscillating (a deliberate choice, reverted at direct request -- see "Status") |
 | 3 | Drive | dual role: (1) single shared drive/saturation stage on the final mix, unchanged from before; (2) also now controls bitcrush + pitch-following sample-rate reduction, non-linearly -- centre-left/off (0) = effectively clean (16-bit, full native sample rate); turning clockwise degrades both bit depth and effective sample rate together, accelerating toward the top of the range. Live-controllable, not fixed per note |
-| 4 | Loop Depth | controls how far Loop's own sustained-then-decay envelope dips each pass -- 0 = no dip at all (flat, drone-like), 1 = dips all the way to true silence by the end of each pass. Has zero influence on length or pitch -- those track only the played note now (see "What it does"), the same way a real tape sampler's playback speed (not the tape's own length) is what changes with note number |
+| 4 | Loop Depth | controls how far Loop's own sustained-then-decay envelope dips each pass -- 0 = no dip at all (flat, drone-like), 1 = dips all the way to true silence by the end of each pass. Applied to the WHOLE VOICE's amplitude, not just Loop's own source signal, so the dip is audible even if Loop's own randomized mix level happens to be quiet. Has zero influence on length or pitch -- those track only the played note now (see "What it does"), the same way a real tape sampler's playback speed (not the tape's own length) is what changes with note number |
 | 5 | Attack | envelope attack time, 0.5-200 ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
 | 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain. Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
 | 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise and Loop sources pan to fixed positions (reusing each source's own pitch-spread randomization); the Karplus source auto-pans back and forth at a fixed internal rate instead |
@@ -127,6 +127,33 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.21.0** -- LOOP's sustained-then-decay envelope now shapes the
+WHOLE VOICE's amplitude, not just LOOP's own per-layer signal, per
+direct report: "if LOOP = 127 (therefore ON) but the loop alg isnt
+feeding the mixer (or is inaudible) the LOOP won't do anything. Lets
+make the LOOP always impact amplitude by the curve we set earlier."
+LOOP's own mix level is independently randomized like any other source
+(see LayerRecipe's own comment) -- previously, if it happened to land
+low or near-silent, Depth's own dip had nothing audible left to shape,
+since the envelope only multiplied LOOP's own captured-noise signal.
+Now the exact same envelope value (captured once per sample, before
+LOOP's own readPos advances, so it stays perfectly in sync with what
+LOOP's own source uses that same sample) also multiplies the entire
+voice's output -- so the sustained-then-chop character is always
+audible at Depth > 0, regardless of how loud LOOP's own timbre happens
+to be in the mix. Verified directly: with LOOP's own mix level forced
+to 0 (the exact reported scenario), the whole voice's amplitude still
+dips sharply near the end of each loop cycle (measured peak ~0.04 near
+the cycle's end vs. ~0.40 mid-cycle) and recovers immediately after the
+wrap. New test added (`test_loop_layer.c`'s 8th check) confirming this
+directly, tracking LOOP's own readPos alongside the voice's output to
+know exactly where in each cycle a measurement falls (an earlier,
+manual verification attempt during this same session got this wrong by
+not accounting for how far the loop had already progressed by the time
+a test's own measurement window began -- a lesson specifically folded
+into how the permanent test is structured). Full 24-suite run passes
+clean.
 
 **v0.20.0** -- LOOP redesigned again, per direct feedback that it
 still didn't need what remained of the previous design: "it doesn't

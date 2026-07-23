@@ -176,6 +176,60 @@ int main(void) {
         else printf("PASSED\n");
     }
 
+    /* Test 8: LOOP's envelope shape impacts the WHOLE VOICE's
+       amplitude, per direct request -- "if LOOP = 127 (therefore ON)
+       but the loop alg isnt feeding the mixer (or is inaudible) the
+       LOOP won't do anything. Lets make the LOOP always impact
+       amplitude by the curve we set earlier." Verify the whole-voice
+       output genuinely dips near the end of each loop cycle even with
+       LOOP's OWN source contribution fully muted (mixLevel01=0) --
+       confirming the modulation comes from applying loop_envelope_gain
+       to the voice as a whole, not from LOOP's own audio being loud in
+       the mix. Uses raw LoopSource calls directly (not the full
+       engine) to know exactly where in the cycle each sample falls,
+       avoiding the indexing mistake an earlier, manual version of this
+       same test made (measuring the wrong portion of a loop cycle
+       relative to when the voice's own note-on/attack settle period
+       had already advanced it). */
+    {
+        NoiseboyEngine e;
+        noiseboy_engine_init(&e, 48000.0, 42u);
+        e.params.loopDepth01 = 1.0;
+        e.recipe[3].mixLevel01 = 0.0; /* LOOP's own source contribution fully muted -- the exact reported scenario */
+        e.recipe[0].mixLevel01 = 0.8;
+        e.recipe[1].mixLevel01 = 0.8;
+        e.recipe[2].mixLevel01 = 0.0;
+        e.params.filterResonance01 = 0.0; /* isolate from the (now genuinely resonant) pitch filter's own ringing, per direct request elsewhere -- keep this test about the envelope multiplier specifically */
+        noiseboy_note_on(&e, 60, 0.8);
+        /* Track LOOP's own readPos alongside the voice's output so we
+           know exactly when a wrap (start of a fresh cycle) happens,
+           rather than assuming a fixed sample offset. */
+        double prevReadPos = e.voices[0].layers[3].loop.readPos;
+        double peakNearWrap = 0.0, peakMidCycle = 0.0;
+        int sawWrap = 0;
+        for (int i = 0; i < 48000; i++) { /* run several full cycles */
+            double l, r;
+            noiseboy_process_stereo(&e, &l, &r);
+            double curReadPos = e.voices[0].layers[3].loop.readPos;
+            if (i > 4800) { /* past the attack settle */
+                if (curReadPos < prevReadPos) sawWrap = 1; /* wrapped this sample -- was at the very end of a cycle last sample */
+                double frac = prevReadPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+                if (frac > 0.995) { if (fabs(l) > peakNearWrap) peakNearWrap = fabs(l); }
+                if (frac > 0.3 && frac < 0.6) { if (fabs(l) > peakMidCycle) peakMidCycle = fabs(l); }
+            }
+            prevReadPos = curReadPos;
+        }
+        printf("\nWith LOOP's own mixLevel01=0: peak amplitude near end of cycle (>99.5%%)=%.5f, peak mid-cycle (30-60%%)=%.5f, wrap observed=%d\n",
+               peakNearWrap, peakMidCycle, sawWrap);
+        if (!sawWrap) { printf("FAILED: test didn't run long enough to observe a full loop cycle\n"); all_ok = 0; }
+        else if (peakNearWrap > peakMidCycle * 0.3) {
+            printf("FAILED: expected a clear amplitude dip near the end of each cycle, even with LOOP's own source muted\n");
+            all_ok = 0;
+        } else {
+            printf("PASSED: whole-voice amplitude dips near the end of each cycle regardless of LOOP's own mix level\n");
+        }
+    }
+
     printf(all_ok ? "\nALL LOOP CHECKS PASSED\n" : "\nSOME LOOP CHECKS FAILED\n");
     return all_ok ? 0 : 1;
 }
