@@ -91,7 +91,7 @@ double karplus_process(KarplusString *k, double sustainFeedSample, double sustai
 }
 
 int loop_source_alloc(LoopSource *lp) {
-    lp->buffer = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_MAX_SAMPLES);
+    lp->buffer = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_FIXED_SAMPLES);
     if (!lp->buffer) return 0;
     return 1;
 }
@@ -101,56 +101,62 @@ void loop_source_free(LoopSource *lp) {
     lp->buffer = NULL;
 }
 
-void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz, int captureLengthSamples) {
-    if (captureLengthSamples < 2) captureLengthSamples = 2;
-    if (captureLengthSamples > NOISEBOY_LOOP_MAX_SAMPLES) captureLengthSamples = NOISEBOY_LOOP_MAX_SAMPLES;
-    lp->captureLengthSamples = captureLengthSamples;
+void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz) {
     lp->readPos = 0.0;
     lp->playbackRate = freqHz / referenceFreqHz;
 
     if (!lp->buffer) return; /* allocation failure fallback -- see loop_source_alloc's own comment; loop_process handles a NULL buffer safely too */
 
-    /* Instant fill, per explicit revert -- unlike the intervening
-     * post-filter design (which recorded the voice's own signal in
-     * real time), this captures raw noise all at once in a tight
-     * loop, exactly like the original pre-filter design and like
-     * karplus_pluck's own one-time excitation burst. This is WHY the
-     * full, already-pitch-transposed content is available from the
+    /* Instant fill -- captures raw noise all at once in a tight loop,
+     * like karplus_pluck's own one-time excitation burst. This is WHY
+     * the full, already-pitch-transposed content is available from the
      * very first sample of the note -- there's no waiting for
-     * real-time capture to complete. */
+     * real-time capture to complete. Buffer length is always
+     * NOISEBOY_LOOP_FIXED_SAMPLES now -- no knob or other input
+     * decides it, per explicit redesign (see LoopSource's own
+     * comment). */
     NoiseGen ng;
     noisegen_init(&ng, xorshift_next(rngState));
-    for (int i = 0; i < captureLengthSamples; i++) {
+    for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
         lp->buffer[i] = noisegen_process(&ng, NOISE_WHITE);
     }
 }
 
-double loop_process(LoopSource *lp) {
+double loop_process(LoopSource *lp, double depth01) {
     if (!lp->buffer) return 0.0; /* allocation failure fallback */
 
     /* Nearest-neighbor read (plain int truncation, no interpolation)
      * -- matches this project's established "the artifacts are the
      * point" philosophy for lo-fi sample-style pitch/rate shifting. */
     int idx = (int)lp->readPos;
-    if (idx >= lp->captureLengthSamples) idx = idx % lp->captureLengthSamples;
+    if (idx >= NOISEBOY_LOOP_FIXED_SAMPLES) idx = idx % NOISEBOY_LOOP_FIXED_SAMPLES;
 
-    /* Decay to near-silence by 98% through the loop, per explicit
-     * spec (raised from 97% in the intervening post-filter design --
-     * "It should not decay until 98% of the way through the loop.
-     * This mimics a real tape loop") -- a PROPORTION of the captured
-     * length, not an absolute time, so this holds regardless of loop
-     * length. Exponential, tuned so decayGain reaches 0.001 (-60dB, a
-     * reasonable "near-silence" floor) at frac=0.98:
-     * exp(-k*0.98)=0.001 -> k = -ln(0.001)/0.98 ~= 7.05. */
-    const double frac = lp->readPos / (double)lp->captureLengthSamples;
-    const double decayGain = exp(-7.05 * frac);
-    const double out = lp->buffer[idx] * decayGain;
+    /* Sustained-then-decay envelope, REDESIGNED per explicit request:
+     * "lets make it follow a sustained path for 97% of its time, then
+     * it decays to 0" -- inverted from the previous design's
+     * continuous decay-throughout shape. Flat (full level) for the
+     * first 97% of each pass; over the final 3%, linearly ramps down
+     * toward a target level set by DEPTH (knob 4) -- 0 = no dip at all
+     * (target = 1.0, i.e. stays flat the whole way, no audible loop
+     * seam), 1 = dips all the way to true silence (target = 0.0) by
+     * the very end of the pass, before jumping back to full level at
+     * the next pass's start. Depth is the loop's own equivalent of how
+     * AM Depth used to work -- 0=off/1=full-swing -- just shaping this
+     * loop's own repeating envelope instead of an external tremolo
+     * oscillator. */
+    const double frac = lp->readPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+    double envelopeGain = 1.0;
+    if (frac >= 0.97) {
+        const double decayProgress = (frac - 0.97) / 0.03; /* 0..1 across the final 3% */
+        envelopeGain = 1.0 - depth01 * decayProgress;
+    }
+    const double out = lp->buffer[idx] * envelopeGain;
 
     double rate = lp->playbackRate;
     if (rate < 0.01) rate = 0.01; /* defensive floor -- avoids a near-stuck or reversed read position from a pathological pitch */
     lp->readPos += rate;
-    if (lp->readPos >= (double)lp->captureLengthSamples) {
-        lp->readPos -= (double)lp->captureLengthSamples * floor(lp->readPos / (double)lp->captureLengthSamples);
+    if (lp->readPos >= (double)NOISEBOY_LOOP_FIXED_SAMPLES) {
+        lp->readPos -= (double)NOISEBOY_LOOP_FIXED_SAMPLES * floor(lp->readPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES);
     }
     return out;
 }
@@ -440,7 +446,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
      * noise via resonant filter" depends on. */
     e->params.filterCutoffOffset01 = 0.5;  /* neutral: filter tracks exactly at the played pitch */
     e->params.filterResonance01 = 0.82;
-    e->params.loopLengthKnob01 = 0.0;      /* knob start (0) = 100% = 3.0s, the longest XX, per the corrected mapping */
+    e->params.loopDepth01 = 0.0;           /* off by default (no dip -- flat/undipped), matching this project's own established default for AM Depth before it, the knob this now takes after */
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
@@ -698,31 +704,14 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             dampingAmount = clampd(dampingAmount, 0.0, 1.0);
             karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, dampingAmount);
         } else {
-            /* LAYER_LOOP -- restored per explicit revert request, see
-             * LoopSource's own comment for the full design. XX (the
-             * captured buffer's length) comes from the Loop Length
-             * knob's CURRENT value at this exact moment -- fixed for
-             * this note's whole duration once captured, not
-             * re-evaluated live mid-note. Reference frequency is
-             * middle C, per the original design's own spec ("if
-             * middle C was 8000 samples..." -- same reference point,
-             * just no longer a fixed 8000-sample buffer).
-             *
-             * REAL BUG FOUND AND FIXED HERE: knob direction was
-             * backwards from spec. Per explicit correction: "Loop
-             * Length should start at 100% (maximum 3 seconds) and
-             * reduce to 1% while turning clockwise" -- knob=0 (start)
-             * -> 3.0s (100% of max), knob=1 (fully clockwise) -> 1% of
-             * max (0.03s), linear in percent-of-max (which is linear
-             * in seconds too, since percent-of-a-fixed-max is just a
-             * linear rescaling). The first version had this both
-             * backwards (clockwise INcreased length) and using an
-             * exponential curve with a much higher floor
-             * (NOISEBOY_LOOP_MIN_SECONDS, 0.25s) instead of the
-             * literal 1%-of-max spec. */
-            const double xxSeconds = NOISEBOY_LOOP_MAX_SECONDS * (1.0 - e->params.loopLengthKnob01 * 0.99);
-            const int captureLengthSamples = (int)(xxSeconds * e->sampleRate);
-            loop_capture(&layer->loop, &e->rngState, layerFreq, midi_note_to_freq(60), captureLengthSamples);
+            /* LAYER_LOOP -- see LoopSource's own comment for the full
+             * design/redesign history. Buffer length is fixed
+             * (NOISEBOY_LOOP_FIXED_SAMPLES) now -- no knob involved in
+             * capture at all, per explicit request ("it doesn't need
+             * a knob to decide length, it should only be tracking note
+             * number"). Reference frequency is middle C, matching this
+             * feature's original design. */
+            loop_capture(&layer->loop, &e->rngState, layerFreq, midi_note_to_freq(60));
         }
     }
 }
@@ -836,10 +825,8 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
      * bitcrush/rate-reduce -> voice-level pitch-tracking filter ->
      * amplitude envelope -> output filter, all in noiseboy_process.
      * No filter and no PitchedHold pitch stage here anymore -- both
-     * moved out. (e) is unused now that there's no per-layer knob
-     * lookup happening in this function; kept in the signature to
-     * avoid touching every call site. */
-    (void)e;
+     * moved out. (e) IS used now, for LAYER_LOOP's own DEPTH knob
+     * lookup (e->params.loopDepth01) -- see that branch below. */
     if (layer->type == LAYER_KARPLUS_STRONG) {
         /* Small ongoing noise injection while the note is held (fades
          * toward 0 once released, letting the string decay/ring out
@@ -882,8 +869,10 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
     if (layer->type == LAYER_LOOP) {
         /* Captured once at note-on (loop_capture, in voice_start) --
          * see LoopSource's own comment for the full design. Just reads
-         * back here, one sample per call. */
-        return loop_process(&layer->loop);
+         * back here, one sample per call, with DEPTH (knob 4) live-
+         * controlling how far the loop's own sustained-then-decay
+         * envelope dips each pass. */
+        return loop_process(&layer->loop, e->params.loopDepth01);
     }
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
@@ -1239,7 +1228,23 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
             const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
-            const double pitchResonance = fmin(e->params.filterResonance01 * resonanceBoostMul * voiceWobbleMul, 2.0);
+            /* Knob rescaled per direct calibration: "resonance is out
+             * of control by the time it hits 30, which is roughly 1/3
+             * its range... lets work to reduce it so that 30 is the
+             * maximum." Verified directly: at knob=30/127, EVERY tested
+             * note across the keyboard was already genuinely unstable
+             * (the same self-oscillation this project has measured
+             * before, not a subjective-only judgment). A straight
+             * proportional rescale of the raw knob value -- not a hard
+             * cap on the final resonance -- so the full 0-127 range
+             * maps onto what used to be 0-30: this keeps the ENTIRE
+             * knob meaningfully expressive throughout its range, rather
+             * than a cap that would leave much of the upper range
+             * feeling dead once resonance hits its ceiling (exactly the
+             * "too tame" complaint an earlier, hard-capped version of
+             * this fix drew). */
+            const double knobRescale = 30.0 / 127.0;
+            const double pitchResonance = fmin(e->params.filterResonance01 * knobRescale * resonanceBoostMul * voiceWobbleMul, 2.0);
             if (v->pitchFilterKind == FILTER_MOOG) {
                 moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
                 moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);

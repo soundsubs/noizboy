@@ -172,14 +172,15 @@ static void set_param(void *instance, const char *key, const char *val) {
         p->filterCutoffOffset01 = raw01;
     } else if (strcmp(key, "resonance") == 0) {
         p->filterResonance01 = raw01;
-    } else if (strcmp(key, "loop_length") == 0) {
-        /* LOOP Length (XX), per explicit revert/refinement request --
-         * see LoopSource's own comment for the full design history.
-         * Sets the master captured-buffer length directly across its
-         * full range, read fresh at each note's own start -- no
-         * longer a live real-time multiplier on an already-captured
-         * buffer ("SPEED goes away", per explicit confirmation). */
-        p->loopLengthKnob01 = raw01;
+    } else if (strcmp(key, "loop_depth") == 0) {
+        /* LOOP Depth, per explicit redesign request -- see LoopSource's
+         * own comment for the full design history. No longer controls
+         * length at all (that's fixed, tracking only the played note's
+         * pitch now, "how a real tape sampler would work") -- controls
+         * how far the loop's own sustained-then-decay envelope dips
+         * each pass, the loop's own equivalent of how AM Depth used to
+         * work: 0 = no dip, 1 = dips to true silence. */
+        p->loopDepth01 = raw01;
     } else if (strcmp(key, "attack") == 0) {
         p->attackMs = 0.5 + raw01 * 199.5; /* 0.5-200 ms */
     } else if (strcmp(key, "release") == 0) {
@@ -251,14 +252,14 @@ static const char *NOISEBOY_UI_HIERARCHY_JSON =
     "{\"key\":\"filter_cutoff\",\"name\":\"Filter Offset\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"drive\",\"name\":\"Drive\",\"type\":\"int\",\"min\":0,\"max\":127},"
-    "{\"key\":\"loop_length\",\"name\":\"Loop Length\",\"type\":\"int\",\"min\":0,\"max\":127},"
+    "{\"key\":\"loop_depth\",\"name\":\"Loop Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"detune_spread\",\"name\":\"Detune\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"tilt\",\"name\":\"TILT\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"randomize\",\"name\":\"Randomize\",\"type\":\"int\",\"min\":0,\"max\":127},"
     "{\"key\":\"master_level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127}"
-    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"drive\",\"loop_length\",\"attack\",\"release\",\"detune_spread\",\"tilt\"]}}}";
+    "],\"knobs\":[\"filter_cutoff\",\"resonance\",\"drive\",\"loop_depth\",\"attack\",\"release\",\"detune_spread\",\"tilt\"]}}}";
 
 static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
@@ -273,7 +274,7 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     double val01 = -1.0;
     if (strcmp(key, "filter_cutoff") == 0) val01 = p->filterCutoffOffset01;
     else if (strcmp(key, "resonance") == 0) val01 = p->filterResonance01;
-    else if (strcmp(key, "loop_length") == 0) val01 = p->loopLengthKnob01;
+    else if (strcmp(key, "loop_depth") == 0) val01 = p->loopDepth01;
     else if (strcmp(key, "attack") == 0) val01 = (p->attackMs - 0.5) / 199.5;
     else if (strcmp(key, "release") == 0) val01 = log(p->releaseMs / 0.02) / log(4000.0 / 0.02);
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;

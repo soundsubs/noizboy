@@ -42,14 +42,14 @@
  * comment for the full LOOP redesign/revert. */
 #define NOISEBOY_MAX_LAYERS 4
 #define NOISEBOY_KS_MAX_SAMPLES 2400 /* enough delay-line length for the lowest supported note (~A0, 27.5Hz) at up to 48kHz-ish sample rates, with headroom */
-/* Per explicit revert -- see LoopSource's own comment for the full
- * history. Buffer sized for the maximum possible loop length (3.0
- * seconds) at a generous assumed sample rate ceiling (48kHz) -- if
- * ever run at a much higher sample rate this would need revisiting,
- * but this project has always targeted Move's fixed rate. */
-#define NOISEBOY_LOOP_MAX_SECONDS 3.0
-#define NOISEBOY_LOOP_MIN_SECONDS 0.25
-#define NOISEBOY_LOOP_MAX_SAMPLES 144000 /* 3.0s * 48000Hz */
+/* Per explicit redesign -- see LoopSource's own comment for the full
+ * history. Fixed buffer length now, matching this feature's own
+ * original design before any length knob ever existed -- "it doesn't
+ * need a knob to decide length, it should only be tracking note
+ * number." 8000 samples (~167ms at 48kHz) -- at middle C (playbackRate
+ * 1.0) that's the loop's own period; other notes transpose this by
+ * playback speed the same way a sample player would. */
+#define NOISEBOY_LOOP_FIXED_SAMPLES 8000
 #define NOISEBOY_ENGINE_INIT_MAGIC 0x4E42214Fu /* arbitrary, just needs to be a value fresh/garbage stack memory won't plausibly already contain -- see NoiseboyEngine's own initMagic field comment */
 
 /* ---- New for NOISEBOY ---- */
@@ -196,10 +196,12 @@ double tape_wobble_process(TapeWobble *w, double rateHz, double sampleRate);
  * from the type rotation when the mixer became fixed at 3 sources
  * (2 noise + 1 Karplus), then briefly became a totally different,
  * post-filter, non-pitch-transposing effect, then reverted back to
- * this original per-layer, pitch-transposing, pre-filter design (now
- * with a knob-controlled master length instead of a fixed 8000-sample
- * buffer) once that post-filter version turned out not to work as
- * envisioned. */
+ * this original per-layer, pitch-transposing, pre-filter design (with
+ * a knob-controlled master length), then had that length knob removed
+ * again ("it doesn't need a knob to decide length, it should only be
+ * tracking note number... how a real tape sampler would work") in
+ * favor of a fixed technical buffer length and a knob now controlling
+ * DEPTH of the loop's own sustain/decay shape instead. */
 typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG, LAYER_LOOP } LayerType;
 /* FILTER_KORG_HP is intentionally no longer selected by the
  * randomizer (see randomizeCell-equivalent logic in the .c file) --
@@ -213,83 +215,77 @@ typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG, LAYER_LOOP } Laye
  * superseded options around for a possible future revert. */
 typedef enum { FILTER_MOOG = 0, FILTER_KORG_LP, FILTER_KORG_HP } FilterKind;
 
-/* LOOP -- REVERTED back to a per-layer, PRE-filter sound-generation
- * "engine" (like Filtered Noise and Karplus), per direct feedback
- * that the intervening post-filter redesign (a per-voice effect
- * blended in after the pitch-tracking filter, with a recipe-random,
- * not-note-linked length) "isn't working like I envisioned... The old
- * one worked and sounded better." Restored close to its ORIGINAL
- * design (a captured noise buffer, pitch-transposed by variable read
- * rate, so loop length transposes with the played note -- exactly
- * like a sample player's pitch-via-playback-speed), but with two
- * refinements from the same conversation that revealed problems with
- * the original 8000-sample fixed buffer:
+/* LOOP -- a per-layer, PRE-filter sound-generation "engine" (like
+ * Filtered Noise and Karplus), REDESIGNED again per direct feedback:
+ * "it doesn't need a knob to decide length, it should only be
+ * tracking note number. This is how a real tape sampler would work."
+ * Length is no longer knob-controlled at all -- back to a FIXED
+ * technical buffer size (NOISEBOY_LOOP_FIXED_SAMPLES, matching this
+ * feature's own original design before any length knob existed), with
+ * ONLY the played note's pitch controlling playback speed through it
+ * (playbackRate = freqHz / referenceFreq, exactly like a sample player
+ * pitching a fixed recording by playback speed -- a real tape sampler
+ * has one fixed piece of tape; how fast you play it back is what
+ * changes, not the tape's own length). Captured INSTANTLY (a tight
+ * fill loop, like karplus_pluck's own initial burst), not recorded in
+ * real time -- the full, already-pitch-transposed content is available
+ * from the very first sample of the note, no capture-phase delay.
  *
- * 1. Buffer length is now knob-controlled (Loop Length, knob 4) across
- *    its full range, not a fixed 8000 samples. "Think of it this way:
- *    if you recorded a 3 second pitched sound on a tape and played it
- *    back, Knob 4 would control when that tape ended or got cut and
- *    looped back from the beginning. Note number would be how fast
- *    that tape would play, which would be pitch of the sound." Every
- *    new note captures fresh, at whatever length (XX seconds) the
- *    knob is set to AT THAT NOTE's start -- not shortened live
- *    mid-note the way the post-filter version's SPEED control worked.
- *    Captured INSTANTLY (a tight fill loop, like the original design
- *    and like karplus_pluck's own initial burst), not recorded in
- *    real-time the way the post-filter version was -- meaning the
- *    full, already-pitch-transposed content is available from the
- *    very first sample of the note, with no capture-phase delay.
- * 2. Decay: content decays to near-silence by 98% of the way through
- *    each pass (was 97% in the post-filter version) -- "It should not
- *    decay until 98%% of the way through the loop. This mimics a real
- *    tape loop." Still a PROPORTION of the loop's own length, not an
- *    absolute time, and still ends in a deliberate, audible "seam"
- *    (loud restart after a near-silent tail) -- that's the intended
- *    "poorly looped sample" character, not a flaw.
+ * Knob 4 ("Loop Length" before) is now LOOP DEPTH, per direct request
+ * -- "The knob should indicate only DEPTH of LOOP, as AM used to do!"
+ * -- an intensity control in the same spirit as this project's old AM
+ * Depth knob, not a length control at all anymore.
  *
- * Pitch-transposition: playbackRate = freqHz / referenceFreq (middle
- * C). At middle C, one loop = the full captured buffer exactly. One
- * octave up, playbackRate=2.0, buffer read twice as fast (every other
- * sample skipped) -- one loop = half the buffer's samples. One octave
- * down, playbackRate=0.5, buffer read at half speed (each sample read
- * twice in a row) -- one loop = twice the samples. Nearest-neighbor
- * read (not interpolated) -- matches this project's established "the
- * artifacts are the point" philosophy for this kind of lo-fi,
- * sample-player-style pitch shifting.
+ * Envelope shape, completely redesigned: each loop pass stays at FULL,
+ * SUSTAINED level for 97% of its length, then drops toward silence
+ * over the final 3% before jumping back to full at the next pass --
+ * inverted from the previous design's continuous decay-throughout
+ * shape. DEPTH controls how FAR that final-3% dip actually goes: at
+ * depth=0, no dip at all (flat, drone-like, sustained the whole way
+ * through with no audible loop seam); at depth=1, the dip reaches true
+ * silence by the end of each pass (the full, dramatic "chop" and
+ * restart); intermediate depths land the dip partway between "barely
+ * audible" and "full silence". This is the loop's own equivalent of
+ * AM Depth's 0=off/1=full-swing behavior, just shaping the loop's own
+ * repeating envelope instead of an external tremolo oscillator.
  *
- * Mono (one buffer, not stereo L/R like the post-filter version was)
- * -- like Filtered Noise and Karplus, this is a raw SOURCE that gets
- * mixed and panned like any other layer, not a voice-wide stereo
- * effect anymore. Heap-allocated (same real reason as before: a
- * multi-second buffer embedded directly in Voice, times
- * NOISEBOY_MAX_VOICES, would overflow a stack-declared NoiseboyEngine
- * -- see this project's own history on that), but half the memory of
- * the old stereo version for the same max length. */
+ * Nearest-neighbor read (not interpolated) -- matches this project's
+ * established "the artifacts are the point" philosophy for this kind
+ * of lo-fi, sample-player-style pitch shifting.
+ *
+ * Mono (one buffer, not stereo L/R) -- like Filtered Noise and
+ * Karplus, this is a raw SOURCE that gets mixed and panned like any
+ * other layer. Heap-allocated (a several-thousand-sample buffer
+ * embedded directly in Voice, times NOISEBOY_MAX_VOICES, would
+ * overflow a stack-declared NoiseboyEngine -- see this project's own
+ * history on that), though now much smaller than either previous
+ * design's buffer given the fixed length is short. */
 typedef struct {
     double *buffer;
-    int captureLengthSamples;  /* fixed at capture time (note-on), from the current Loop Length knob value */
     double readPos;             /* fractional read position, nearest-neighbor read */
     double playbackRate;        /* freqHz / referenceFreq, set once at note-on */
 } LoopSource;
 
-/* Allocates buffer -- NOISEBOY_LOOP_MAX_SAMPLES doubles, ~1.1MB.
- * Called once per voice at engine init time (NOT at every note-on,
- * which would mean allocating on every note -- wasteful and not
- * real-time-safe for a hot path). Returns 0 on allocation failure. */
+/* Allocates buffer -- NOISEBOY_LOOP_FIXED_SAMPLES doubles. Called
+ * once per voice at engine init time (NOT at every note-on, which
+ * would mean allocating on every note -- wasteful and not real-time-
+ * safe for a hot path). Returns 0 on allocation failure. */
 int loop_source_alloc(LoopSource *lp);
 /* Frees what loop_source_alloc allocated. */
 void loop_source_free(LoopSource *lp);
 /* Captures the buffer INSTANTLY (raw noise, filled in a tight loop --
- * see this struct's own comment for why this differs from the old
- * post-filter version's real-time recording), and sets the pitch-
+ * see this struct's own comment for why), and sets the pitch-
  * transposing playback rate. Called once at note-on, analogous to
- * karplus_pluck's one-time excitation. captureLengthSamples is
- * derived from whatever the Loop Length knob (XX seconds) is set to
- * AT THIS MOMENT -- fixed for this note's whole duration once set. */
-void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz, int captureLengthSamples);
-/* Reads back one sample per call, nearest-neighbor, with the 98%-
- * through decay applied -- see this struct's own comment. */
-double loop_process(LoopSource *lp);
+ * karplus_pluck's one-time excitation. Buffer length is always
+ * NOISEBOY_LOOP_FIXED_SAMPLES now -- no knob or other input decides
+ * it anymore. */
+void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz);
+/* Reads back one sample per call, nearest-neighbor, with the
+ * sustained-then-decay envelope applied (97% flat, final 3% dips
+ * toward silence, dip amount set by depth01) -- see this struct's own
+ * comment for the full shape. depth01: 0 = no dip at all, 1 = dip
+ * reaches true silence. */
+double loop_process(LoopSource *lp, double depth01);
 
 typedef struct {
     LayerType type;
@@ -545,20 +541,20 @@ typedef struct {
 typedef struct {
     double filterCutoffOffset01;  /* knob 1: brightens/darkens the pitch-tracked filter cutoff, -1..1 mapped from 0..1 */
     double filterResonance01;     /* knob 2 */
-    /* Knobs 3 and 4 REDESIGNED per explicit revert/refinement request
-     * -- see LoopSource's own comment for the full LOOP history. Knob
-     * 3 (was AM Depth, then briefly LOOP Intensity) is now DRIVE --
-     * moved here from its old menu-only position now that LOOP no
-     * longer needs a dedicated wet/dry blend knob (it's a per-layer
-     * source now, mixed via its own mixLevel01 like Filtered Noise and
-     * Karplus, not a live effect blend). Knob 4 (was AM Rate, then
-     * LOOP Length/SPEED as a live playback-rate multiplier) is now
-     * LOOP Length (XX) directly: sets the master captured-buffer
-     * length across its full range (NOISEBOY_LOOP_MIN_SECONDS to
-     * NOISEBOY_LOOP_MAX_SECONDS), read at each note's own start (not a
-     * live multiplier on an already-captured buffer anymore -- "SPEED
-     * goes away", per explicit confirmation). */
-    double loopLengthKnob01;      /* knob 4: 0-1, maps to NOISEBOY_LOOP_MIN_SECONDS..MAX_SECONDS */
+    /* Knobs 3 and 4, redesigned several times -- see LoopSource's own
+     * comment for the full LOOP history. Knob 3 is DRIVE (moved from
+     * menu-only once LOOP no longer needed a dedicated blend knob).
+     * Knob 4 was briefly "LOOP Length" (a knob-controlled buffer
+     * length), now LOOP DEPTH instead, per direct request: "it doesn't
+     * need a knob to decide length, it should only be tracking note
+     * number... The knob should indicate only DEPTH of LOOP, as AM
+     * used to do!" Length is fixed (NOISEBOY_LOOP_FIXED_SAMPLES) now;
+     * this knob controls how far the loop's own sustained-then-decay
+     * envelope dips each pass -- 0 = no dip (flat/drone-like), 1 =
+     * dips to true silence -- the loop's own equivalent of how AM
+     * Depth used to work, just shaping the loop's repeating envelope
+     * instead of an external tremolo oscillator. */
+    double loopDepth01;            /* knob 4: 0-1, 0 = no dip, 1 = full silence at the end of each pass */
     double attackMs;              /* knob 5: 0.5-200 ms */
     double releaseMs;             /* knob 6: 5-2000 ms */
     double detuneSpread01;        /* knob 7: scales each layer's per-layer detuneCents, 0 = unison, 1 = full spread */
@@ -578,13 +574,12 @@ typedef struct {
      * further). Master level moved off knob 8 to a menu-only position
      * (see masterLevel01 below) to make room for this. */
     double tiltAmount01;
-    /* Now knob 3 (see this struct's own comment on loopLengthKnob01
-     * for the full context) -- moved from menu-only to a dedicated
-     * physical knob, per explicit request ("That knob could now be
-     * DRIVE"), since LOOP no longer needs knob 3 for a wet/dry blend.
-     * Same field, same effect (single shared drive/saturation stage on
-     * the final mix -- see noiseboy_process), just knob-controlled
-     * now instead of menu-only. */
+    /* Now knob 3 (see this struct's own comment on loopDepth01 for the
+     * full context) -- moved from menu-only to a dedicated physical
+     * knob, per explicit request ("That knob could now be DRIVE"),
+     * since LOOP no longer needs knob 3 for a wet/dry blend. Also now
+     * controls bitcrush/rate-reduce intensity -- see
+     * noiseboy_process_stereo's own comment. */
     double drive01;
     /* Moved off knob 8 (was there through v0.7.0) to make room for
      * outputFilterFreq01 -- still fully controllable, just via the

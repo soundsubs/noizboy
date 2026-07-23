@@ -32,13 +32,17 @@ sources this time"), a legitimate outcome, not an accident.
 - **Loop** (always the 4th source): a captured buffer of raw noise,
   instantly filled at each note's own start (not built up in real
   time), read back on repeat and pitch-transposed by the played note
-  -- exactly like a cheap sampler pitching a fixed recording by
-  playback speed. The buffer's own length (XX, 0.25-3.0s) is set
-  directly by Loop Length (knob 4), read fresh at the start of every
-  note. Decays to near-silence by 98% of the way through each pass
-  before jumping back to full volume at the next repeat -- a
-  deliberate, audible "seam", mimicking a real tape loop rather than a
-  seamless drone.
+  ONLY -- exactly like a real tape sampler: one fixed piece of tape,
+  how fast you play it back (and therefore its pitch) is what changes,
+  not the tape's own length. Buffer length is fixed
+  (NOISEBOY_LOOP_FIXED_SAMPLES, 8000 samples) -- no knob controls it
+  at all. Each pass stays at full, sustained level for 97% of its
+  length, then dips toward silence over the final 3% before jumping
+  back to full at the next repeat -- Loop Depth (knob 4) controls how
+  FAR that dip goes (0 = no dip at all, flat/drone-like; 1 = dips all
+  the way to true silence), the same 0=off/1=full-swing role this
+  project's old AM Depth knob used to play, just shaping the loop's
+  own repeating envelope instead of an external tremolo oscillator.
 
 Per voice, the 4 sources mix together (raw, unfiltered) and
 immediately pass through reintroduced bitcrush + pitch-following
@@ -113,7 +117,7 @@ after all voices sum together):
 | 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
 | 2 | Resonance | resonance of the voice-level pitch-tracking filter -- constant while a note plays, no envelope or release dependency of any kind. Full range, no safety cap; higher settings ARE genuinely self-oscillating (a deliberate choice, reverted at direct request -- see "Status") |
 | 3 | Drive | dual role: (1) single shared drive/saturation stage on the final mix, unchanged from before; (2) also now controls bitcrush + pitch-following sample-rate reduction, non-linearly -- centre-left/off (0) = effectively clean (16-bit, full native sample rate); turning clockwise degrades both bit depth and effective sample rate together, accelerating toward the top of the range. Live-controllable, not fixed per note |
-| 4 | Loop Length | sets Loop's own captured-buffer length (XX), read fresh at the START of every note (not adjustable live mid-note). Start (0) = 100% = 3.0 seconds, the longest; turning clockwise reduces it down to 1% (0.03s) at full right. The played note's own pitch is what controls playback SPEED through that buffer (see "What it does") -- this knob only sets how long the buffer itself is |
+| 4 | Loop Depth | controls how far Loop's own sustained-then-decay envelope dips each pass -- 0 = no dip at all (flat, drone-like), 1 = dips all the way to true silence by the end of each pass. Has zero influence on length or pitch -- those track only the played note now (see "What it does"), the same way a real tape sampler's playback speed (not the tape's own length) is what changes with note number |
 | 5 | Attack | envelope attack time, 0.5-200 ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
 | 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain. Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
 | 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise and Loop sources pan to fixed positions (reusing each source's own pitch-spread randomization); the Karplus source auto-pans back and forth at a fixed internal rate instead |
@@ -123,6 +127,53 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.20.0** -- LOOP redesigned again, per direct feedback that it
+still didn't need what remained of the previous design: "it doesn't
+need a knob to decide length, it should only be tracking note number.
+This is how a real tape sampler would work. The knob should indicate
+only DEPTH of LOOP, as AM used to do!"
+
+Length is fixed now (NOISEBOY_LOOP_FIXED_SAMPLES, 8000 samples,
+matching this feature's own original design before any length knob
+ever existed) -- no knob has any influence on it at all. Only the
+played note's own pitch controls playback speed through that fixed
+buffer, exactly like a real tape sampler: one fixed piece of tape, how
+fast you play it back is what changes, not the tape's own length.
+
+Knob 4 is Loop Depth now, not Loop Length -- an intensity control in
+the same spirit as this project's old AM Depth knob, not a length
+control at all anymore. Paired with a completely inverted envelope
+shape: each pass now stays at full, sustained level for 97% of its
+length, then dips toward silence over the final 3% before jumping back
+to full at the next pass -- the previous design's continuous decay-
+throughout shape is gone. Depth controls how FAR that final dip
+actually goes: 0 = no dip at all (flat, drone-like, no audible loop
+seam), 1 = dips all the way to true silence by the very end of each
+pass, with intermediate values landing the dip partway between "barely
+audible" and "full silence" -- the loop's own equivalent of how AM
+Depth's 0=off/1=full-swing behavior used to work, just shaping the
+loop's own repeating envelope instead of an external tremolo
+oscillator.
+
+`test_loop_layer.c` fully rewritten for the new design (7 tests,
+directly verifying: buffer length has zero dependency on any knob;
+pitch-transposition is exact; content is available from the very first
+sample; the envelope shape is genuinely flat until 97% then dips
+correctly to the depth-controlled target; fresh capture every note;
+full pipeline sanity). Full 24-suite run passes clean.
+
+**v0.19.1** -- Resonance knob rescaled, per direct calibration: "out
+of control by the time it hits 30, roughly 1/3 its range." Verified
+directly (not just by ear): at knob=30/127, every tested note across
+the keyboard was already genuinely, persistently self-oscillating.
+Fixed with a straight proportional rescale of the raw knob value
+(multiply by 30/127) rather than a hard cap on the final resonance --
+this keeps the entire 0-127 range meaningfully expressive throughout,
+whereas a hard cap (tried in an earlier version) left much of the
+upper range feeling dead once resonance hit its ceiling. Knob=127 now
+reproduces exactly what knob=30 used to do; nothing above that is
+reachable anymore.
 
 **v0.19.0** -- two changes, both direct reversals/redesigns following
 listening feedback on v0.18.0.
