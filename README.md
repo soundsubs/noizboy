@@ -12,7 +12,8 @@ set, so sharing filter/noise character with it is deliberate.
 Every time the module is instantiated (or the user hits Randomize),
 it randomizes a fixed "recipe": always exactly 4 sources -- two
 filtered-noise generators, one Karplus-Strong plucked-string, and one
-Loop (a captured, pitch-transposed noise sample) -- whose relative MIX
+Loop (a shared digital delay line playing back the instrument's own
+recent output, pitch-transposed) -- whose relative MIX
 LEVELS (0-100% each) are what's actually randomized, not their type or
 count. A source can randomize down to silent (e.g. "just the two noise
 sources this time"), a legitimate outcome, not an accident.
@@ -29,20 +30,24 @@ sources this time"), a legitimate outcome, not an accident.
   knob); 34% are "string mode" (a much longer, more variable ring-out,
   tied to the Release knob so the string's own natural decay and the
   amplitude envelope's release stay roughly in step).
-- **Loop** (always the 4th source): a captured buffer of raw noise,
-  instantly filled at each note's own start (not built up in real
-  time), read back on repeat and pitch-transposed by the played note
-  ONLY -- exactly like a real tape sampler: one fixed piece of tape,
-  how fast you play it back (and therefore its pitch) is what changes,
-  not the tape's own length. Buffer length is fixed
-  (NOISEBOY_LOOP_FIXED_SAMPLES, 8000 samples) -- no knob controls it
-  at all. Each pass stays at full, sustained level for 97% of its
-  length, then dips toward silence over the final 3% before jumping
-  back to full at the next repeat -- Loop Depth (knob 4) controls how
-  FAR that dip goes (0 = no dip at all, flat/drone-like; 1 = dips all
-  the way to true silence), the same 0=off/1=full-swing role this
-  project's old AM Depth knob used to play, just shaping the loop's
-  own repeating envelope instead of an external tremolo oscillator.
+- **Loop** (always the 4th source): a genuine, SHARED digital delay
+  line -- one buffer for the whole instrument (not one per voice),
+  continuously written every sample with the engine's own summed mix
+  (2 seconds long). Any note that plays back through it reads its own
+  transposed position into that SAME shared buffer, starting from the
+  oldest available sample and running forward at a rate set by the
+  played note's own pitch -- exactly like a real tape sampler pitching
+  a fixed recording by playback speed, just now playing back a rolling
+  recording of the instrument's own recent output instead of a
+  one-off noise capture. Each pass through the buffer stays at full,
+  sustained level for 97% of its length, then dips toward silence over
+  the final 3% before jumping back to full at the next repeat -- Loop
+  Depth (knob 4) controls how FAR that dip goes (0 = no dip at all,
+  flat/drone-like; 1 = dips all the way to true silence, with a brief
+  genuine silence gap and fade-in swell at the wrap, tape-splice
+  style, plus some tape jitter localized right around that same point),
+  the same 0=off/1=full-swing role this project's old AM Depth knob
+  used to play.
 
 Per voice, the 4 sources mix together (raw, unfiltered) and
 immediately pass through reintroduced bitcrush + pitch-following
@@ -81,8 +86,10 @@ avoid clicks, not a sustained pad envelope).
    Loop), mixed together by their randomized mix levels (raw, no
    per-layer filtering). Filtered-noise sources darken on their own
    during release, at this stage, before anything else touches them.
-   Loop is captured instantly at each note's own start (see "What it
-   does").
+   Loop reads from a shared delay line that's continuously written by
+   the engine's own output (see "What it does") -- each note starts
+   reading at note-on, from the oldest available sample in that shared
+   buffer.
 2. Bitcrush + pitch-following sample-rate reduction (reintroduced --
    see "Status"), applied to the mixed signal, before the filter.
 3. Voice-level pitch-tracking filter -- tracks the played note
@@ -114,7 +121,7 @@ after all voices sum together):
 
 | Knob | Parameter | Range |
 |---|---|---|
-| 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it. Top ~25% of the knob blends toward a fixed, note-independent 15kHz ceiling, guaranteeing genuine brightness at max regardless of what note is playing (see "Status") |
+| 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it. Blends smoothly toward a fixed, note-independent 15kHz ceiling as the knob approaches its max (a smooth power curve, not a sudden-onset ramp -- see "Status" for a real regression this fixed) |
 | 2 | Resonance | resonance of the voice-level pitch-tracking filter -- constant while a note plays, no envelope or release dependency of any kind. Full range, no safety cap; higher settings ARE genuinely self-oscillating (a deliberate choice, reverted at direct request -- see "Status") |
 | 3 | Drive | dual role: (1) single shared drive/saturation stage on the final mix, unchanged from before; (2) also now controls bitcrush + pitch-following sample-rate reduction, non-linearly -- centre-left/off (0) = effectively clean (16-bit, full native sample rate); turning clockwise degrades both bit depth and effective sample rate together, accelerating toward the top of the range. Live-controllable, not fixed per note |
 | 4 | Loop Depth | BINARY, not continuous -- any movement off exactly 0 immediately engages LOOP fully (true-silence gap, full dip, full tape jitter around the wrap); only the exact minimum turns it off. Applied to the WHOLE VOICE's amplitude, not just Loop's own source signal, so it's audible even if Loop's own randomized mix level happens to be quiet. Has zero influence on length or pitch -- those track only the played note (see "What it does") |
@@ -127,6 +134,90 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.26.0** -- LOOP fundamentally redesigned, per direct request:
+"capture from 'whole final mix' and replay it, transposing according
+to pad number... This is how a digital delay works, I think." A real
+architecture shift, not a parameter tweak: LOOP moves from "a private,
+per-voice noise generator" (each voice synthesizing its own captured
+noise) to "a single, shared digital delay line" that continuously
+records the engine's own summed output, with any note reading its own
+transposed position into that same shared buffer. This is genuinely
+how a digital delay works -- a real, live recording of the
+instrument's own recent playing, not a synthesized texture.
+
+Implementation: ONE `GlobalDelayLine` per engine now (stereo, 2
+seconds, continuously written every sample), replacing the old
+per-voice buffer entirely. Each note starts reading from the OLDEST
+available sample in that shared buffer -- the natural "how far back
+does this delay reach" starting point for a fixed-length delay line --
+then plays forward at a rate transposed by the played note's own
+pitch, same convention as before. Write happens after this engine's
+own Drive/tape-saturation stages but before final master-level
+scaling, capturing the "intended" signal level regardless of the
+user's own volume setting; read happens per-voice, per-sample, always
+looking at PAST buffer positions relative to the current write head,
+so there's no circular dependency within a single sample. Scoped
+deliberately to the engine-level summed mix, not the plugin wrapper's
+own later DBCELL/TILT/gate stages (which live in `noiseboy_plugin.c`,
+outside what this project's own test suite can reach) -- flagged
+directly as a scoping choice at the time, not a silent assumption.
+
+All of the previous session's refinements to LOOP's own envelope
+shape (97% sustained, dips over the final 3%), the tape-splice-style
+silence gap and fade-in at the wrap, the localized tape jitter, and
+Depth's binary on/off behavior carried over completely unchanged --
+all of that logic only ever depended on read position and depth, not
+on where the underlying buffer content came from, so none of it needed
+touching.
+
+`test_loop_layer.c` fully rewritten (11 tests) for the shared-buffer
+architecture, including a test that directly verifies the actual new
+behavior: play a distinctive note, let it ring for half a second, then
+confirm the shared delay line genuinely contains real captured audio
+(not synthesized noise). Full 25-suite run passes clean.
+
+**v0.25.0** -- two fixes, per direct follow-up feedback on the two
+most recent sessions' work.
+
+**1. Filter cutoff's brightness blend fixed AGAIN, real regression
+this time.** Direct report: "Filter frequency is almost useless around
+knob values of 100, and above that there is audible glitching
+artifacts." Root cause: the previous fix's blend only started engaging
+at 75% of the knob's range, then ramped linearly -- its own derivative
+jumped discontinuously right at that point, from zero (nothing
+happening, hence "useless" just below it) to a large nonzero slope
+(hence "glitching" right above it, since the gap between a typical
+proportional cutoff and the 15kHz ceiling is huge, so even a small
+blend fraction of that gap produces a big jump). Measured directly:
+cutoff jumped from ~500Hz to ~2270Hz between knob=93 and knob=99 -- a
+massive change over just 6 knob steps. Directly ruled out genuine
+filter instability as a contributing cause too (a stability sweep
+across the whole 6-15kHz cutoff range at various resonance settings
+found nothing unstable) -- the discontinuous KNOB MAPPING itself was
+the entire cause. Fixed with a smooth power curve (raw01^10) across
+the entire knob range instead of a sudden-onset ramp. A first attempt
+at this (raw01^4) eliminated the jump but introduced a SEPARATE
+regression, caught via this project's own voice-steal click test:
+even at the DEFAULT knob value, that curve's blend was already
+substantial enough to inflate a normal voice's cutoff by over 3x
+compared to how the filter always sounded before brightness was ever
+touched. Raised to raw01^10, verified directly this keeps the
+default-knob cutoff nearly identical to the original, untouched
+formula (a 5.9% difference) while still climbing smoothly through the
+previously-broken 90-110 region and reaching the full 15kHz ceiling at
+knob=127. New dedicated regression test added (`test_cutoff_brightness.c`)
+locking in both properties together, since fixing one without the
+other was exactly how this went wrong twice.
+
+**2. Loop Depth's display type changed to "bool".** Per direct
+request: "When LOOP is ON it should only display LOOP ON, not values
+of 1-127." Best-effort change, genuinely unconfirmed without access to
+Move/Schwung platform documentation -- every chain_param in this
+project has used "int" until now, this is the first attempt at a
+different display type and needs verification on real hardware.
+
+Full 25-suite run passes clean.
 
 **v0.24.0** -- two LOOP refinements, per direct follow-up feedback.
 

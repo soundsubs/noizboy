@@ -113,21 +113,19 @@ static void* create_instance(const char *module_dir, const char *json_defaults) 
 }
 
 static void destroy_instance(void *instance) {
-    /* Loop buffers are separately heap-allocated (see
-     * loop_source_alloc's own comment for why -- keeping NoiseboyEngine
+    /* LOOP's shared delay line is separately heap-allocated (see
+     * GlobalDelayLine's own comment for why -- keeping NoiseboyEngine
      * itself small enough to stack-declare safely elsewhere, like this
-     * project's own tests, while still supporting a full 3-second
-     * loop). free(instance) alone would free the outer calloc'd block
-     * but NOT these separately-allocated buffers -- a real leak on
-     * every instance destruction without this. Lives at the fixed
-     * layer index 3 (the always-Loop slot) now, per-layer rather than
-     * per-voice -- see LoopSource's own comment for the full LOOP
-     * revert/redesign history. */
+     * project's own tests, while still supporting a full 2-second
+     * stereo buffer). free(instance) alone would free the outer
+     * calloc'd block but NOT this separately-allocated buffer -- a
+     * real leak on every instance destruction without this. ONE shared
+     * buffer per engine now (not one per voice), per the shared-delay-
+     * line redesign -- see GlobalDelayLine's own comment for the full
+     * history. */
     noiseboy_instance_t *inst = (noiseboy_instance_t*)instance;
     if (inst) {
-        for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-            loop_source_free(&inst->engine.voices[v].layers[3].loop);
-        }
+        global_delay_line_free(&inst->engine.delayLine);
     }
     free(instance);
 }

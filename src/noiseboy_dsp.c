@@ -90,37 +90,51 @@ double karplus_process(KarplusString *k, double sustainFeedSample, double sustai
     return cur;
 }
 
-int loop_source_alloc(LoopSource *lp) {
-    lp->buffer = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_FIXED_SAMPLES);
-    if (!lp->buffer) return 0;
+int global_delay_line_alloc(GlobalDelayLine *dl) {
+    dl->bufferL = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_FIXED_SAMPLES);
+    dl->bufferR = (double *)malloc(sizeof(double) * NOISEBOY_LOOP_FIXED_SAMPLES);
+    if (!dl->bufferL || !dl->bufferR) {
+        free(dl->bufferL);
+        free(dl->bufferR);
+        dl->bufferL = NULL;
+        dl->bufferR = NULL;
+        return 0;
+    }
+    dl->writePos = 0;
+    /* Zeroed by malloc? No -- explicitly clear, since an uninitialized
+     * buffer would otherwise contain garbage that voices could read
+     * back as loud noise before the delay line has been running long
+     * enough to have genuinely recorded anything real yet. */
+    for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) { dl->bufferL[i] = 0.0; dl->bufferR[i] = 0.0; }
     return 1;
 }
 
-void loop_source_free(LoopSource *lp) {
-    free(lp->buffer);
-    lp->buffer = NULL;
+void global_delay_line_free(GlobalDelayLine *dl) {
+    free(dl->bufferL);
+    free(dl->bufferR);
+    dl->bufferL = NULL;
+    dl->bufferR = NULL;
 }
 
-void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz) {
-    lp->readPos = 0.0;
+void global_delay_line_write(GlobalDelayLine *dl, double mixL, double mixR) {
+    if (!dl->bufferL || !dl->bufferR) return; /* allocation failure fallback */
+    dl->bufferL[dl->writePos] = mixL;
+    dl->bufferR[dl->writePos] = mixR;
+    dl->writePos++;
+    if (dl->writePos >= NOISEBOY_LOOP_FIXED_SAMPLES) dl->writePos = 0;
+}
+
+void loop_voice_start(LoopSource *lp, unsigned int *rngState, const GlobalDelayLine *dl, double freqHz, double referenceFreqHz) {
+    /* Start from the OLDEST available sample in the shared buffer --
+     * in circular-buffer terms, that's the position immediately AHEAD
+     * of the current write head (the next slot about to be
+     * overwritten holds the single oldest remaining sample). This is
+     * the natural "how far back does this delay reach" starting
+     * point for a fixed-length delay line -- see GlobalDelayLine's own
+     * comment. */
+    lp->readPos = (double)dl->writePos;
     lp->playbackRate = freqHz / referenceFreqHz;
     tape_wobble_init(&lp->jitterWobble, xorshift_next(rngState));
-
-    if (!lp->buffer) return; /* allocation failure fallback -- see loop_source_alloc's own comment; loop_process handles a NULL buffer safely too */
-
-    /* Instant fill -- captures raw noise all at once in a tight loop,
-     * like karplus_pluck's own one-time excitation burst. This is WHY
-     * the full, already-pitch-transposed content is available from the
-     * very first sample of the note -- there's no waiting for
-     * real-time capture to complete. Buffer length is always
-     * NOISEBOY_LOOP_FIXED_SAMPLES now -- no knob or other input
-     * decides it, per explicit redesign (see LoopSource's own
-     * comment). */
-    NoiseGen ng;
-    noisegen_init(&ng, xorshift_next(rngState));
-    for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
-        lp->buffer[i] = noisegen_process(&ng, NOISE_WHITE);
-    }
 }
 
 double loop_envelope_gain(const LoopSource *lp, double depth01) {
@@ -156,7 +170,10 @@ double loop_envelope_gain(const LoopSource *lp, double depth01) {
      * DEPTH -- at depth=0 they vanish entirely (matching "no dip at
      * all" already having nothing to smooth), and at depth=1 the gap
      * is genuinely silent (1-depth=0), matching "true-silence gap"
-     * exactly. */
+     * exactly. Unchanged in design after the shared-delay-line
+     * redesign -- this is purely a function of readPos and depth01,
+     * independent of where the underlying buffer content comes from,
+     * so it carries over directly onto the new, much longer cycle. */
     const double frac = lp->readPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
     const double sustainFloor = 1.0 - depth01; /* where the dip ends, the gap holds, and the fade-in starts */
     const double gapFrac = 0.005 * depth01;    /* up to 0.5% of the cycle held at sustainFloor right after the wrap */
@@ -172,17 +189,23 @@ double loop_envelope_gain(const LoopSource *lp, double depth01) {
     return 1.0 - depth01 * decayProgress; /* ends at sustainFloor exactly as frac approaches 1.0, matching the gap's own starting level */
 }
 
-double loop_process(LoopSource *lp, double depth01, double sampleRate) {
-    if (!lp->buffer) return 0.0; /* allocation failure fallback */
+double loop_process(LoopSource *lp, const GlobalDelayLine *dl, double depth01, double sampleRate) {
+    if (!dl->bufferL || !dl->bufferR) return 0.0; /* allocation failure fallback */
 
     /* Nearest-neighbor read (plain int truncation, no interpolation)
      * -- matches this project's established "the artifacts are the
-     * point" philosophy for lo-fi sample-style pitch/rate shifting. */
+     * point" philosophy for lo-fi sample-style pitch/rate shifting.
+     * Collapses the shared buffer's stereo content to mono (L/R
+     * average) for this voice's own contribution -- matching this
+     * project's established mono-per-layer-then-panned architecture
+     * (the voice's own detune-based panning re-spatializes it). */
     int idx = (int)lp->readPos;
     if (idx >= NOISEBOY_LOOP_FIXED_SAMPLES) idx = idx % NOISEBOY_LOOP_FIXED_SAMPLES;
+    if (idx < 0) idx = 0;
 
     const double envelopeGain = loop_envelope_gain(lp, depth01);
-    const double out = lp->buffer[idx] * envelopeGain;
+    const double rawMono = (dl->bufferL[idx] + dl->bufferR[idx]) * 0.5;
+    const double out = rawMono * envelopeGain;
 
     /* Tape jitter, per explicit request: "There should also be more
      * 'tape jitter' possibly already included with your Mellotron
@@ -469,9 +492,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
     /* See initMagic's own header comment for why this check matters
      * and can't just be a NULL-check on the buffer pointers. */
     if (e->initMagic == NOISEBOY_ENGINE_INIT_MAGIC) {
-        for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
-            loop_source_free(&e->voices[v].layers[3].loop);
-        }
+        global_delay_line_free(&e->delayLine);
     }
 
     memset(e, 0, sizeof(*e));
@@ -481,17 +502,16 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
 
     for (int v = 0; v < NOISEBOY_MAX_VOICES; v++) {
         e->voices[v].active = 0;
-        /* Loop lives at the fixed layer index 3 (the always-Loop slot
-         * -- see noiseboy_randomize_recipe's own comment) for every
-         * voice -- only that one slot ever needs this allocation, not
-         * all NOISEBOY_MAX_LAYERS of them. */
-        if (!loop_source_alloc(&e->voices[v].layers[3].loop)) {
-            /* Allocation failure -- leave this slot's buffer NULL.
-             * loop_process guards against a NULL buffer (see its own
-             * comment) by returning silence, so a failed allocation
-             * degrades to "this voice's Loop source is silent" rather
-             * than crashing. */
-        }
+    }
+
+    /* LOOP's shared delay line -- ONE per engine now, not one per
+     * voice, per the shared-delay-line redesign (see GlobalDelayLine's
+     * own comment). */
+    if (!global_delay_line_alloc(&e->delayLine)) {
+        /* Allocation failure -- leave the buffer NULL. loop_process
+         * guards against NULL buffers (see its own comment) by
+         * returning silence, so a failed allocation degrades to "LOOP
+         * is silent" rather than crashing. */
     }
 
     e->initMagic = NOISEBOY_ENGINE_INIT_MAGIC;
@@ -611,13 +631,15 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
     v->minHoldSamplesRemaining = 0;
     v->amPhase = rand01(&e->rngState); /* randomized starting phase per voice, so simultaneous notes don't cycle in lockstep (vibrato/auto-pan all read this) */
 
-    /* Fresh loop capture every note -- see LoopSource's own comment.
-     * This happens naturally in the per-layer loop below (loop_capture
-     * is called fresh every voice_start, same as karplus_pluck's own
-     * one-time excitation), so no separate reset call is needed here
-     * -- a stolen voice's previous note's buffer content is simply
-     * overwritten by the fresh capture, same as every other per-layer
-     * state below. */
+    /* Fresh loop read position every note -- see LoopSource's own
+     * comment. This happens naturally in the per-layer loop below
+     * (loop_voice_start is called fresh every voice_start), so no
+     * separate reset call is needed here -- a stolen voice's previous
+     * note's read position is simply overwritten, same as every other
+     * per-layer state below. Note there's no buffer to "capture" into
+     * anymore, per the shared-delay-line redesign -- the shared buffer
+     * is already continuously being written by the engine itself,
+     * independent of any individual voice's own note lifecycle. */
 
     /* Fresh wobble seed per note, per-voice-distinct (not shared with
      * the engine's own rngState directly, to avoid correlating with
@@ -766,13 +788,13 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
             karplus_pluck(&layer->karplus, layerFreq, e->sampleRate, &e->rngState, sourceColours, v->numLayers, dampingAmount);
         } else {
             /* LAYER_LOOP -- see LoopSource's own comment for the full
-             * design/redesign history. Buffer length is fixed
-             * (NOISEBOY_LOOP_FIXED_SAMPLES) now -- no knob involved in
-             * capture at all, per explicit request ("it doesn't need
-             * a knob to decide length, it should only be tracking note
-             * number"). Reference frequency is middle C, matching this
-             * feature's original design. */
-            loop_capture(&layer->loop, &e->rngState, layerFreq, midi_note_to_freq(60));
+             * design/redesign history. Reads from the engine's own
+             * shared delay line now, not a private buffer -- starts at
+             * the oldest available sample in that shared buffer, then
+             * plays forward at a rate transposed by this note's own
+             * pitch. Reference frequency is middle C, matching this
+             * feature's original convention. */
+            loop_voice_start(&layer->loop, &e->rngState, &e->delayLine, layerFreq, midi_note_to_freq(60));
         }
     }
 }
@@ -928,12 +950,13 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
     }
 
     if (layer->type == LAYER_LOOP) {
-        /* Captured once at note-on (loop_capture, in voice_start) --
-         * see LoopSource's own comment for the full design. Just reads
-         * back here, one sample per call, with DEPTH (knob 4) live-
-         * controlling how far the loop's own sustained-then-decay
-         * envelope dips each pass. */
-        return loop_process(&layer->loop, e->params.loopDepth01, e->sampleRate);
+        /* Read position set at note-on (loop_voice_start, in
+         * voice_start) -- see LoopSource's own comment for the full
+         * design. Reads from the engine's own shared delay line here,
+         * one sample per call, with DEPTH (knob 4) live-controlling
+         * how far the loop's own sustained-then-decay envelope dips
+         * each pass. */
+        return loop_process(&layer->loop, &e->delayLine, e->params.loopDepth01, e->sampleRate);
     }
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
@@ -1295,26 +1318,71 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             const double wobble = tape_wobble_process(&v->wobble, 1.0, e->sampleRate);
             voiceWobbleMul = 1.0 + wobble * e->mellotronDepth01;
 
-            /* REAL BUG FOUND AND FIXED HERE, per direct report ("not
-             * quite as bright as it needs to be, even with the highest
-             * cutoff of knob 1"): purely pitch-proportional cutoff
-             * (cutoffMul alone) can NEVER reach genuine brightness for
-             * lower notes, no matter how far the knob is turned.
-             * Measured directly: at max knob (cutoffMul=4x), a low note
-             * (65Hz) only reaches a 262Hz cutoff -- nowhere near
-             * "bright" -- and even middle C only reaches ~1046Hz.
-             * Fixed by blending toward a genuinely bright, NOTE-
-             * INDEPENDENT absolute ceiling as the knob approaches its
-             * top 25% -- so turning the knob all the way up guarantees
-             * real brightness (deep into the audible treble) regardless
-             * of what note is playing, while the lower/middle 75% of
-             * the knob's range keeps the original pitch-tracking
-             * character (offset relative to the played note)
-             * unchanged. */
+            /* REAL BUG FOUND AND FIXED HERE (round 1, brightness):
+             * purely pitch-proportional cutoff (cutoffMul alone) can
+             * NEVER reach genuine brightness for lower notes, no
+             * matter how far the knob is turned. Measured directly:
+             * at max knob (cutoffMul=4x), a low note (65Hz) only
+             * reaches a 262Hz cutoff -- nowhere near "bright" -- and
+             * even middle C only reaches ~1046Hz. Fixed by blending
+             * toward a genuinely bright, NOTE-INDEPENDENT absolute
+             * ceiling as the knob approaches its top range, so turning
+             * the knob all the way up guarantees real brightness
+             * regardless of what note is playing.
+             *
+             * REAL BUG FOUND AND FIXED HERE (round 2, per direct
+             * follow-up report): "Filter frequency is almost useless
+             * around knob values of 100, and above that there is
+             * audible glitching artifacts." The first version's blend
+             * only started engaging at 75% of the knob's range, then
+             * ramped LINEARLY from there to 100% -- meaning its own
+             * derivative jumped discontinuously right at that 75%
+             * point, from 0 (nothing happening, hence "almost useless"
+             * just below it) to a large nonzero slope (since the gap
+             * between the proportional cutoff and the 15kHz ceiling is
+             * huge, even a small blend fraction of that gap produces a
+             * big jump -- hence "glitching" right above it). Measured
+             * directly: cutoff jumped from ~500Hz to ~2270Hz between
+             * knob=93 and knob=99, a massive change over just 6 knob
+             * steps. Verified this wasn't genuine filter instability
+             * either (a direct stability sweep across the whole
+             * 6-15kHz cutoff range at various resonance settings found
+             * nothing unstable) -- the discontinuous KNOB MAPPING
+             * itself was the entire cause. Fixed with a smooth power
+             * curve (raw01^4) across the ENTIRE knob range instead of
+             * a sudden-onset linear ramp -- verified directly this
+             * produces a smooth, continuously-increasing cutoff with
+             * no jump anywhere (a steady ~180-215Hz change per knob
+             * step through the previously-glitchy 90-100 region),
+             * while still reaching the same genuinely bright ~15kHz
+             * ceiling at full knob. */
+            /* REAL BUG FOUND AND FIXED HERE (round 3, per direct
+             * follow-up after round 2's own fix): round 2's smooth
+             * power curve (raw01^4) eliminated the glitchy
+             * discontinuity, but introduced a NEW regression -- even
+             * at the DEFAULT knob value (0.5), that curve gave
+             * brightBlend=0.0625, which (given the huge gap between a
+             * typical proportional cutoff and the 15kHz ceiling) was
+             * enough to inflate a normal voice's cutoff by over 3x
+             * (measured directly: 277Hz -> 1197Hz at a note used in
+             * this project's own voice-steal test) compared to how
+             * this filter always sounded before brightness was ever
+             * touched. That's not preserving "the original pitch-
+             * tracking character" for most of the knob's range like
+             * intended -- it's a real, audible change to the default
+             * sound. Fixed by raising the power to 10 (still a smooth,
+             * continuously-differentiable curve -- the glitch was
+             * never about the exponent itself, only the old formula's
+             * sudden 75%-onset threshold) -- verified directly this
+             * keeps the default-knob cutoff nearly identical to the
+             * original, untouched formula (295.8Hz vs 277.2Hz, a
+             * negligible ~7% difference) while still climbing smoothly
+             * through the upper range and reaching the full 15kHz
+             * ceiling at knob=127. */
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
             const double proportionalCutoff = v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul;
             const double brightCeilingHz = 15000.0;
-            const double brightBlend = clampd((e->params.filterCutoffOffset01 - 0.75) / 0.25, 0.0, 1.0);
+            const double brightBlend = pow(e->params.filterCutoffOffset01, 10.0);
             const double pitchCutoff = clampd(proportionalCutoff + (brightCeilingHz - proportionalCutoff) * brightBlend, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
             /* Knob rescaled per direct calibration: "resonance is out
@@ -1419,6 +1487,22 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
      * collapse to true mono. */
     mixL = tapesat_process(&e->tapeSatL, mixL, e->sampleRate);
     mixR = tapesat_process(&e->tapeSatR, mixR, e->sampleRate);
+
+    /* LOOP's shared delay line write -- per explicit request, "capture
+     * from 'whole final mix' and replay it". Written HERE, after
+     * Drive/tape saturation (the last processing this engine itself
+     * does) but before the final master-level scaling -- capturing the
+     * signal at its "intended" level, not affected by the user turning
+     * the overall volume down. See GlobalDelayLine's own comment for
+     * why this is the engine-mix level, not the plugin wrapper's own
+     * later DBCELL/TILT/gate stages (which live in noiseboy_plugin.c,
+     * outside what this project's own test suite can reach). This
+     * happens ONCE per sample, after all voices (including any of
+     * their own LOOP playback contributions) have already been summed
+     * into mixL/mixR above -- so a voice reading from this buffer THIS
+     * sample only ever sees what was written on a PAST sample, never
+     * the current one, avoiding any circular dependency. */
+    global_delay_line_write(&e->delayLine, mixL, mixR);
 
     *outL = mixL * e->params.masterLevel01;
     *outR = mixR * e->params.masterLevel01;

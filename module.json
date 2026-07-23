@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOIZBOY",
-    "version": "0.24.0",
+    "version": "0.26.0",
     "abbrev": "NOIZB",
-    "description": "LOOP: added tape jitter localized around the wrap (reusing the Mellotron tape model). Loop Depth is now binary -- any knob movement off zero fully engages it, only zero disengages. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
+    "description": "LOOP fundamentally redesigned into a genuine shared digital delay line -- continuously records the engine's own output, any note plays back a transposed copy of it. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",
@@ -41,7 +41,7 @@
             {
                 "key": "loop_depth",
                 "name": "Loop Depth",
-                "type": "int",
+                "type": "bool",
                 "min": 0,
                 "max": 127,
                 "default": 0

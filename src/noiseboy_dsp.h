@@ -42,14 +42,19 @@
  * comment for the full LOOP redesign/revert. */
 #define NOISEBOY_MAX_LAYERS 4
 #define NOISEBOY_KS_MAX_SAMPLES 2400 /* enough delay-line length for the lowest supported note (~A0, 27.5Hz) at up to 48kHz-ish sample rates, with headroom */
-/* Per explicit redesign -- see LoopSource's own comment for the full
- * history. Fixed buffer length now, matching this feature's own
- * original design before any length knob ever existed -- "it doesn't
- * need a knob to decide length, it should only be tracking note
- * number." 8000 samples (~167ms at 48kHz) -- at middle C (playbackRate
- * 1.0) that's the loop's own period; other notes transpose this by
- * playback speed the same way a sample player would. */
-#define NOISEBOY_LOOP_FIXED_SAMPLES 8000
+/* LOOP REDESIGNED AGAIN, per direct request: "yes, capture from 'whole
+ * final mix' and replay it, transposing according to pad number...
+ * This is how a digital delay works, I think." A fundamental
+ * architecture shift -- see GlobalDelayLine's own comment below for
+ * the full design. This buffer is now SHARED across all voices (one
+ * per engine, not one per voice), continuously written with the
+ * engine's own summed mix every sample (a real, rolling delay line),
+ * with each voice reading its own transposed position into it. Length
+ * raised from the old per-note-noise-buffer's 8000 samples (~167ms --
+ * plenty for a texture, far too short to capture a meaningful musical
+ * phrase for a delay) to 2 seconds -- long enough to be musically
+ * useful as an actual delay/echo of recently played material. */
+#define NOISEBOY_LOOP_FIXED_SAMPLES 96000
 #define NOISEBOY_ENGINE_INIT_MAGIC 0x4E42214Fu /* arbitrary, just needs to be a value fresh/garbage stack memory won't plausibly already contain -- see NoiseboyEngine's own initMagic field comment */
 
 /* ---- New for NOISEBOY ---- */
@@ -215,54 +220,73 @@ typedef enum { LAYER_FILTERED_NOISE = 0, LAYER_KARPLUS_STRONG, LAYER_LOOP } Laye
  * superseded options around for a possible future revert. */
 typedef enum { FILTER_MOOG = 0, FILTER_KORG_LP, FILTER_KORG_HP } FilterKind;
 
-/* LOOP -- a per-layer, PRE-filter sound-generation "engine" (like
- * Filtered Noise and Karplus), REDESIGNED again per direct feedback:
- * "it doesn't need a knob to decide length, it should only be
- * tracking note number. This is how a real tape sampler would work."
- * Length is no longer knob-controlled at all -- back to a FIXED
- * technical buffer size (NOISEBOY_LOOP_FIXED_SAMPLES, matching this
- * feature's own original design before any length knob existed), with
- * ONLY the played note's pitch controlling playback speed through it
- * (playbackRate = freqHz / referenceFreq, exactly like a sample player
- * pitching a fixed recording by playback speed -- a real tape sampler
- * has one fixed piece of tape; how fast you play it back is what
- * changes, not the tape's own length). Captured INSTANTLY (a tight
- * fill loop, like karplus_pluck's own initial burst), not recorded in
- * real time -- the full, already-pitch-transposed content is available
- * from the very first sample of the note, no capture-phase delay.
+/* LOOP -- REDESIGNED again, fundamentally this time, per direct
+ * request: "capture from 'whole final mix' and replay it, transposing
+ * according to pad number... This is how a digital delay works, I
+ * think." Previously a per-VOICE, per-layer source that generated its
+ * own noise content -- now a genuine, SHARED delay line: ONE buffer
+ * per engine (not one per voice), continuously written every sample
+ * with the engine's own summed mix (all voices combined, before the
+ * plugin wrapper's own DBCELL/TILT/gate stages -- capturing at the
+ * engine-mix level keeps this fully testable in this project's own
+ * suite, which can't reach the plugin-level stages; flagged directly
+ * as a scoping choice, not a silent assumption).
  *
- * Knob 4 ("Loop Length" before) is now LOOP DEPTH, per direct request
- * -- "The knob should indicate only DEPTH of LOOP, as AM used to do!"
- * -- an intensity control in the same spirit as this project's old AM
- * Depth knob, not a length control at all anymore.
+ * Circular, fixed-size (NOISEBOY_LOOP_FIXED_SAMPLES, 2 seconds) --
+ * stereo, since it's capturing the actual stereo mix, not synthesized
+ * mono content like the old per-voice design. Each VOICE reads its
+ * OWN transposed position into this SHARED buffer (LoopSource below
+ * no longer owns a buffer at all -- just tracks one voice's own read
+ * position and playback rate into the shared one), collapsing to mono
+ * for that voice's own contribution (matching this project's
+ * established mono-per-layer-then-panned architecture) via the
+ * average of the captured L/R.
  *
- * Envelope shape, completely redesigned: each loop pass stays at FULL,
- * SUSTAINED level for 97% of its length, then drops toward silence
- * over the final 3% before jumping back to full at the next pass --
- * inverted from the previous design's continuous decay-throughout
- * shape. DEPTH controls how FAR that final-3% dip actually goes: at
- * depth=0, no dip at all (flat, drone-like, sustained the whole way
- * through with no audible loop seam); at depth=1, the dip reaches true
- * silence by the end of each pass (the full, dramatic "chop" and
- * restart); intermediate depths land the dip partway between "barely
- * audible" and "full silence". This is the loop's own equivalent of
- * AM Depth's 0=off/1=full-swing behavior, just shaping the loop's own
- * repeating envelope instead of an external tremolo oscillator.
+ * Playback ALWAYS starts from the OLDEST available sample in the
+ * buffer (the position immediately ahead of the current write head,
+ * in circular-buffer terms) whenever a note using LOOP starts -- the
+ * natural "how far back does this delay reach" starting point for a
+ * fixed-length delay line, matching how a real delay's own buffer
+ * length defines its maximum delay time. From there, playback runs
+ * forward through the buffer at a rate transposed by the played note
+ * (playbackRate = freqHz / referenceFreq, unchanged from the previous
+ * design's own convention) -- exactly like a tape sampler pitching a
+ * fixed recording by playback speed, just now playing back a rolling
+ * recording of the instrument's own recent output instead of a
+ * one-off noise capture.
  *
- * Nearest-neighbor read (not interpolated) -- matches this project's
- * established "the artifacts are the point" philosophy for this kind
- * of lo-fi, sample-player-style pitch shifting.
- *
- * Mono (one buffer, not stereo L/R) -- like Filtered Noise and
- * Karplus, this is a raw SOURCE that gets mixed and panned like any
- * other layer. Heap-allocated (a several-thousand-sample buffer
- * embedded directly in Voice, times NOISEBOY_MAX_VOICES, would
- * overflow a stack-declared NoiseboyEngine -- see this project's own
- * history on that), though now much smaller than either previous
- * design's buffer given the fixed length is short. */
+ * The sustained-then-decay envelope shape (97% flat, final 3% dips
+ * toward silence, DEPTH-scaled gap+fade-in at the wrap, and the
+ * tape-jitter localized around it) is UNCHANGED in design -- all of
+ * that logic already lived in loop_envelope_gain/loop_process as
+ * functions of readPos and depth01, independent of where the
+ * underlying buffer content came from, so it carries over directly
+ * onto this new, much longer (2-second) cycle. */
 typedef struct {
-    double *buffer;
-    double readPos;             /* fractional read position, nearest-neighbor read */
+    double *bufferL;
+    double *bufferR;
+    int writePos; /* circular write head, advances by exactly 1 sample every engine tick, shared by all voices' reads */
+} GlobalDelayLine;
+
+/* Allocates bufferL/bufferR -- NOISEBOY_LOOP_FIXED_SAMPLES doubles
+ * each (~1.5MB total at 2 seconds/48kHz). Called once per engine at
+ * init time, same real reason as this project's own previous
+ * heap-allocation lessons (a multi-second stereo buffer embedded
+ * directly in NoiseboyEngine would overflow a stack-declared
+ * instance -- this project's own test suite declares NoiseboyEngine
+ * on the stack throughout). Returns 0 on allocation failure. */
+int global_delay_line_alloc(GlobalDelayLine *dl);
+/* Frees what global_delay_line_alloc allocated. */
+void global_delay_line_free(GlobalDelayLine *dl);
+/* Called once per sample (from noiseboy_process_stereo, after all
+ * voices have been summed into the engine's own mix), writing that
+ * sample into the circular buffer and advancing the write head. This
+ * is the ONLY place the buffer's content changes -- voices only ever
+ * read from it. */
+void global_delay_line_write(GlobalDelayLine *dl, double mixL, double mixR);
+
+typedef struct {
+    double readPos;             /* fractional read position INTO THE SHARED GlobalDelayLine, nearest-neighbor read */
     double playbackRate;        /* freqHz / referenceFreq, set once at note-on */
     /* Dedicated tape-jitter oscillator, per explicit request: "There
      * should also be more 'tape jitter' possibly already included with
@@ -277,20 +301,15 @@ typedef struct {
     TapeWobble jitterWobble;
 } LoopSource;
 
-/* Allocates buffer -- NOISEBOY_LOOP_FIXED_SAMPLES doubles. Called
- * once per voice at engine init time (NOT at every note-on, which
- * would mean allocating on every note -- wasteful and not real-time-
- * safe for a hot path). Returns 0 on allocation failure. */
-int loop_source_alloc(LoopSource *lp);
-/* Frees what loop_source_alloc allocated. */
-void loop_source_free(LoopSource *lp);
-/* Captures the buffer INSTANTLY (raw noise, filled in a tight loop --
- * see this struct's own comment for why), and sets the pitch-
- * transposing playback rate. Called once at note-on, analogous to
- * karplus_pluck's one-time excitation. Buffer length is always
- * NOISEBOY_LOOP_FIXED_SAMPLES now -- no knob or other input decides
- * it anymore. */
-void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz);
+/* Sets this voice's own starting read position (the oldest available
+ * sample in the shared delay line, relative to its current write
+ * head -- see GlobalDelayLine's own comment for why that's the
+ * natural starting point) and pitch-transposing playback rate. Called
+ * once at note-on, analogous to karplus_pluck's one-time excitation --
+ * but unlike the previous per-voice design, this does NOT fill any
+ * buffer itself (there's nothing to capture; the shared buffer is
+ * already continuously being written by the engine itself). */
+void loop_voice_start(LoopSource *lp, unsigned int *rngState, const GlobalDelayLine *dl, double freqHz, double referenceFreqHz);
 /* Read-only: computes the SAME envelope gain loop_process is about to
  * apply, WITHOUT advancing readPos or touching any state -- lets a
  * caller apply this loop's envelope shape somewhere ELSE too (see
@@ -303,16 +322,19 @@ void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double 
  * produce LOOP's own source audio; this is an ADDITIONAL read of the
  * same envelope value for a second purpose. */
 double loop_envelope_gain(const LoopSource *lp, double depth01);
-/* Reads back one sample per call, nearest-neighbor, with the
- * sustained-then-decay envelope applied (97% flat, final 3% dips
- * toward silence, dip amount set by depth01) -- see this struct's own
- * comment for the full shape. depth01: 0 = no dip at all, 1 = dip
- * reaches true silence. Also applies tape jitter (pitch/rate
- * instability) localized to the region right around the wrap/gap, per
- * explicit request -- see this function's own implementation comment
- * for the full design; sampleRate is needed here for the jitter
- * oscillator's own rate. */
-double loop_process(LoopSource *lp, double depth01, double sampleRate);
+/* Reads back one sample per call from the SHARED delay line (at this
+ * voice's own transposed read position, collapsing the captured
+ * stereo content to mono via the L/R average -- matching this
+ * project's established mono-per-layer-then-panned architecture),
+ * with the sustained-then-decay envelope applied (97% flat, final 3%
+ * dips toward silence, dip amount set by depth01) -- see this
+ * struct's own comment for the full shape. depth01: 0 = no dip at
+ * all, 1 = dip reaches true silence. Also applies tape jitter
+ * (pitch/rate instability) localized to the region right around the
+ * wrap/gap, per explicit request -- see this function's own
+ * implementation comment for the full design; sampleRate is needed
+ * here for the jitter oscillator's own rate. */
+double loop_process(LoopSource *lp, const GlobalDelayLine *dl, double depth01, double sampleRate);
 
 typedef struct {
     LayerType type;
@@ -808,6 +830,13 @@ typedef struct {
      * fix this properly, matching every other voice-level stage. */
     TapeSaturation tapeSatL;
     TapeSaturation tapeSatR;
+
+    /* LOOP's shared delay line -- see GlobalDelayLine's own comment
+     * for the full design. ONE per engine (not one per voice), heap-
+     * allocated at engine init, continuously written every sample from
+     * the engine's own summed mix, read by every active voice at its
+     * own transposed position. */
+    GlobalDelayLine delayLine;
 } NoiseboyEngine;
 
 void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int seed);
