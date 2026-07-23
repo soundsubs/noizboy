@@ -114,12 +114,12 @@ after all voices sum together):
 
 | Knob | Parameter | Range |
 |---|---|---|
-| 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
+| 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it. Top ~25% of the knob blends toward a fixed, note-independent 15kHz ceiling, guaranteeing genuine brightness at max regardless of what note is playing (see "Status") |
 | 2 | Resonance | resonance of the voice-level pitch-tracking filter -- constant while a note plays, no envelope or release dependency of any kind. Full range, no safety cap; higher settings ARE genuinely self-oscillating (a deliberate choice, reverted at direct request -- see "Status") |
 | 3 | Drive | dual role: (1) single shared drive/saturation stage on the final mix, unchanged from before; (2) also now controls bitcrush + pitch-following sample-rate reduction, non-linearly -- centre-left/off (0) = effectively clean (16-bit, full native sample rate); turning clockwise degrades both bit depth and effective sample rate together, accelerating toward the top of the range. Live-controllable, not fixed per note |
-| 4 | Loop Depth | controls how far Loop's own sustained-then-decay envelope dips each pass -- 0 = no dip at all (flat, drone-like), 1 = dips all the way to true silence by the end of each pass. Applied to the WHOLE VOICE's amplitude, not just Loop's own source signal, so the dip is audible even if Loop's own randomized mix level happens to be quiet. Has zero influence on length or pitch -- those track only the played note now (see "What it does"), the same way a real tape sampler's playback speed (not the tape's own length) is what changes with note number |
-| 5 | Attack | envelope attack time, 0.5-200 ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
-| 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain. Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
+| 4 | Loop Depth | BINARY, not continuous -- any movement off exactly 0 immediately engages LOOP fully (true-silence gap, full dip, full tape jitter around the wrap); only the exact minimum turns it off. Applied to the WHOLE VOICE's amplitude, not just Loop's own source signal, so it's audible even if Loop's own randomized mix level happens to be quiet. Has zero influence on length or pitch -- those track only the played note (see "What it does") |
+| 5 | Attack | envelope attack time, 0.5-600ms, mild power curve (0.85) -- knob=50 now reaches a clearly audible ~272ms, no longer "barely different" from knob=0's fast ~0.5ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
+| 6 | Release | envelope release time, power-adjusted exponential mapping, ~0.02ms (a single sample) to 8000ms. Recalibrated per direct feedback -- knob=64 now reaches a genuine ~511ms decay (was ~9.4ms, reported as "too instant"), and knob=127 reaches a full 8 seconds ("almost always on"). Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
 | 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise and Loop sources pan to fixed positions (reusing each source's own pitch-spread randomization); the Karplus source auto-pans back and forth at a fixed internal rate instead |
 | 8 | TILT | analog-tape-style EQ, applied after DBCELL, before the final noise gate (see "Signal chain"). NOT a filter that can silence the signal -- a fixed tape-bandwidth window (gentle rolloff below ~100Hz, steeper above ~10kHz) is always present. Centre (64) = neutral, no bass/treble emphasis. Left: bass emphasis (treble rolls off further). Right: treble emphasis (bass rolls off further) |
 | 9 | (menu only) | reserved -- Drive moved to knob 3; nothing currently occupies this menu-only slot |
@@ -127,6 +127,108 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.24.0** -- two LOOP refinements, per direct follow-up feedback.
+
+**1. Tape jitter added around the wrap/gap,** reusing this project's
+own established TapeWobble mechanism (the same slowly-wandering noise
+oscillator used for the Mellotron-style voice-wide modulation), per
+direct request: "There should also be more 'tape jitter' possibly
+already included with your Mellotron tape model, right around the
+gap!" A dedicated TapeWobble instance (separate from the voice-wide
+one, with its own note-on lifecycle) modulates LOOP's own playback
+rate, but deliberately LOCALIZED to the region right around the wrap
+-- a real tape splice's own instability shows up right at the join,
+not as constant flutter across the whole loop. Intensity peaks exactly
+at the wrap and tapers to zero within a window scaled by DEPTH; at
+depth=0 there's no gap to begin with, so no jitter either. Runs at a
+faster 8Hz rate than the voice-wide wobble's slow 1Hz drift, for a
+quicker, more "flutter"-like character, and is deliberately more
+pronounced (up to 15% rate deviation at the peak) than the subtle 1-5%
+voice-wide modulation, since this is meant to read as a noticeable,
+characterful imperfection right at the seam. Verified directly: actual
+measured playback rate varies 0.89-1.13 near the wrap, while staying
+exactly 1.0 mid-cycle and everywhere at depth=0.
+
+**2. Loop Depth (knob 4) is now BINARY, not continuous,** per direct
+request: "The knob behavior should be more immediate, even binary, one
+turn turns LOOP ON. One turn back turns LOOP OFF." Any knob movement
+off exactly zero snaps straight to full depth (fully engaged); only
+the exact minimum turns it back off. A deliberate simplification, not
+a rounding artifact -- no intermediate/partial depths anymore.
+
+New tests added (`test_loop_layer.c`'s 10th and 11th checks) verifying
+the jitter's actual measured localization and the binary threshold
+logic directly. Full 24-suite run passes clean.
+
+**v0.23.0** -- LOOP's wrap point fixed, per direct report: "the loop
+point now sounds like a click, rather than a tape looping over
+itself." Investigated two candidate causes directly before fixing:
+the raw captured buffer's own waveform discontinuity at the wrap
+turned out to be a red herring (measured smaller than the average
+adjacent-sample difference elsewhere in the same buffer -- white noise
+already jumps around that much constantly, the loop point isn't
+special). The real cause: the envelope's own gain snapping from
+near-zero back to full within a single sample at the wrap -- measured
+directly, 0.0002 to 1.0 in one sample at max depth, a near-
+instantaneous amplitude step that IS a click (a fast, broadband
+transient) regardless of the audio underneath it.
+
+Fixed with a brief, genuine silence gap right after the wrap, followed
+by a fade-in swell back to full level, per explicit request to get
+"close to tape like" -- a real tape splice has a silent leader, then
+the next section swells back in, rather than snapping on instantly.
+The gap holds at the exact same level the previous cycle's fade-out
+ended at, and the fade-in starts from that same level, keeping the
+whole shape perfectly continuous at every boundary -- no new
+discontinuity introduced anywhere else in the process. Both the gap
+and fade-in scale with DEPTH: at depth=0 they vanish entirely (nothing
+to smooth, since there's no dip in the first place), and at depth=1
+the gap is genuinely silent, matching "true-silence gap" exactly.
+Verified directly: max per-sample gain change anywhere in a full loop
+cycle is now 0.0125 (was ~1.0 at the wrap specifically).
+
+New test added (`test_loop_layer.c`'s 9th check) verifying the wrap
+transition is smooth, a genuine silence gap exists at max depth, no
+other large jump hides elsewhere in the new shape, and depth=0 remains
+completely unaffected. Full 24-suite run passes clean.
+
+**v0.22.0** -- two real, calibration-driven fixes, both verified
+numerically before implementation.
+
+**1. Filter brightness fixed.** Cutoff was purely proportional to the
+played note's own frequency (up to 4x at max knob) -- verified
+directly this could NEVER reach genuine brightness for lower notes no
+matter how far the knob was turned: a low note (65Hz) topped out at
+just 262Hz, even middle C only reached ~1046Hz. Fixed by blending
+toward a fixed, note-independent 15kHz ceiling as the knob approaches
+its top 25% -- max cutoff now measures consistently bright (~16300
+zero-crossings/sec, a brightness proxy) across the entire keyboard,
+where it previously varied by nearly 2 orders of magnitude between the
+lowest and highest notes. The lower/middle 75% of the knob keeps its
+original pitch-tracking character unchanged.
+
+**2. Attack and Release curves recalibrated,** per direct feedback:
+"at Attack of 0, its fine, but almost by 50 theres barely any
+perceptible change. Similarly, at a release of 64, the decay is too
+instant. By release of 127, it should almost always be on." Verified
+both complaints numerically against the previous mappings before
+fixing: Attack's old linear mapping (0.5-200ms) only reached ~79ms by
+knob=50 -- not far enough from 0.5ms to read as a clearly different,
+slower attack. Release's old exponential mapping put knob=64 (roughly
+the midpoint) at only ~9.4ms, nowhere near a "decay", and topped out
+at 4000ms. Attack widened to 0.5-600ms with a mild power curve (0.85)
+-- knob=50 now reaches ~272ms. Release given a power-adjusted
+exponential (raw01^0.35 before the exponential mapping, front-loading
+more effective progress into the lower-middle of the knob) and widened
+to 0.02-8000ms -- knob=64 now reaches ~511ms (a genuine, audible decay)
+and knob=127 reaches a full 8 seconds. The envelope's own internal time
+clamp raised to match (was silently capping at 4000ms). `test_release_curve.c`
+rewritten to verify both curves directly, including the exact reported
+calibration points (knob=50 for Attack, knob=64 and knob=127 for
+Release), not just generic endpoint/monotonicity checks.
+
+Full 24-suite run passes clean.
 
 **v0.21.0** -- LOOP's sustained-then-decay envelope now shapes the
 WHOLE VOICE's amplitude, not just LOOP's own per-layer signal, per

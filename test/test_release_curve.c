@@ -2,89 +2,123 @@
 #include <stdio.h>
 #include <math.h>
 
-/* Verifies the exponential (log-scale) release knob mapping, per
- * explicit spec: "the release should be a single sample at [knob] 0,
- * and at 1 should be pluckier but almost hard to hear... a decaying
- * exponential curve". This replicates the exact formula from
+/* Verifies the attack/release knob mappings, redesigned per direct
+ * calibration feedback: "at Attack of 0, its fine, but almost by 50
+ * theres barely any perceptible change. Similarly, at a release of
+ * 64, the decay is too instant. By release of 127, it should almost
+ * always be on." This replicates the exact formulas from
  * noiseboy_plugin.c's set_param (which can't be unit-tested directly
- * here, since it needs the real Schwung plugin headers) to verify its
- * endpoints and shape directly. */
+ * here, since it needs the real Schwung plugin headers) to verify
+ * their endpoints, shape, and the specific reported calibration
+ * points directly. */
 
-static double release_mapping(double raw01) {
-    return 0.02 * pow(4000.0 / 0.02, raw01);
+static double attack_mapping(double raw01) {
+    return 0.5 + 599.5 * pow(raw01, 0.85);
 }
-
-static double inverse_mapping(double releaseMs) {
-    return log(releaseMs / 0.02) / log(4000.0 / 0.02);
+static double attack_inverse(double attackMs) {
+    return pow((attackMs - 0.5) / 599.5, 1.0 / 0.85);
+}
+static double release_mapping(double raw01) {
+    return 0.02 * pow(8000.0 / 0.02, pow(raw01, 0.35));
+}
+static double release_inverse(double releaseMs) {
+    return pow(log(releaseMs / 0.02) / log(8000.0 / 0.02), 1.0 / 0.35);
 }
 
 int main(void) {
     int all_ok = 1;
 
-    /* Endpoint checks */
-    double atZero = release_mapping(0.0);
-    double atOne = release_mapping(1.0);
-    printf("release at knob=0: %.4fms (expect ~0.02ms, ~1 sample at 48kHz)\n", atZero);
-    printf("release at knob=1: %.1fms (expect 4000ms)\n", atOne);
-    if (fabs(atZero - 0.02) > 0.001) { printf("FAILED: knob=0 endpoint\n"); all_ok = 0; }
-    if (fabs(atOne - 4000.0) > 0.1) { printf("FAILED: knob=1 endpoint\n"); all_ok = 0; }
+    /* --- ATTACK --- */
+    printf("=== ATTACK ===\n");
+    double attackAt0 = attack_mapping(0.0);
+    double attackAt127 = attack_mapping(1.0);
+    printf("knob=0: %.3fms (expect ~0.5ms), knob=127: %.1fms (expect 600ms)\n", attackAt0, attackAt127);
+    if (fabs(attackAt0 - 0.5) > 0.01) { printf("FAILED: attack knob=0 endpoint\n"); all_ok = 0; }
+    if (fabs(attackAt127 - 600.0) > 0.5) { printf("FAILED: attack knob=127 endpoint\n"); all_ok = 0; }
 
-    /* Verify one sample at 48kHz is genuinely representable and not
-       clamped away by the envelope's own floor (0.02ms, matched). */
-    double oneSampleMs = 1000.0 / 48000.0;
-    printf("One sample at 48kHz = %.4fms; mapping's knob=0 value = %.4fms\n", oneSampleMs, atZero);
-    if (atZero > oneSampleMs * 1.5) {
-        printf("FAILED: knob=0 release time should be close to one sample duration\n");
+    /* The specific reported calibration point: knob=50/127 should be
+       clearly, substantially different from knob=0 -- not "barely any
+       perceptible change". Require at least a 3x jump from the floor,
+       a conservative bar for "clearly audible difference". */
+    double attackAt50 = attack_mapping(50.0 / 127.0);
+    printf("knob=50: %.2fms (old linear mapping gave ~79ms, which was reported as barely different from knob=0's ~0.5ms)\n", attackAt50);
+    if (attackAt50 < attackAt0 * 3.0) {
+        printf("FAILED: knob=50 should be clearly, substantially different from knob=0\n");
         all_ok = 0;
-    }
+    } else printf("PASSED: knob=50 is now clearly different from knob=0\n");
 
-    /* Verify the mapping is monotonic and genuinely exponential (not
-       linear) -- equal knob steps should give equal RATIOS, not equal
-       DIFFERENCES, in the resulting ms value. */
-    printf("\nknob   releaseMs   ratio-to-previous\n");
+    /* Round-trip accuracy */
+    int attackRoundTripOk = 1;
+    for (double k = 0.0; k <= 1.0001; k += 0.2) {
+        double ms = attack_mapping(k);
+        double kBack = attack_inverse(ms);
+        if (fabs(k - kBack) > 0.001) attackRoundTripOk = 0;
+    }
+    printf("Attack round-trip mapping: %s\n", attackRoundTripOk ? "PASSED" : "FAILED");
+    if (!attackRoundTripOk) all_ok = 0;
+
+    /* --- RELEASE --- */
+    printf("\n=== RELEASE ===\n");
+    double releaseAt0 = release_mapping(0.0);
+    double releaseAt127 = release_mapping(1.0);
+    printf("knob=0: %.4fms (expect ~0.02ms, ~1 sample at 48kHz), knob=127: %.1fms (expect 8000ms)\n", releaseAt0, releaseAt127);
+    if (fabs(releaseAt0 - 0.02) > 0.001) { printf("FAILED: release knob=0 endpoint\n"); all_ok = 0; }
+    if (fabs(releaseAt127 - 8000.0) > 1.0) { printf("FAILED: release knob=127 endpoint\n"); all_ok = 0; }
+
+    double oneSampleMs = 1000.0 / 48000.0;
+    if (releaseAt0 > oneSampleMs * 1.5) { printf("FAILED: knob=0 release time should be close to one sample duration\n"); all_ok = 0; }
+
+    /* The specific reported calibration point: knob=64/127 (roughly
+       the midpoint) was reported as "too instant" under the old
+       mapping (which gave only ~9.4ms there). Require a release time
+       clearly in "genuine decay" territory, not "instant" -- at least
+       200ms, a conservative bar. */
+    double releaseAt64 = release_mapping(64.0 / 127.0);
+    printf("knob=64: %.2fms (old mapping gave ~9.4ms here, reported as \"too instant\")\n", releaseAt64);
+    if (releaseAt64 < 200.0) {
+        printf("FAILED: knob=64 should be a clearly audible decay, not near-instant\n");
+        all_ok = 0;
+    } else printf("PASSED: knob=64 is now a genuine, non-instant decay\n");
+
+    /* "By release of 127, it should almost always be on" -- require a
+       multi-second tail at max knob. */
+    if (releaseAt127 < 5000.0) {
+        printf("FAILED: knob=127 should give a very long, 'almost always on' release\n");
+        all_ok = 0;
+    } else printf("PASSED: knob=127 gives a genuinely long, sustained-feeling release\n");
+
+    /* Monotonicity */
+    int releaseMonotonic = 1;
     double prev = -1;
-    int monotonic = 1;
-    for (double k = 0.0; k <= 1.0001; k += 0.1) {
+    for (double k = 0.0; k <= 1.0001; k += 0.05) {
         double ms = release_mapping(k);
-        double ratio = (prev > 0) ? ms / prev : 0.0;
-        printf("%.1f    %9.3f   %.3f\n", k, ms, ratio);
-        if (prev > 0 && ms <= prev) monotonic = 0;
+        if (prev > 0 && ms <= prev) releaseMonotonic = 0;
         prev = ms;
     }
-    if (!monotonic) { printf("FAILED: mapping should be strictly increasing\n"); all_ok = 0; }
+    printf("Release mapping monotonic: %s\n", releaseMonotonic ? "PASSED" : "FAILED");
+    if (!releaseMonotonic) all_ok = 0;
 
-    /* Verify round-trip accuracy of the inverse mapping (used by get_param) */
-    printf("\nRound-trip check:\n");
-    int roundTripOk = 1;
-    for (double k = 0.0; k <= 1.0001; k += 0.25) {
+    /* Round-trip accuracy */
+    int releaseRoundTripOk = 1;
+    for (double k = 0.0; k <= 1.0001; k += 0.2) {
         double ms = release_mapping(k);
-        double kBack = inverse_mapping(ms);
-        printf("knob=%.2f -> %.3fms -> knob=%.4f (diff=%.5f)\n", k, ms, kBack, fabs(k - kBack));
-        if (fabs(k - kBack) > 0.001) roundTripOk = 0;
+        double kBack = release_inverse(ms);
+        if (fabs(k - kBack) > 0.001) releaseRoundTripOk = 0;
     }
-    if (!roundTripOk) { printf("FAILED: round-trip mapping should be accurate\n"); all_ok = 0; }
-    else printf("PASSED: round-trip accurate\n");
+    printf("Release round-trip mapping: %s\n", releaseRoundTripOk ? "PASSED" : "FAILED");
+    if (!releaseRoundTripOk) all_ok = 0;
 
-    /* Verify low knob values now get much finer control than the old
-       linear mapping would have given -- e.g. knob steps 0.00 to 0.02
-       (roughly 2-3 raw MIDI CC steps out of 127) should span a
-       meaningfully different range than they would have linearly. */
-    double oldLinearAt002 = 5.0 + 0.02 * 1995.0; /* old formula, for comparison */
-    double newExpAt002 = release_mapping(0.02);
-    printf("\nAt knob=0.02 (~2-3 MIDI steps): old linear mapping gave %.2fms, new exponential gives %.4fms\n",
-           oldLinearAt002, newExpAt002);
-    printf("(Old mapping barely moved off its 5ms floor here; new mapping is still near-instant,\n");
-    printf(" meaning far more of the knob's low range is now usable for genuinely short, plucky times.)\n");
-
-    /* Full DSP integration test -- actually use these release times in
-       the real engine, confirm clean, click-free, finite behavior. */
+    /* Full DSP integration test -- actually use these times in the
+       real engine, confirm clean, click-free, finite behavior, and
+       that the envelope's own clamp (widened to 8000ms) doesn't
+       silently truncate the new, longer release times. */
     {
         int finite_ok = 1;
         for (double k = 0.0; k <= 1.0; k += 0.1) {
             NoiseboyEngine e;
             noiseboy_engine_init(&e, 48000.0, 42u);
             e.params.releaseMs = release_mapping(k);
-            e.params.attackMs = 4.0;
+            e.params.attackMs = attack_mapping(k);
             noiseboy_note_on(&e, 60, 0.8);
             for (int i = 0; i < 4800; i++) { double l, r; noiseboy_process_stereo(&e, &l, &r); }
             noiseboy_note_off(&e, 60);
@@ -99,6 +133,6 @@ int main(void) {
         else printf("PASSED\n");
     }
 
-    printf(all_ok ? "\nALL RELEASE CURVE CHECKS PASSED\n" : "\nSOME RELEASE CURVE CHECKS FAILED\n");
+    printf(all_ok ? "\nALL ENVELOPE CURVE CHECKS PASSED\n" : "\nSOME ENVELOPE CURVE CHECKS FAILED\n");
     return all_ok ? 0 : 1;
 }

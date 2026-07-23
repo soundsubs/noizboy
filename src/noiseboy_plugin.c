@@ -173,36 +173,51 @@ static void set_param(void *instance, const char *key, const char *val) {
     } else if (strcmp(key, "resonance") == 0) {
         p->filterResonance01 = raw01;
     } else if (strcmp(key, "loop_depth") == 0) {
-        /* LOOP Depth, per explicit redesign request -- see LoopSource's
-         * own comment for the full design history. No longer controls
-         * length at all (that's fixed, tracking only the played note's
-         * pitch now, "how a real tape sampler would work") -- controls
-         * how far the loop's own sustained-then-decay envelope dips
-         * each pass, the loop's own equivalent of how AM Depth used to
-         * work: 0 = no dip, 1 = dips to true silence. */
-        p->loopDepth01 = raw01;
+        /* LOOP Depth -- see LoopSource's own comment for the full
+         * design history. No longer controls length at all (that's
+         * fixed, tracking only the played note's pitch, "how a real
+         * tape sampler would work") -- controls how far the loop's own
+         * sustained-then-decay envelope dips each pass.
+         *
+         * REDESIGNED to be BINARY, per explicit request: "The knob
+         * behavior should be more immediate, even binary, one turn
+         * turns LOOP ON. One turn back turns LOOP OFF." Any knob
+         * movement off exactly zero snaps straight to full depth
+         * (fully engaged: true-silence gap, full dip, full jitter
+         * around the wrap); only the knob's exact minimum turns it
+         * back off entirely. No intermediate/partial depths anymore --
+         * a deliberate simplification, not a rounding artifact. */
+        p->loopDepth01 = (raw01 > 0.0) ? 1.0 : 0.0;
     } else if (strcmp(key, "attack") == 0) {
-        p->attackMs = 0.5 + raw01 * 199.5; /* 0.5-200 ms */
+        /* REAL ISSUE FOUND AND FIXED HERE, per direct report: "at
+         * Attack of 0, its fine, but almost by 50 theres barely any
+         * perceptible change." The old linear mapping (0.5-200ms) only
+         * reached ~79ms by knob=50/127 -- not far enough from a
+         * near-instant 0.5ms to read as a clearly different, slower
+         * attack. Widened the range (0.5-600ms) and added a mild power
+         * curve (0.85, close to linear but giving a bit more progress
+         * early) -- knob=50 now reaches ~272ms, a clearly audible,
+         * no-longer-instant attack, while knob=0 still stays a
+         * genuinely fast ~0.5ms. */
+        p->attackMs = 0.5 + 599.5 * pow(raw01, 0.85); /* 0.5-600 ms */
     } else if (strcmp(key, "release") == 0) {
-        /* Exponential (log-scale) mapping, per explicit request:
-         * "the release should be a single sample at [knob] 0, and at
-         * 1 should be pluckier but almost hard to hear... a decaying
-         * exponential curve". The envelope's own decay was ALREADY
-         * exponential (verified directly, no linear branch anywhere
-         * in that code) -- the actual issue was this KNOB-TO-MS
-         * mapping being linear across a huge range (5-2000ms) with
-         * only 128 discrete MIDI steps to cover it. Linear meant most
-         * of those 128 steps were spent on the long, pad-like end of
-         * the range, leaving very few, coarse steps for the short,
-         * "plucky" end where fine control actually matters most.
-         * min lowered to 0.02ms (~1 sample at 48kHz, matching "a
-         * single sample" literally -- see the envelope's own clamp
-         * floor, lowered to match) from the previous 5ms/0.5ms floor.
-         * max raised to 4000ms (up from 2000ms) to give genuine room
-         * for "almost hard to hear" at the top of the knob -- a long
-         * enough exponential tail that most of its energy decays
-         * quickly even though the time constant itself is long. */
-        p->releaseMs = 0.02 * pow(4000.0 / 0.02, raw01);
+        /* REAL ISSUE FOUND AND FIXED HERE, per direct report: "at a
+         * release of 64, the decay is too instant. By release of 127,
+         * it should almost always be on." The previous exponential
+         * mapping (0.02-4000ms across the full 0-1 knob range) put
+         * knob=64/127 (roughly the midpoint) at only ~9.4ms -- far too
+         * short to read as anything but instant. Fixed with a power-
+         * adjusted exponential: raw01 is raised to the 0.35 power
+         * BEFORE the exponential mapping, which front-loads more
+         * effective progress into the lower-middle of the knob's
+         * range (since raw01^0.35 > raw01 for raw01 in (0,1)) while
+         * still starting genuinely fast near knob=0 and reaching a
+         * genuinely long, "almost always on" tail by knob=127. Also
+         * widened the max from 4000ms to 8000ms for a more convincing
+         * "almost always on" at full knob. Verified numerically:
+         * knob=64 now lands around ~511ms (clearly a real decay, not
+         * instant), knob=127 reaches 8 seconds. */
+        p->releaseMs = 0.02 * pow(8000.0 / 0.02, pow(raw01, 0.35));
     } else if (strcmp(key, "detune_spread") == 0) {
         p->detuneSpread01 = raw01;
     } else if (strcmp(key, "tilt") == 0) {
@@ -275,8 +290,8 @@ static int get_param(void *instance, const char *key, char *buf, int buf_len) {
     if (strcmp(key, "filter_cutoff") == 0) val01 = p->filterCutoffOffset01;
     else if (strcmp(key, "resonance") == 0) val01 = p->filterResonance01;
     else if (strcmp(key, "loop_depth") == 0) val01 = p->loopDepth01;
-    else if (strcmp(key, "attack") == 0) val01 = (p->attackMs - 0.5) / 199.5;
-    else if (strcmp(key, "release") == 0) val01 = log(p->releaseMs / 0.02) / log(4000.0 / 0.02);
+    else if (strcmp(key, "attack") == 0) val01 = pow((p->attackMs - 0.5) / 599.5, 1.0 / 0.85);
+    else if (strcmp(key, "release") == 0) val01 = pow(log(p->releaseMs / 0.02) / log(8000.0 / 0.02), 1.0 / 0.35);
     else if (strcmp(key, "detune_spread") == 0) val01 = p->detuneSpread01;
     else if (strcmp(key, "tilt") == 0) val01 = p->tiltAmount01;
     else if (strcmp(key, "master_level") == 0) val01 = p->masterLevel01;

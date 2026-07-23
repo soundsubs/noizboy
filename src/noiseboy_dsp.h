@@ -264,6 +264,17 @@ typedef struct {
     double *buffer;
     double readPos;             /* fractional read position, nearest-neighbor read */
     double playbackRate;        /* freqHz / referenceFreq, set once at note-on */
+    /* Dedicated tape-jitter oscillator, per explicit request: "There
+     * should also be more 'tape jitter' possibly already included with
+     * your Mellotron tape model, right around the gap!" Reuses this
+     * project's own TapeWobble mechanism (see its own header comment),
+     * but as a SEPARATE instance from the voice-wide wobble (v->wobble)
+     * -- this one needs its own note-on lifecycle and is applied only
+     * in the region right around the wrap/gap, not throughout the
+     * whole cycle, matching a real tape splice's own localized
+     * instability rather than constant flutter. See loop_process's own
+     * comment for how it's scaled and applied. */
+    TapeWobble jitterWobble;
 } LoopSource;
 
 /* Allocates buffer -- NOISEBOY_LOOP_FIXED_SAMPLES doubles. Called
@@ -296,8 +307,12 @@ double loop_envelope_gain(const LoopSource *lp, double depth01);
  * sustained-then-decay envelope applied (97% flat, final 3% dips
  * toward silence, dip amount set by depth01) -- see this struct's own
  * comment for the full shape. depth01: 0 = no dip at all, 1 = dip
- * reaches true silence. */
-double loop_process(LoopSource *lp, double depth01);
+ * reaches true silence. Also applies tape jitter (pitch/rate
+ * instability) localized to the region right around the wrap/gap, per
+ * explicit request -- see this function's own implementation comment
+ * for the full design; sampleRate is needed here for the jitter
+ * oscillator's own rate. */
+double loop_process(LoopSource *lp, double depth01, double sampleRate);
 
 typedef struct {
     LayerType type;

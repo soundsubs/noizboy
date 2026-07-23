@@ -78,7 +78,7 @@ int main(void) {
             loop_capture(&lp, &rng, 261.6, 261.6);
             double peakVeryFirst = 0.0;
             for (int i = 0; i < 100; i++) {
-                double out = loop_process(&lp, 0.0); /* depth=0 to isolate from the envelope shape */
+                double out = loop_process(&lp, 0.0, 48000.0); /* depth=0 to isolate from the envelope shape */
                 if (fabs(out) > peakVeryFirst) peakVeryFirst = fabs(out);
             }
             printf("\nPeak in the first 100 samples, raw LoopSource output: %.4f (expect clearly nonzero -- no capture delay)\n", peakVeryFirst);
@@ -92,49 +92,45 @@ int main(void) {
         }
     }
 
-    /* Test 5: envelope shape -- flat for 97%, dips toward (1-depth) over the final 3% */
+    /* Test 5: envelope shape -- flat for 97%, dips toward (1-depth) over the final 3%.
+       Uses loop_envelope_gain directly (not inferred via loop_process's
+       out/raw ratio) since that's unaffected by the new tape jitter,
+       which legitimately perturbs the actual read position near the
+       wrap -- the envelope SHAPE itself is a separate, deterministic
+       function of readPos alone, and this verifies that directly. */
     {
         LoopSource lp = {0};
-        if (!loop_source_alloc(&lp)) { printf("\nFAILED: alloc failed\n"); all_ok = 0; }
-        else {
-            unsigned int rng = 123u;
-            loop_capture(&lp, &rng, 48000.0 / NOISEBOY_LOOP_FIXED_SAMPLES, 48000.0 / NOISEBOY_LOOP_FIXED_SAMPLES); /* playbackRate=1.0 -- straightforward proportional read */
-
-            /* depth=0: should stay flat the ENTIRE pass, no dip at all */
-            double minGainDepth0 = 2.0, maxGainDepth0 = -2.0;
-            for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
-                double raw = lp.buffer[i % NOISEBOY_LOOP_FIXED_SAMPLES];
-                double out = loop_process(&lp, 0.0);
-                double impliedGain = (fabs(raw) > 1e-6) ? out / raw : 1.0;
-                if (impliedGain < minGainDepth0) minGainDepth0 = impliedGain;
-                if (impliedGain > maxGainDepth0) maxGainDepth0 = impliedGain;
-            }
-            printf("\nAt depth=0: implied gain range across full pass: %.4f to %.4f (expect both ~1.0 -- no dip at all)\n", minGainDepth0, maxGainDepth0);
-            int depth0_ok = (minGainDepth0 > 0.99 && maxGainDepth0 < 1.01);
-            if (!depth0_ok) { printf("FAILED: depth=0 should never dip\n"); all_ok = 0; }
-            else printf("PASSED\n");
-
-            /* depth=1: should be flat for 97%, then dip to exactly 0 gain by the very last sample */
-            lp.readPos = 0.0;
-            double gainAt50pct = 0, gainAt96pct = 0, gainAt99pct = 0, gainAtLastSample = 0;
-            for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
-                double raw = lp.buffer[i % NOISEBOY_LOOP_FIXED_SAMPLES];
-                double out = loop_process(&lp, 1.0);
-                double impliedGain = (fabs(raw) > 1e-6) ? out / raw : 1.0;
-                double frac = (double)i / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
-                if (fabs(frac - 0.50) < 0.001) gainAt50pct = impliedGain;
-                if (fabs(frac - 0.96) < 0.001) gainAt96pct = impliedGain;
-                if (fabs(frac - 0.99) < 0.001) gainAt99pct = impliedGain;
-                if (i == NOISEBOY_LOOP_FIXED_SAMPLES - 1) gainAtLastSample = impliedGain;
-            }
-            printf("\nAt depth=1: gain at 50%%=%.4f, 96%%=%.4f (still before the dip window), 99%%=%.4f (mid-dip), last sample=%.4f (expect near 0)\n",
-                   gainAt50pct, gainAt96pct, gainAt99pct, gainAtLastSample);
-            int depth1_ok = (fabs(gainAt50pct - 1.0) < 0.01) && (fabs(gainAt96pct - 1.0) < 0.01) && (gainAt99pct < gainAt96pct) && (gainAtLastSample < 0.05);
-            if (!depth1_ok) { printf("FAILED: expected flat until 97%%, then a dip to ~0 by the end\n"); all_ok = 0; }
-            else printf("PASSED\n");
-
-            loop_source_free(&lp);
+        /* depth=0: should stay flat the ENTIRE pass, no dip at all */
+        double minGainDepth0 = 2.0, maxGainDepth0 = -2.0;
+        for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
+            lp.readPos = i;
+            double gain = loop_envelope_gain(&lp, 0.0);
+            if (gain < minGainDepth0) minGainDepth0 = gain;
+            if (gain > maxGainDepth0) maxGainDepth0 = gain;
         }
+        printf("\nAt depth=0: gain range across full pass: %.4f to %.4f (expect both ~1.0 -- no dip at all)\n", minGainDepth0, maxGainDepth0);
+        int depth0_ok = (minGainDepth0 > 0.99 && maxGainDepth0 < 1.01);
+        if (!depth0_ok) { printf("FAILED: depth=0 should never dip\n"); all_ok = 0; }
+        else printf("PASSED\n");
+
+        /* depth=1: should be flat for most of the pass, then dip to
+           exactly 0 gain by the very last sample */
+        double gainAt50pct = 0, gainAt50_5pct = 0, gainAt96pct = 0, gainAt99pct = 0, gainAtLastSample = 0;
+        for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
+            lp.readPos = i;
+            double gain = loop_envelope_gain(&lp, 1.0);
+            double frac = (double)i / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+            if (fabs(frac - 0.50) < 0.001) gainAt50pct = gain;
+            if (fabs(frac - 0.505) < 0.001) gainAt50_5pct = gain; /* just past the fade-in window, still flat */
+            if (fabs(frac - 0.96) < 0.001) gainAt96pct = gain;
+            if (fabs(frac - 0.99) < 0.001) gainAt99pct = gain;
+            if (i == NOISEBOY_LOOP_FIXED_SAMPLES - 1) gainAtLastSample = gain;
+        }
+        printf("\nAt depth=1: gain at 50%%=%.4f, 50.5%%=%.4f (well past the gap/fade-in), 96%%=%.4f (still before the dip window), 99%%=%.4f (mid-dip), last sample=%.4f (expect near 0)\n",
+               gainAt50pct, gainAt50_5pct, gainAt96pct, gainAt99pct, gainAtLastSample);
+        int depth1_ok = (fabs(gainAt50_5pct - 1.0) < 0.01) && (fabs(gainAt96pct - 1.0) < 0.01) && (gainAt99pct < gainAt96pct) && (gainAtLastSample < 0.05);
+        if (!depth1_ok) { printf("FAILED: expected flat for most of the pass, then a dip to ~0 by the end\n"); all_ok = 0; }
+        else printf("PASSED\n");
     }
 
     /* Test 6: fresh capture every note -- different content each time */
@@ -228,6 +224,149 @@ int main(void) {
         } else {
             printf("PASSED: whole-voice amplitude dips near the end of each cycle regardless of LOOP's own mix level\n");
         }
+    }
+
+    /* Test 9: click fix -- the wrap transition should be smooth
+       (small per-sample jump), not an abrupt snap back to full gain,
+       per direct report: "the loop point now sounds like a click,
+       rather than a tape looping over itself." At max depth, there
+       should also be a brief period of genuine, true silence right
+       after the wrap (the "tape splice" gap), before swelling back up. */
+    {
+        LoopSource lp = {0};
+        double depth = 1.0;
+
+        /* Continuity across the wrap: the jump from the very last
+           sample of one cycle to the very first sample of the next
+           should be small, not a near-full-scale snap. */
+        lp.readPos = NOISEBOY_LOOP_FIXED_SAMPLES - 1;
+        double lastOfCycle = loop_envelope_gain(&lp, depth);
+        lp.readPos = 0;
+        double firstOfNext = loop_envelope_gain(&lp, depth);
+        double wrapJump = fabs(lastOfCycle - firstOfNext);
+        printf("\nGain at last sample of cycle: %.6f, first sample of next: %.6f, wrap jump: %.6f (expect small, not ~1.0)\n",
+               lastOfCycle, firstOfNext, wrapJump);
+        if (wrapJump > 0.05) {
+            printf("FAILED: wrap transition should be smooth, not an abrupt snap\n");
+            all_ok = 0;
+        } else printf("PASSED\n");
+
+        /* A genuine silence gap exists right after the wrap at max depth */
+        int foundTrueSilence = 0;
+        for (int i = 0; i < 50; i++) {
+            lp.readPos = i;
+            if (loop_envelope_gain(&lp, depth) < 1e-6) { foundTrueSilence = 1; break; }
+        }
+        printf("Genuine silence found in the first 50 samples after the wrap at depth=1: %d\n", foundTrueSilence);
+        if (!foundTrueSilence) { printf("FAILED: expected a true-silence gap at max depth\n"); all_ok = 0; }
+        else printf("PASSED\n");
+
+        /* Verify the maximum per-sample gain change ANYWHERE in a full
+           cycle is small -- confirms there's no OTHER abrupt jump
+           hiding elsewhere in the new shape (e.g. at the gap-to-fade-in
+           or fade-in-to-sustain boundaries). */
+        double maxStep = 0.0;
+        double prevGain = loop_envelope_gain(&lp, depth); /* readPos still at 49 from the loop above, fine as a starting reference */
+        for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
+            lp.readPos = i;
+            double g = loop_envelope_gain(&lp, depth);
+            double step = fabs(g - prevGain);
+            if (step > maxStep) maxStep = step;
+            prevGain = g;
+        }
+        printf("Max per-sample gain change anywhere in a full cycle: %.6f (expect small throughout)\n", maxStep);
+        if (maxStep > 0.05) { printf("FAILED: found an unexpectedly large per-sample jump somewhere in the cycle\n"); all_ok = 0; }
+        else printf("PASSED\n");
+
+        /* depth=0 remains completely unaffected -- flat at 1.0 always */
+        int depth0_ok = 1;
+        for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i += 137) {
+            lp.readPos = i;
+            if (fabs(loop_envelope_gain(&lp, 0.0) - 1.0) > 1e-9) depth0_ok = 0;
+        }
+        printf("depth=0 stays exactly flat throughout: %d\n", depth0_ok);
+        if (!depth0_ok) { printf("FAILED\n"); all_ok = 0; }
+        else printf("PASSED\n");
+    }
+
+    /* Test 10: tape jitter, per explicit request -- "There should also
+       be more 'tape jitter'... right around the gap!" Verify the
+       actual playback rate genuinely varies near the wrap (not just
+       the intended design, but the measured behavior), stays exactly
+       at the base rate mid-cycle, and vanishes entirely at depth=0
+       (nothing to smooth/jitter around if there's no gap in the first
+       place). */
+    {
+        LoopSource lp = {0};
+        if (!loop_source_alloc(&lp)) { printf("\nFAILED: alloc failed\n"); all_ok = 0; }
+        else {
+            unsigned int rng = 55u;
+            loop_capture(&lp, &rng, 48000.0 / NOISEBOY_LOOP_FIXED_SAMPLES, 48000.0 / NOISEBOY_LOOP_FIXED_SAMPLES);
+            double minRateNearWrap = 100, maxRateNearWrap = 0;
+            double minRateMidCycle = 100, maxRateMidCycle = 0;
+            for (int cyc = 0; cyc < 5; cyc++) {
+                for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES; i++) {
+                    double before = lp.readPos;
+                    loop_process(&lp, 1.0, 48000.0);
+                    double after = lp.readPos;
+                    double actualRate = (after > before) ? (after - before) : (after + NOISEBOY_LOOP_FIXED_SAMPLES - before);
+                    double frac = before / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+                    if (frac > 0.98 || frac < 0.02) {
+                        if (actualRate < minRateNearWrap) minRateNearWrap = actualRate;
+                        if (actualRate > maxRateNearWrap) maxRateNearWrap = actualRate;
+                    } else if (frac > 0.4 && frac < 0.6) {
+                        if (actualRate < minRateMidCycle) minRateMidCycle = actualRate;
+                        if (actualRate > maxRateMidCycle) maxRateMidCycle = actualRate;
+                    }
+                }
+            }
+            printf("\nAt depth=1: rate near wrap varies %.4f to %.4f, rate mid-cycle varies %.4f to %.4f (expect near-wrap CLEARLY varying, mid-cycle exactly constant)\n",
+                   minRateNearWrap, maxRateNearWrap, minRateMidCycle, maxRateMidCycle);
+            int jitterPresent = (maxRateNearWrap - minRateNearWrap) > 0.05;
+            int midCycleStable = (maxRateMidCycle - minRateMidCycle) < 1e-9;
+            if (!jitterPresent) { printf("FAILED: expected clearly measurable rate jitter near the wrap\n"); all_ok = 0; }
+            else if (!midCycleStable) { printf("FAILED: mid-cycle rate should be exactly stable, no jitter there\n"); all_ok = 0; }
+            else printf("PASSED\n");
+            loop_source_free(&lp);
+        }
+
+        /* At depth=0, jitter should vanish entirely -- rate stays exactly constant everywhere, including near the wrap */
+        LoopSource lp0 = {0};
+        if (!loop_source_alloc(&lp0)) { printf("\nFAILED: alloc failed\n"); all_ok = 0; }
+        else {
+            unsigned int rng = 55u;
+            loop_capture(&lp0, &rng, 48000.0 / NOISEBOY_LOOP_FIXED_SAMPLES, 48000.0 / NOISEBOY_LOOP_FIXED_SAMPLES);
+            double minRate = 100, maxRate = 0;
+            for (int i = 0; i < NOISEBOY_LOOP_FIXED_SAMPLES * 3; i++) {
+                double before = lp0.readPos;
+                loop_process(&lp0, 0.0, 48000.0);
+                double after = lp0.readPos;
+                double actualRate = (after > before) ? (after - before) : (after + NOISEBOY_LOOP_FIXED_SAMPLES - before);
+                if (actualRate < minRate) minRate = actualRate;
+                if (actualRate > maxRate) maxRate = actualRate;
+            }
+            printf("At depth=0: rate range across 3 full cycles: %.4f to %.4f (expect exactly constant, no jitter anywhere)\n", minRate, maxRate);
+            if (maxRate - minRate > 1e-9) { printf("FAILED: depth=0 should have zero jitter anywhere in the cycle\n"); all_ok = 0; }
+            else printf("PASSED\n");
+            loop_source_free(&lp0);
+        }
+    }
+
+    /* Test 11: binary depth threshold logic, replicating set_param's
+       own formula (can't unit-test set_param itself here, since it
+       needs the real Schwung plugin headers) -- per explicit request:
+       "one turn turns LOOP ON. One turn back turns LOOP OFF." */
+    {
+        double rawValues[] = {0.0, 1.0/127.0, 0.5, 1.0};
+        double expected[]  = {0.0, 1.0,       1.0, 1.0};
+        int binary_ok = 1;
+        for (int i = 0; i < 4; i++) {
+            double result = (rawValues[i] > 0.0) ? 1.0 : 0.0;
+            printf("raw01=%.5f -> loopDepth01=%.1f (expect %.1f)\n", rawValues[i], result, expected[i]);
+            if (result != expected[i]) binary_ok = 0;
+        }
+        printf("Binary depth threshold: %s\n", binary_ok ? "PASSED" : "FAILED");
+        if (!binary_ok) all_ok = 0;
     }
 
     printf(all_ok ? "\nALL LOOP CHECKS PASSED\n" : "\nSOME LOOP CHECKS FAILED\n");

@@ -104,6 +104,7 @@ void loop_source_free(LoopSource *lp) {
 void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double referenceFreqHz) {
     lp->readPos = 0.0;
     lp->playbackRate = freqHz / referenceFreqHz;
+    tape_wobble_init(&lp->jitterWobble, xorshift_next(rngState));
 
     if (!lp->buffer) return; /* allocation failure fallback -- see loop_source_alloc's own comment; loop_process handles a NULL buffer safely too */
 
@@ -123,22 +124,55 @@ void loop_capture(LoopSource *lp, unsigned int *rngState, double freqHz, double 
 }
 
 double loop_envelope_gain(const LoopSource *lp, double depth01) {
-    /* Sustained-then-decay envelope: flat (full level) for the first
-     * 97% of each pass; over the final 3%, linearly ramps down toward
-     * a target level set by DEPTH -- 0 = no dip at all (stays flat the
-     * whole way, no audible loop seam), 1 = dips all the way to true
-     * silence by the very end of the pass, before jumping back to full
-     * level at the next pass's start. See LoopSource's own comment for
-     * the full design and why this is exposed as its own read-only
-     * function (letting a caller apply the same shape to more than
-     * just this source's own audio). */
+    /* Sustained-then-decay envelope: flat (full level) for most of each
+     * pass; toward the end, linearly ramps down toward a target level
+     * set by DEPTH -- 0 = no dip at all (stays flat the whole way, no
+     * audible loop seam), 1 = dips all the way to true silence.
+     *
+     * REAL BUG FOUND AND FIXED HERE, per direct report: "the loop
+     * point now sounds like a click, rather than a tape looping over
+     * itself." Investigated two candidate causes directly -- the raw
+     * captured buffer's own waveform discontinuity at the wrap point
+     * turned out to be a red herring (measured smaller than the
+     * average adjacent-sample difference elsewhere in the same
+     * buffer, since white noise already jumps around that much
+     * constantly). The real cause: this envelope's own gain snapping
+     * from near-zero back to full within a single sample at the wrap
+     * -- verified directly (0.0002 to 1.0 in one sample at depth=1) --
+     * a near-instantaneous amplitude step is exactly what a click IS
+     * (a fast, broadband transient), independent of whatever audio
+     * content it's applied to.
+     *
+     * Fixed with a brief, genuine silence gap right after the wrap,
+     * followed by a fade-in swell back to full level -- per explicit
+     * request, "close to tape like": a real tape splice has a silent
+     * leader, then the next section swells back in, rather than
+     * snapping on instantly. The gap holds at the SAME level the
+     * previous cycle's dip ended at (1-depth01), and the fade-in
+     * starts from that same level -- this keeps the whole shape
+     * perfectly continuous at both boundaries (dip-into-gap, and
+     * fade-in-into-sustain), so there's no new discontinuity
+     * introduced anywhere else. Both the gap and fade-in scale with
+     * DEPTH -- at depth=0 they vanish entirely (matching "no dip at
+     * all" already having nothing to smooth), and at depth=1 the gap
+     * is genuinely silent (1-depth=0), matching "true-silence gap"
+     * exactly. */
     const double frac = lp->readPos / (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+    const double sustainFloor = 1.0 - depth01; /* where the dip ends, the gap holds, and the fade-in starts */
+    const double gapFrac = 0.005 * depth01;    /* up to 0.5% of the cycle held at sustainFloor right after the wrap */
+    const double fadeInFrac = 0.01 * depth01;  /* up to 1% of the cycle swelling from sustainFloor back to full */
+
+    if (frac < gapFrac) return sustainFloor;
+    if (frac < gapFrac + fadeInFrac) {
+        const double fadeProgress = (frac - gapFrac) / fadeInFrac; /* 0..1 */
+        return sustainFloor + (1.0 - sustainFloor) * fadeProgress;
+    }
     if (frac < 0.97) return 1.0;
     const double decayProgress = (frac - 0.97) / 0.03; /* 0..1 across the final 3% */
-    return 1.0 - depth01 * decayProgress;
+    return 1.0 - depth01 * decayProgress; /* ends at sustainFloor exactly as frac approaches 1.0, matching the gap's own starting level */
 }
 
-double loop_process(LoopSource *lp, double depth01) {
+double loop_process(LoopSource *lp, double depth01, double sampleRate) {
     if (!lp->buffer) return 0.0; /* allocation failure fallback */
 
     /* Nearest-neighbor read (plain int truncation, no interpolation)
@@ -150,7 +184,36 @@ double loop_process(LoopSource *lp, double depth01) {
     const double envelopeGain = loop_envelope_gain(lp, depth01);
     const double out = lp->buffer[idx] * envelopeGain;
 
-    double rate = lp->playbackRate;
+    /* Tape jitter, per explicit request: "There should also be more
+     * 'tape jitter' possibly already included with your Mellotron
+     * tape model, right around the gap!" Reuses this project's own
+     * TapeWobble mechanism (a slowly-wandering noise oscillator --
+     * see its own header comment), but as its own dedicated instance
+     * (lp->jitterWobble, separate from the voice-wide wobble used for
+     * the Mellotron-style filter/level modulation), and deliberately
+     * LOCALIZED to the region right around the wrap/gap rather than
+     * applied throughout the whole cycle -- a real tape splice's own
+     * instability shows up right at the join, not as constant flutter
+     * across the whole loop. Intensity peaks exactly at the wrap
+     * (frac=0/1 boundary) and tapers to zero within a symmetric window
+     * scaled by DEPTH -- at depth=0 there's no gap to begin with, so
+     * no jitter either. Faster oscillator rate (8Hz) than the voice's
+     * own slow 1Hz wobble, for a quicker, more "flutter"-like character
+     * appropriate to a brief splice imperfection rather than a slow
+     * wow. Deliberately more pronounced (up to 15% rate deviation at
+     * the peak) than the subtle 1-5% voice-wide wobble, since this is
+     * meant to read as a noticeable, characterful imperfection right
+     * at the seam, not a subtle drift. */
+    const double jitterZoneWidth = 0.02 * depth01;
+    double distFromWrap = (lp->readPos > NOISEBOY_LOOP_FIXED_SAMPLES * 0.5)
+        ? (double)NOISEBOY_LOOP_FIXED_SAMPLES - lp->readPos  /* approaching the wrap from below */
+        : lp->readPos;                                        /* just past the wrap */
+    distFromWrap /= (double)NOISEBOY_LOOP_FIXED_SAMPLES;
+    const double jitterIntensity = (jitterZoneWidth > 1e-9) ? clampd(1.0 - distFromWrap / jitterZoneWidth, 0.0, 1.0) : 0.0;
+    const double jitterRaw = tape_wobble_process(&lp->jitterWobble, 8.0, sampleRate);
+    const double rateJitterMul = 1.0 + jitterRaw * 0.15 * jitterIntensity;
+
+    double rate = lp->playbackRate * rateJitterMul;
     if (rate < 0.01) rate = 0.01; /* defensive floor -- avoids a near-stuck or reversed read position from a pathological pitch */
     lp->readPos += rate;
     if (lp->readPos >= (double)NOISEBOY_LOOP_FIXED_SAMPLES) {
@@ -691,11 +754,11 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
                  * Fixed by computing the TARGET k->damping value
                  * directly, then inverting karplus_pluck's own mapping
                  * to find the correct 0-1 input that produces it. */
-                const double releaseNorm01 = clampd(log(e->params.releaseMs / 0.02) / log(4000.0 / 0.02), 0.0, 1.0);
+                const double releaseNorm01 = clampd(pow(log(e->params.releaseMs / 0.02) / log(8000.0 / 0.02), 1.0 / 0.35), 0.0, 1.0);
                 const double targetKDamping = clampd(0.95 + releaseNorm01 * 0.048 + rand01(&e->rngState) * 0.001, 0.90, 0.999);
                 dampingAmount = clampd((targetKDamping - 0.90) / 0.099, 0.0, 1.0);
             } else {
-                const double attackNorm01 = clampd((e->params.attackMs - 0.5) / 199.5, 0.0, 1.0);
+                const double attackNorm01 = clampd(pow((e->params.attackMs - 0.5) / 599.5, 1.0 / 0.85), 0.0, 1.0);
                 dampingAmount = clampd(r->dampingAmount01 * 0.5 + e->params.filterResonance01 * 0.5, 0.0, 1.0);
                 dampingAmount *= (0.85 + attackNorm01 * 0.15); /* shorter attack -> pulled slightly tighter/snappier */
             }
@@ -870,7 +933,7 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
          * back here, one sample per call, with DEPTH (knob 4) live-
          * controlling how far the loop's own sustained-then-decay
          * envelope dips each pass. */
-        return loop_process(&layer->loop, e->params.loopDepth01);
+        return loop_process(&layer->loop, e->params.loopDepth01, e->sampleRate);
     }
 
     double raw = noisegen_process(&layer->noiseGen, layer->colour);
@@ -968,7 +1031,7 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
          * for attackMs too (unaffected in practice -- its own linear
          * mapping's minimum, 0.5ms, already sits above this new,
          * lower floor). */
-        timeMs = clampd(timeMs, 0.02, 4000.0);
+        timeMs = clampd(timeMs, 0.02, 8000.0);
         const double coeff = exp(-1.0 / (0.001 * timeMs * e->sampleRate));
         v->envLevel = target + (v->envLevel - target) * coeff;
 
@@ -1232,8 +1295,27 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             const double wobble = tape_wobble_process(&v->wobble, 1.0, e->sampleRate);
             voiceWobbleMul = 1.0 + wobble * e->mellotronDepth01;
 
+            /* REAL BUG FOUND AND FIXED HERE, per direct report ("not
+             * quite as bright as it needs to be, even with the highest
+             * cutoff of knob 1"): purely pitch-proportional cutoff
+             * (cutoffMul alone) can NEVER reach genuine brightness for
+             * lower notes, no matter how far the knob is turned.
+             * Measured directly: at max knob (cutoffMul=4x), a low note
+             * (65Hz) only reaches a 262Hz cutoff -- nowhere near
+             * "bright" -- and even middle C only reaches ~1046Hz.
+             * Fixed by blending toward a genuinely bright, NOTE-
+             * INDEPENDENT absolute ceiling as the knob approaches its
+             * top 25% -- so turning the knob all the way up guarantees
+             * real brightness (deep into the audible treble) regardless
+             * of what note is playing, while the lower/middle 75% of
+             * the knob's range keeps the original pitch-tracking
+             * character (offset relative to the played note)
+             * unchanged. */
             const double cutoffMul = pow(2.0, (e->params.filterCutoffOffset01 - 0.5) * 4.0);
-            const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul, 20.0, e->sampleRate * 0.45);
+            const double proportionalCutoff = v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul;
+            const double brightCeilingHz = 15000.0;
+            const double brightBlend = clampd((e->params.filterCutoffOffset01 - 0.75) / 0.25, 0.0, 1.0);
+            const double pitchCutoff = clampd(proportionalCutoff + (brightCeilingHz - proportionalCutoff) * brightBlend, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
             /* Knob rescaled per direct calibration: "resonance is out
              * of control by the time it hits 30, which is roughly 1/3
