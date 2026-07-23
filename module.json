@@ -1,9 +1,9 @@
 {
     "id": "noiseboy",
     "name": "NOIZBOY",
-    "version": "0.17.0",
+    "version": "0.18.0",
     "abbrev": "NOIZB",
-    "description": "Fixed a genuine, long-standing pitch-filter self-oscillation bug (was drowning out other sources). LOOP reverted to a per-layer, pre-filter, pitch-transposing source with knob-controlled length. Knob 3 is now DRIVE. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
+    "description": "Resonance now tracks Amp Release (starts at knob's raw value, decays to the safe ceiling as a note lets go). Karplus boosted further to hold its own in the mix. Loop Length knob direction/range corrected. DIAGNOSTIC: polyphony still 4, confirmed real CPU ceiling.",
     "author": "soundsubs",
     "dsp": "dsp.so",
     "ui": "ui.js",

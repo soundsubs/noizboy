@@ -13,25 +13,28 @@
 int main(void) {
     int all_ok = 1;
 
-    /* Test 1: loopLengthKnob01 maps correctly across the full XX range */
+    /* Test 1: loopLengthKnob01 maps correctly, per corrected spec:
+       knob=0 (start) -> 100% of max (3.0s), knob=1 (fully clockwise)
+       -> 1% of max (0.03s) -- REVERSED from an earlier, incorrect
+       version of this mapping. */
     {
         NoiseboyEngine e;
         noiseboy_engine_init(&e, 48000.0, 42u);
         e.params.loopLengthKnob01 = 0.0;
         noiseboy_note_on(&e, 60, 0.8); /* middle C -- playbackRate=1.0, so captureLengthSamples == the loop's own period in samples */
-        int lenAtMin = e.voices[0].layers[3].loop.captureLengthSamples;
-        double expectedMin = NOISEBOY_LOOP_MIN_SECONDS * 48000.0;
+        int lenAtStart = e.voices[0].layers[3].loop.captureLengthSamples;
+        double expectedStart = NOISEBOY_LOOP_MAX_SECONDS * 48000.0; /* 100% of max */
 
         NoiseboyEngine e2;
         noiseboy_engine_init(&e2, 48000.0, 42u);
         e2.params.loopLengthKnob01 = 1.0;
         noiseboy_note_on(&e2, 60, 0.8);
-        int lenAtMax = e2.voices[0].layers[3].loop.captureLengthSamples;
-        double expectedMax = NOISEBOY_LOOP_MAX_SECONDS * 48000.0;
+        int lenAtFull = e2.voices[0].layers[3].loop.captureLengthSamples;
+        double expectedFull = NOISEBOY_LOOP_MAX_SECONDS * 0.01 * 48000.0; /* 1% of max */
 
-        printf("Loop Length knob=0.0 -> %d samples (expect ~%.0f), knob=1.0 -> %d samples (expect ~%.0f)\n",
-               lenAtMin, expectedMin, lenAtMax, expectedMax);
-        if (fabs(lenAtMin - expectedMin) > 10 || fabs(lenAtMax - expectedMax) > 10) {
+        printf("Loop Length knob=0.0 (start) -> %d samples (expect ~%.0f, 100%% of max), knob=1.0 (full CW) -> %d samples (expect ~%.0f, 1%% of max)\n",
+               lenAtStart, expectedStart, lenAtFull, expectedFull);
+        if (fabs(lenAtStart - expectedStart) > 10 || fabs(lenAtFull - expectedFull) > 10) {
             printf("FAILED: knob mapping doesn't match expected XX range\n");
             all_ok = 0;
         } else {

@@ -111,9 +111,9 @@ after all voices sum together):
 | Knob | Parameter | Range |
 |---|---|---|
 | 1 | Filter Offset | brightens/darkens the voice-level pitch-tracking filter relative to the played note -- centre (64) = filter sits exactly at the played pitch, never stops tracking it |
-| 2 | Resonance | resonance of the voice-level pitch-tracking filter; also blends into Karplus-Strong pluck damping (plucky-mode notes only -- string-mode notes use Release instead, see "What it does"). See "Status" for a real stability fix that meaningfully narrowed this knob's usable range from earlier versions |
+| 2 | Resonance | resonance of the voice-level pitch-tracking filter while a note is HELD (safe, stable range -- see "Status" for the stability fix that established this ceiling); also blends into Karplus-Strong pluck damping (plucky-mode notes only). On RELEASE, resonance starts at this knob's raw (uncapped) value and decays back to the safe ceiling over roughly the first fifth of the release -- a short, audible resonant "ping" as a note lets go, higher knob settings giving a sharper, more pronounced ping. Short/plucky releases barely show it, by nature of being brief |
 | 3 | Drive | single shared drive/saturation stage on the final mix -- moved here from the parameter menu now that LOOP no longer needs this knob for a wet/dry blend (it's a 4th mixed source now, see "What it does") |
-| 4 | Loop Length | sets Loop's own captured-buffer length (XX) directly across its full range (0.25-3.0s, exponential mapping) -- read fresh at the START of every note, not adjustable live mid-note. The played note's own pitch is what controls playback SPEED through that buffer (see "What it does") -- this knob only sets how long the buffer itself is |
+| 4 | Loop Length | sets Loop's own captured-buffer length (XX), read fresh at the START of every note (not adjustable live mid-note). Start (0) = 100% = 3.0 seconds, the longest; turning clockwise reduces it down to 1% (0.03s) at full right. The played note's own pitch is what controls playback SPEED through that buffer (see "What it does") -- this knob only sets how long the buffer itself is |
 | 5 | Attack | envelope attack time, 0.5-200 ms; also nudges plucky-mode Karplus decay slightly tighter at shorter settings |
 | 6 | Release | envelope release time, exponential/log-scale mapping, ~0.02ms (a single sample) to 4000ms. Most of the knob's range is now dedicated to short, "plucky" times, with only the top end reaching long, pad-like sustain. Also stretches string-mode Karplus's own ring-out time to stay roughly in step with the envelope |
 | 7 | Detune | spreads BOTH pitch and stereo image (0 = unison and mono; up = richer/chorused pitch AND wider stereo). Filtered-noise and Loop sources pan to fixed positions (reusing each source's own pitch-spread randomization); the Karplus source auto-pans back and forth at a fixed internal rate instead |
@@ -123,6 +123,72 @@ after all voices sum together):
 | 11 | Level | master output level -- moved off knob 8 to make room for TILT; still fully controllable via the parameter menu |
 
 ## Status
+
+**v0.18.0** -- three targeted fixes following direct feedback on
+v0.17.0's filter stability fix, each verified independently.
+
+**1. Loop Length knob direction and range corrected.** Was mapped
+backwards from spec (clockwise increased length) with the wrong low
+end (0.25s floor instead of a literal 1% of max). Per explicit
+correction -- "Loop Length should start at 100% (maximum 3 seconds)
+and reduce to 1% while turning clockwise" -- now maps directly: start
+(0) = 3.0s, full clockwise (1) = 0.03s, linear in percent-of-max.
+
+**2. Karplus-Strong boosted further.** v0.17.0's filter stability fix
+(genuinely necessary -- see below) had a real side effect: the old,
+unstable filter's resonant self-oscillation was incidentally
+amplifying whatever sat at the resonant frequency, and Karplus's own
+clean, pitch-coherent signal benefited from that far more than
+broadband noise did. With that instability gone, Karplus's held
+contribution to the mix measured directly at only ~36% of a comparable
+noise generator's own level -- still frequently inaudible or
+overwhelmed in a full mix even after v0.17.0's own smaller sustain-feed
+fix. Measured the actual gap and tuned Karplus's ongoing sustain feed
+(not a uniform gain boost on the whole voice, which would have clipped
+the already near-full-scale initial pluck transient) so its held level
+now matches a noise generator's own level almost exactly. Re-verified
+directly: Karplus's marginal contribution to a full mix, across many
+random seeds, is now substantial and audible in most cases (previously
+~0.03 RMS at best, now regularly 0.15+).
+
+**3. Resonance now tracks the amplitude envelope's release, per direct
+request.** While a note is HELD, resonance stays exactly at the safe,
+verified-stable ceiling from v0.17.0's fix -- unchanged. The moment a
+note RELEASES, resonance starts at the Resonance knob's raw (uncapped)
+value and decays back down to that safe ceiling, giving a short,
+audible resonant "ping" right as a note lets go -- getting back some of
+the pitched character the stability fix removed, without reintroducing
+indefinite ringing. Two real bugs found and fixed while building this:
+a straight linear (and later, cubed) decay curve both kept resonance
+elevated for far too long, since the amplitude envelope's own decay is
+exponential and never truly reaches zero -- at the longest release
+setting, this left the filter audibly ringing for 30-60+ seconds after
+note-off. Fixed with a threshold-gated ramp instead (elevated only
+during roughly the first fifth of the release's own progress, then
+snapped to the safe ceiling), giving a short, clearly audible "ping"
+regardless of how long the overall amplitude tail continues afterward.
+Specifically stress-tested the worst case (lowest note, resonance
+knob maxed, longest release) and confirmed it genuinely settles: the
+voice takes the same ~29.5 seconds to fully deactivate as the
+amplitude envelope alone does at that same release setting with
+resonance turned down low -- meaning this feature adds zero additional
+risk of the original self-oscillation bug pattern.
+
+Also fixed, found during review rather than reported: a stale,
+misleading comment in `noiseboy_dsp.c` claimed bitcrush/rate-reduce had
+been "removed entirely" -- it hadn't; that text was leftover from an
+earlier revision that was never updated when the feature came back.
+The actual code was correct throughout; only the comment was wrong,
+but a wrong comment in a project this dependent on its own inline
+documentation for continuity across sessions is worth fixing
+immediately once spotted.
+
+One new test (`test-releaseresonance`), and `test-wobble`'s own
+pitch-stability check rewritten (again) after the Karplus boost shifted
+the same kind of full-pipeline zero-crossing proxy that already proved
+unreliable once this session -- replaced with a direct, math-based
+verification of the wobble multiplier's guaranteed bound instead of
+inferring it indirectly through audio. Full 24-suite run passes clean.
 
 **v0.17.0** -- two major pieces of work, both stemming from direct
 reports that this project's own recent changes had made real things

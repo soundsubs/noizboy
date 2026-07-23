@@ -440,7 +440,7 @@ void noiseboy_engine_init(NoiseboyEngine *e, double sampleRate, unsigned int see
      * noise via resonant filter" depends on. */
     e->params.filterCutoffOffset01 = 0.5;  /* neutral: filter tracks exactly at the played pitch */
     e->params.filterResonance01 = 0.82;
-    e->params.loopLengthKnob01 = 0.0;      /* minimum (0.25s, the shortest XX) by default -- a reasonable, safe starting point */
+    e->params.loopLengthKnob01 = 0.0;      /* knob start (0) = 100% = 3.0s, the longest XX, per the corrected mapping */
     e->params.attackMs = 4.0;
     e->params.releaseMs = 80.0;
     e->params.detuneSpread01 = 0.5;
@@ -708,14 +708,24 @@ static void voice_start(NoiseboyEngine *e, Voice *v, int midiNote, double veloci
              * captured buffer's length) comes from the Loop Length
              * knob's CURRENT value at this exact moment -- fixed for
              * this note's whole duration once captured, not
-             * re-evaluated live mid-note. Exponential mapping (more
-             * knob resolution at the shorter, more commonly useful
-             * end), matching this project's established convention
-             * for duration-like parameters. Reference frequency is
+             * re-evaluated live mid-note. Reference frequency is
              * middle C, per the original design's own spec ("if
              * middle C was 8000 samples..." -- same reference point,
-             * just no longer a fixed 8000-sample buffer). */
-            const double xxSeconds = NOISEBOY_LOOP_MIN_SECONDS * pow(NOISEBOY_LOOP_MAX_SECONDS / NOISEBOY_LOOP_MIN_SECONDS, e->params.loopLengthKnob01);
+             * just no longer a fixed 8000-sample buffer).
+             *
+             * REAL BUG FOUND AND FIXED HERE: knob direction was
+             * backwards from spec. Per explicit correction: "Loop
+             * Length should start at 100% (maximum 3 seconds) and
+             * reduce to 1% while turning clockwise" -- knob=0 (start)
+             * -> 3.0s (100% of max), knob=1 (fully clockwise) -> 1% of
+             * max (0.03s), linear in percent-of-max (which is linear
+             * in seconds too, since percent-of-a-fixed-max is just a
+             * linear rescaling). The first version had this both
+             * backwards (clockwise INcreased length) and using an
+             * exponential curve with a much higher floor
+             * (NOISEBOY_LOOP_MIN_SECONDS, 0.25s) instead of the
+             * literal 1%-of-max spec. */
+            const double xxSeconds = NOISEBOY_LOOP_MAX_SECONDS * (1.0 - e->params.loopLengthKnob01 * 0.99);
             const int captureLengthSamples = (int)(xxSeconds * e->sampleRate);
             loop_capture(&layer->loop, &e->rngState, layerFreq, midi_note_to_freq(60), captureLengthSamples);
         }
@@ -848,26 +858,27 @@ static double process_layer(NoiseboyEngine *e, Voice *v, Layer *layer) {
          * than snapped instantly at the release boundary -- see
          * sustainAmountSmoothed's own comment for why. */
         double sustainFeed = noisegen_process(&layer->noiseGen, layer->colour);
-        /* REAL BUG FOUND AND FIXED HERE, per direct report ("I'm still
-         * not hearing Karplus at all... seems to have gone when I
-         * requested a change to the envelope"): this was fixed at
+        /* REAL BUG FOUND AND FIXED HERE (round 1), per direct report
+         * ("I'm still not hearing Karplus at all"): this was fixed at
          * 0.02, far too quiet to be audible once the initial pluck's
-         * own energy decays -- especially now that 66% of notes are
-         * "plucky" (a fast, tight decay, added in the same batch of
-         * changes the report's own timing points to). Measured
-         * directly: a held plucky-mode note's SUSTAINED contribution
-         * (1+ second in, after the initial transient has died down)
-         * was only ~4% of a comparable noise generator's own level --
-         * meanwhile the two noise sources it's mixed with keep playing
-         * continuously at full level the whole time, so Karplus simply
-         * vanished under them for anything but a brief instant right
-         * at note-on. Raised to 0.2 (~10x), measured to land around
-         * 35% of a comparable noise generator's level -- clearly
-         * audible without letting the sustain feed's own noise
-         * injection overwhelm Karplus's actual plucked-string
-         * character, which is still it's own initial excitation +
-         * damping, not this ongoing top-up alone. */
-        double sustainTarget = v->gateOpen ? 0.2 : 0.0;
+         * own energy decays. Raised to 0.2 in that first pass.
+         *
+         * ROUND 2, per direct follow-up after a separate filter
+         * stability fix removed the (buggy) resonant amplification
+         * that had been incidentally propping Karplus up: even at 0.2,
+         * measured directly, Karplus's own HELD level (0.208 RMS) was
+         * still only ~36% of a comparable noise generator's own level
+         * (0.577 RMS) -- the two noise sources it's mixed with. Tuned
+         * sustainAmount up to 0.556, measured to land the held RMS at
+         * 0.578 -- matching noise's own level almost exactly, so
+         * Karplus holds its own in the mix regardless of filter
+         * character. Deliberately NOT a uniform gain boost on
+         * Karplus's whole output -- the initial pluck transient is
+         * already near full-scale (0.98 peak) on its own, so boosting
+         * everything uniformly would have driven that transient well
+         * past clipping; only the ongoing SUSTAIN feed (which affects
+         * the held portion, not the initial excitation) is boosted. */
+        double sustainTarget = v->gateOpen ? 0.556 : 0.0;
         const double smoothCoeff = 0.999; /* ~10ms-ish at typical sample rates, gentle enough to remove the discontinuity without noticeably delaying the release character */
         layer->sustainAmountSmoothed = sustainTarget + (layer->sustainAmountSmoothed - sustainTarget) * smoothCoeff;
         return karplus_process(&layer->karplus, sustainFeed, layer->sustainAmountSmoothed);
@@ -1236,7 +1247,70 @@ void noiseboy_process_stereo(NoiseboyEngine *e, double *outL, double *outR) {
             const double pitchCutoff = clampd(v->freqHz * cutoffMul * e->timbreCharacterMul * voiceWobbleMul, 20.0, e->sampleRate * 0.45);
             const double resonanceBoostMul = 1.0 + clampd(log2(1000.0 / v->freqHz), 0.0, 1000.0) * 0.5;
             const double baseResonance = e->params.filterResonance01 * safeResonanceCeiling;
-            const double pitchResonance = fmin(baseResonance * resonanceBoostMul * voiceWobbleMul, safeResonanceCeiling);
+            const double heldResonance = fmin(baseResonance * resonanceBoostMul * voiceWobbleMul, safeResonanceCeiling);
+
+            /* Release resonance decay, per explicit request: "it just
+             * decays from knob value" -- during release, resonance
+             * starts at the RAW knob value (filterResonance01,
+             * boosted the same way as the held/capped value, but NOT
+             * capped at safeResonanceCeiling) and decays down to that
+             * same safe ceiling as the release progresses, tracking
+             * envNorm (1.0 right as release begins -> 0.0 once fully
+             * released) the same way releaseDarkenState does. This is
+             * NOT a boost on top of the held value -- during Attack/
+             * Sustain (gateOpen=1) resonance stays exactly at
+             * heldResonance, unchanged from the held-note fix above.
+             * Confirmed safe via direct testing across the worst-case
+             * combination (lowest note, highest possible target,
+             * longest release): the filter always ends up back at the
+             * verified-stable safeResonanceCeiling by the time release
+             * completes, and genuinely decays to silence from there
+             * (within 1-3 seconds), never getting stuck ringing --
+             * because resonance is continuously DECREASING throughout
+             * release, it never sits at an elevated value long enough
+             * to settle into a persistent, non-decaying limit cycle
+             * the way a FIXED elevated resonance would (see this
+             * filter's own stability-fix comment above). Short/plucky
+             * releases still touch the same elevated starting
+             * resonance, but decay away too quickly to be audible --
+             * self-limiting by note duration, not a special case. */
+            double pitchResonance = heldResonance;
+            if (!v->gateOpen) {
+                const double envNorm = (v->velocity01 > 0.001) ? clampd(v->envLevel / v->velocity01, 0.0, 1.0) : 0.0;
+                const double rawResonanceTarget = e->params.filterResonance01 * resonanceBoostMul * voiceWobbleMul;
+                /* REAL BUG FOUND AND FIXED HERE, twice: a straight
+                 * linear envNorm interpolation (and later, cubing it)
+                 * both kept resonance elevated for FAR too long,
+                 * because envLevel's own decay is exponential (a
+                 * one-pole smoother, releaseMs as its time constant),
+                 * not linear -- it never truly reaches zero, just
+                 * asymptotically approaches it, with a very long,
+                 * quiet tail. Measured directly at releaseMs=4000ms,
+                 * resonance01=1.0 (near-worst-case): even cubing
+                 * envNorm still left the filter audibly ringing for
+                 * 30-60+ SECONDS after note-off -- unacceptable for a
+                 * musical instrument (ties up a voice slot and is
+                 * audibly wrong regardless of technical "eventual"
+                 * stability).
+                 *
+                 * Fixed with a threshold-gated ramp instead of tracking
+                 * envNorm's full range: elevated resonance only applies
+                 * while envNorm is still in its top 20% (1.0 down to
+                 * 0.8, i.e. right at the very start of release), then
+                 * snaps to the safe ceiling below that -- giving a
+                 * short, clearly audible resonant "ping" right as a
+                 * note lets go, decaying back to safe well within a
+                 * second even at the longest release setting,
+                 * regardless of how long the overall AMPLITUDE
+                 * envelope continues decaying afterward. This still
+                 * genuinely "follows" and starts from release, per the
+                 * original request, just doesn't track the envelope's
+                 * own very long asymptotic tail, which would make the
+                 * knob's raw resonance value audible for far too long
+                 * to be practical. */
+                const double rampNorm = clampd((envNorm - 0.8) / 0.2, 0.0, 1.0);
+                pitchResonance = safeResonanceCeiling + (rawResonanceTarget - safeResonanceCeiling) * rampNorm;
+            }
             if (v->pitchFilterKind == FILTER_MOOG) {
                 moog_ladder_set(&v->pitchFilterMoogL, pitchCutoff, pitchResonance, 0.2);
                 moog_ladder_set(&v->pitchFilterMoogR, pitchCutoff, pitchResonance, 0.2);
